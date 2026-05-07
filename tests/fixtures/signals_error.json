@@ -1,0 +1,20 @@
+{
+  "openlab_acquisition_alive": true,
+  "openlab_instrument_service_alive": true,
+  "openlab_reverse_proxy_alive": true,
+  "moses_process_alive": false,
+  "moses_process_pid": null,
+  "last_run_dir": "C:\\CDSProjects\\Installation\\Results\\Han\\HH248\\HH248-01-01_D4B-A1_2026-05-02_13-40-37.sirslt",
+  "last_run_mtime_iso8601": "2026-05-07T11:30:00+00:00",
+  "last_run_mtime_epoch": 9.99e9,
+  "acquisition_active": false,
+  "last_error": {
+    "code": null,
+    "message": "2026-05-07 07:42:30,123 [ERROR] Pump pressure threshold exceeded on instrument SDL2_LC1290",
+    "severity": "error",
+    "timestamp": "2026-05-07T11:42:30+00:00"
+  },
+  "last_error_log_path": "C:\\ProgramData\\Agilent\\LogFiles\\InstrumentService.log",
+  "last_observation_at": "2026-05-07T11:42:35+00:00",
+  "probe_error": null
+}

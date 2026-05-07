@@ -1,0 +1,15 @@
+{
+  "openlab_acquisition_alive": false,
+  "openlab_instrument_service_alive": false,
+  "openlab_reverse_proxy_alive": false,
+  "moses_process_alive": false,
+  "moses_process_pid": null,
+  "last_run_dir": null,
+  "last_run_mtime_iso8601": null,
+  "last_run_mtime_epoch": null,
+  "acquisition_active": false,
+  "last_error": null,
+  "last_error_log_path": null,
+  "last_observation_at": "2026-05-07T11:42:35+00:00",
+  "probe_error": null
+}

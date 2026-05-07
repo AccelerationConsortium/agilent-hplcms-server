@@ -1,0 +1,15 @@
+{
+  "openlab_acquisition_alive": true,
+  "openlab_instrument_service_alive": true,
+  "openlab_reverse_proxy_alive": true,
+  "moses_process_alive": true,
+  "moses_process_pid": 24512,
+  "last_run_dir": "C:\\CDSProjects\\Installation\\Results\\Alexei2\\AK-1-60\\AK-1-61D.sirslt",
+  "last_run_mtime_iso8601": "2026-05-07T11:42:30+00:00",
+  "last_run_mtime_epoch": 9.99e9,
+  "acquisition_active": true,
+  "last_error": null,
+  "last_error_log_path": null,
+  "last_observation_at": "2026-05-07T11:42:35+00:00",
+  "probe_error": null
+}
