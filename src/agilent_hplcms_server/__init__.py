@@ -5,4 +5,4 @@ CDS supervisor without touching them. It never imports `moses`, never loads
 `pythonnet`, and never opens an instrument session.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
