@@ -40,6 +40,26 @@ class Settings:
     host: str = os.environ.get("HOST", "0.0.0.0")
     port: int = _env_int("PORT", 8010)
 
+    # Moses subprocess settings (control layer)
+    moses_work_dir: str = os.environ.get(
+        "MOSES_WORK_DIR",
+        r"C:\Users\sdl2\Documents\Code\yoyo\pythofisher_hplcms",
+    )
+    moses_python_exe: str = os.environ.get(
+        "MOSES_PYTHON_EXE",
+        r"C:\Users\sdl2\anaconda3\envs\moses_v4_yoyo\python.exe",
+    )
+    # Comma-separated list of script paths (relative to moses_work_dir) that
+    # are permitted to be executed via POST /control/run.
+    moses_allowed_scripts: str = os.environ.get(
+        "MOSES_ALLOWED_SCRIPTS",
+        "examples/agent_agilent.py",
+    )
+    run_jobs_dir: str = os.environ.get(
+        "RUN_JOBS_DIR",
+        r"C:\SDL_Tools\hplcms_jobs",
+    )
+
 
 def load_settings() -> Settings:
     return Settings()

@@ -14,6 +14,11 @@ from .models import (
     ErrorInfo,
 )
 
+# Avoid a hard import cycle: MosesRunner is only imported for type-checking.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .control.runner import MosesRunner
+
 
 EQUIPMENT_ID = "agilent_uplc_ms"
 EQUIPMENT_NAME = "Agilent UPLC-MS"
@@ -23,9 +28,17 @@ EQUIPMENT_KIND = "hplc"
 def build_status(
     signals: dict[str, Any],
     settings: Settings | None = None,
+    runner: "MosesRunner | None" = None,
 ) -> EquipmentStatus:
     """Build an ``EquipmentStatus`` from a probe ``read_signals()`` dict."""
     settings = settings or load_settings()
+
+    # If the server-managed runner has an active process, treat the instrument
+    # as busy regardless of what the probe says. This closes the race window
+    # between run submission and the first *.sirslt directory appearing on disk.
+    if runner is not None and runner.is_busy():
+        signals = dict(signals)
+        signals["acquisition_active"] = True
 
     core_up = (
         signals.get("openlab_acquisition_alive")
