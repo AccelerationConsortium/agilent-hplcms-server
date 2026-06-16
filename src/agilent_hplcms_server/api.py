@@ -6,6 +6,8 @@ import argparse
 import os
 from typing import Callable
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -49,7 +51,14 @@ def create_app(
     reader_fn: SignalReader = reader or _adapt()
     runner_instance = runner if runner is not None else MosesRunner()
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
+        runner_instance.start_poller(settings=settings)
+        yield
+        runner_instance.stop_poller()
+
     app = FastAPI(
+        lifespan=lifespan,
         title="Agilent UPLC-MS Status Sidecar",
         version=__version__,
         description=(
@@ -69,7 +78,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=allow_origins,
         allow_credentials=allow_credentials,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["*"],
     )
 

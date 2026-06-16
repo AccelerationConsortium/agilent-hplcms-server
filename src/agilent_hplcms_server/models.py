@@ -32,6 +32,7 @@ EquipmentKind = Literal[
 EquipmentState = Literal[
     "ready",
     "busy",
+    "paused",
     "requires_init",
     "degraded",
     "dry_run",
