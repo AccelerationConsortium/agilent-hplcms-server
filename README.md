@@ -13,6 +13,9 @@ C:\SDL_Tools\uv.exe sync --extra dev
 # Run tests
 C:\SDL_Tools\uv.exe run pytest -q
 
+# If Windows temp/cache permissions block pytest on this PC:
+C:\SDL_Tools\uv.exe run pytest -q --basetemp .tmp_pytest -p no:cacheprovider
+
 # Start the server (foreground)
 C:\SDL_Tools\uv.exe run agilent-hplcms-server-serve --host 0.0.0.0 --port 8010
 ```
@@ -91,6 +94,16 @@ DELETE /control/queue/{queue_id}  → cancel a pending job (409 if running, 404 
 
 A background daemon thread polls every 5 seconds and automatically starts the next pending run when the active one finishes. `POST /control/abort` terminates the active process and marks all pending jobs as failed.
 
+### OpenLab direct runs and pause/resume
+
+The queue is gated by live OpenLab Sharing Services (OLSS) state, not only by jobs submitted through this server.
+
+- If an operator starts a run directly in OpenLab and OLSS reports `olss_instrument_state` as `Run`, `Busy`, `Prerun`, or `PostRun`, then `GET /status` returns `equipment_status: "busy"` even when no server-managed Moses job exists.
+- While OLSS reports an active acquisition, new `/control/run` and `/control/queue` submissions are accepted into the FIFO queue instead of starting immediately.
+- If OpenLab reports `olss_software_status: "Paused"` while connected, `GET /status` returns `equipment_status: "paused"` with `required_actions: ["resume_paused_sequence"]`.
+- If a Moses subprocess exits while OLSS still reports the instrument as running or paused, the server keeps the active job linked as `acquiring` and does not dispatch the next queued job until OLSS returns to idle.
+- When an operator resumes a paused sequence directly in OpenLab, OLSS returning to an active run state keeps `/status` busy and keeps `/control/queue` attached to the active job.
+
 ## What the server never does
 
 - Does **not** import or share an environment with `moses`.
@@ -105,7 +118,7 @@ A background daemon thread polls every 5 seconds and automatically starts the ne
 3. Any `python.exe` under `C:\Users\sdl2\anaconda3\envs\moses*\` currently running.
 4. Trailing bytes of `C:\ProgramData\Agilent\LogFiles\InstrumentService.log` and the newest `AcquisitionServer-*.log` for recent `ERROR` / `CRITICAL` / `FATAL` events.
 5. Server-managed runner state — if a run was just submitted, `busy` is forced immediately (before the `*.sirslt` directory appears on disk).
-6. **OpenLab Sharing Services (OLSS) REST API** — `GET /status` and `GET /control/queue` include `instrument_state` (e.g. `"Idle"`, `"Error"`, `"NotReady"`, `"NotConnected"`) from the live OpenLab CDS instrument, plus `olss_software_status` and `olss_current_run` in `details`.
+6. **OpenLab Sharing Services (OLSS) REST API** — `GET /status` and `GET /control/queue` include `instrument_state` (e.g. `"Idle"`, `"Run"`, `"Busy"`, `"Prerun"`, `"PostRun"`, `"Error"`, `"NotReady"`, `"NotConnected"`) from the live OpenLab CDS instrument, plus `olss_software_status` and `olss_current_run` in `details`. OLSS active states are treated as busy even for runs submitted directly in OpenLab.
 7. **Sensor daemon JSON file** — `GET /status` → `metrics` includes live hardware metrics populated by `tools/hplcms_sensor_daemon.py`. Keys absent from the file render as `"—"` in the dashboard.
 
 ## Live hardware metrics
@@ -186,7 +199,8 @@ Writes to `C:\SDL_Tools\hplcms_sensor_data.json` every 30 seconds (override via 
 |---|---|
 | `requires_init` | Any required OpenLab core process missing. |
 | `error` | An `ERROR` / `CRITICAL` / `FATAL` event in the last `ERROR_WINDOW_S` of OpenLab logs. |
-| `busy` | Newest `*.sirslt` mtime within `BUSY_THRESHOLD_S`, a moses-env `python.exe` running, or server-managed run active. |
+| `paused` | OLSS reports `olss_software_status: "Paused"` while OpenLab is connected. Response includes `required_actions: ["resume_paused_sequence"]`. |
+| `busy` | Newest `*.sirslt` mtime within `BUSY_THRESHOLD_S`, a moses-env `python.exe` running, server-managed run active, or OLSS instrument state is `Run`, `Busy`, `Prerun`, or `PostRun`. |
 | `ready` | OpenLab core processes up, no recent error, no recent acquisition activity, no active run. |
 | `unknown` | Probe could not stat the OpenLab log dir or the CDS results dir. |
 
