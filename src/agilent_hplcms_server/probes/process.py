@@ -42,6 +42,9 @@ from typing import Any
 import psutil
 
 from ..config import Settings, load_settings
+from .openlab_rest import read_instrument_state
+from .rc_driver_log import read_rc_driver_log
+from .sensor_file import read_sensor_file
 
 
 # Process names that indicate the OpenLab supervisor stack is alive. We match
@@ -64,6 +67,14 @@ _OPENLAB_REVERSEPROXY_NAMES = {
 # with an ISO-ish timestamp followed by the level. We keep the matcher lenient
 # so we work across slightly different OpenLab log formats.
 _ERROR_LEVEL_PATTERN = re.compile(r"\b(?:ERROR|CRITICAL|FATAL)\b", re.IGNORECASE)
+
+# Background housekeeping components that log errors continuously and are not
+# indicative of instrument readiness.  Lines matching any of these are skipped
+# by _scan_recent_error so they do not flip equipment_state to "error".
+_NOISE_PATTERN = re.compile(
+    r"\b(?:ResultSetUploader|UploadRecoveryRun)\b",
+    re.IGNORECASE,
+)
 _TIMESTAMP_PATTERNS = [
     # 2026-05-07 07:42:35,123
     re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)"),
@@ -100,7 +111,7 @@ def _check_processes() -> tuple[bool, bool, bool, bool, int | None]:
                 exe_norm = exe.lower()
                 if (
                     _path_matches_glob(exe_norm, moses_glob_norm)
-                    or "pythofisher_hplcms" in cmdline.lower()
+                    and "pythofisher_hplcms" in cmdline.lower()
                 ):
                     moses = True
                     moses_pid = proc.pid
@@ -283,6 +294,8 @@ def _scan_recent_error(
         for line in reversed(text.splitlines()):
             if not _ERROR_LEVEL_PATTERN.search(line):
                 continue
+            if _NOISE_PATTERN.search(line):
+                continue
             severity = _classify_severity(line) or "error"
             ts = _parse_log_timestamp(line)
             ts_epoch = ts.timestamp() if ts else file_mtime
@@ -355,6 +368,15 @@ def read_signals(settings: Settings | None = None) -> dict[str, Any]:
     else:
         last_error, last_error_log = _scan_recent_error(log_dir, settings.error_window_s)
 
+    olss = read_instrument_state(
+        olss_url=settings.openlab_olss_url,
+        username=settings.openlab_username,
+        instrument_id=settings.openlab_instrument_id,
+    )
+
+    sensor = read_sensor_file(settings.sensor_data_file)
+    rc_driver = read_rc_driver_log(settings.rc_driver_log_dir)
+
     return {
         "openlab_acquisition_alive": bool(acq_alive),
         "openlab_instrument_service_alive": bool(instsvc_alive),
@@ -369,4 +391,13 @@ def read_signals(settings: Settings | None = None) -> dict[str, Any]:
         "last_error_log_path": last_error_log,
         "last_observation_at": now_iso,
         "probe_error": probe_error,
+        # OLSS REST API signals
+        "olss_instrument_state": olss.get("olss_instrument_state"),
+        "olss_software_status": olss.get("olss_software_status"),
+        "olss_current_run": olss.get("olss_current_run"),
+        "olss_error": olss.get("olss_error"),
+        # Sensor daemon file signals (absent until sensor daemon is deployed)
+        **sensor,
+        # RC driver log signals (solvent/waste bottle levels from RCDriver.log)
+        **rc_driver,
     }

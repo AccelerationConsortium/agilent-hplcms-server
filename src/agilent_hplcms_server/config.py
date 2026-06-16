@@ -59,6 +59,30 @@ class Settings:
         "RUN_JOBS_DIR",
         r"C:\SDL_Tools\hplcms_jobs",
     )
+    queue_max_depth: int = _env_int("QUEUE_MAX_DEPTH", 20)
+    queue_poll_interval_s: int = _env_int("QUEUE_POLL_INTERVAL_S", 5)
+
+    # OpenLab Sharing Services REST API (instrument state probe)
+    openlab_olss_url: str = os.environ.get(
+        "OPENLAB_OLSS_URL",
+        "http://localhost:6625/olss",
+    )
+    openlab_username: str = os.environ.get("OPENLAB_USERNAME", "sdl2")
+    openlab_instrument_id: int = _env_int("OPENLAB_INSTRUMENT_ID", 15)
+
+    # Sensor daemon JSON file (written by tools/hplcms_sensor_daemon.py running
+    # in the Moses conda env).  Absent file → all sensor metrics show as "—".
+    sensor_data_file: str = os.environ.get(
+        "SENSOR_DATA_FILE",
+        r"C:\SDL_Tools\hplcms_sensor_data.json",
+    )
+
+    # LC Drivers log directory — contains the active RCDriver.log written by
+    # AcquisitionClient.exe with real-time solvent/waste bottle levels.
+    rc_driver_log_dir: str = os.environ.get(
+        "RC_DRIVER_LOG_DIR",
+        r"C:\ProgramData\Agilent\LogFiles\LC Drivers",
+    )
 
 
 def load_settings() -> Settings:

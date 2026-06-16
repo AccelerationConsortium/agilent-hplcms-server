@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -55,17 +55,61 @@ class RunRequest(BaseModel):
 
 
 class RunResponse(BaseModel):
+    """Response for POST /control/run (backward-compat quick-submit)."""
+
     run_id: str
-    status: Literal["accepted"]
+    status: Literal["accepted", "queued"]
     message: str
     pid: int | None = None
-    started_at: datetime
+    started_at: datetime | None = None
+    queue_position: int | None = None
+
+
+class QueuedRun(BaseModel):
+    """Single job entry returned in GET /control/queue."""
+
+    queue_id: str
+    request: dict[str, Any]
+    queued_at: datetime
+    status: Literal["pending", "acquiring", "done", "failed"]
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    pid: int | None = None
+
+
+class QueueResponse(BaseModel):
+    """Response for POST /control/queue."""
+
+    queue_id: str
+    position: int
+    status: Literal["queued"]
+    message: str
+
+
+class QueueStatusResponse(BaseModel):
+    """Response for GET /control/queue."""
+
+    queue: list[QueuedRun]
+    active_run_id: str | None
+    pending_count: int
+    max_depth: int
+    instrument_online: bool
+    accepting_jobs: bool
+    instrument_state: str | None = None
+
+
+class CancelResponse(BaseModel):
+    """Response for DELETE /control/queue/{queue_id}."""
+
+    cancelled_id: str
+    message: str
 
 
 class AbortResponse(BaseModel):
     status: Literal["aborted", "not_running"]
     message: str
     run_id: str | None = None
+    queue_cleared: int = 0
 
 
 class StartupResponse(BaseModel):
@@ -76,8 +120,9 @@ class StartupResponse(BaseModel):
 
 class ShutdownResponse(BaseModel):
     run_id: str
-    status: Literal["accepted"]
+    status: Literal["accepted", "queued"]
     message: str
+    queue_position: int | None = None
 
 
 class EquipmentBusyError(BaseModel):
@@ -90,3 +135,10 @@ class RequiresInitError(BaseModel):
     error: Literal["requires_init"] = "requires_init"
     message: str
     required_actions: list[str]
+
+
+class QueueFullError(BaseModel):
+    error: Literal["queue_full"] = "queue_full"
+    message: str
+    max_depth: int
+    current_depth: int

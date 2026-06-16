@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from subprocess import Popen
@@ -14,8 +13,7 @@ from fastapi.testclient import TestClient
 
 from agilent_hplcms_server.api import create_app
 from agilent_hplcms_server.config import Settings
-from agilent_hplcms_server.control.runner import ActiveRun, MosesRunner
-
+from agilent_hplcms_server.control.runner import JobEntry, MosesRunner
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -28,48 +26,113 @@ def _load(name: str) -> dict:
 # Fake runner helpers
 # ---------------------------------------------------------------------------
 
-def _fake_active_run(run_id: str = "test-run-1") -> ActiveRun:
+def _make_mock_proc() -> MagicMock:
     mock_proc = MagicMock(spec=Popen)
     mock_proc.pid = 12345
-    mock_proc.poll.return_value = None  # still running
-    return ActiveRun(
-        run_id=run_id,
-        pid=12345,
-        process=mock_proc,
-        started_at=datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
-        job_path=Path("fake_job.json"),
+    mock_proc.poll.return_value = None
+    return mock_proc
+
+
+def _fake_job_entry(
+    run_id: str = "test-run-1",
+    status: str = "dispatched",
+    request_dict: dict | None = None,
+) -> JobEntry:
+    active = status in ("dispatched", "acquiring")
+    return JobEntry(
+        queue_id=run_id,
         script_name="examples/agent_agilent.py",
+        job={},
+        request_dict=request_dict or {"script_name": "examples/agent_agilent.py"},
+        queued_at=datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+        status=status,  # type: ignore[arg-type]
+        started_at=datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc) if active else None,
+        pid=12345 if active else None,
+        process=_make_mock_proc() if active else None,
+        job_path=Path("fake_job.json"),
     )
 
 
 class FakeRunner(MosesRunner):
-    """MosesRunner subclass that never touches the filesystem or spawns processes."""
+    """MosesRunner that never touches the filesystem or spawns processes."""
 
-    def __init__(self, *, busy: bool = False, run_id: str = "test-run-1") -> None:
+    def __init__(
+        self,
+        *,
+        busy: bool = False,
+        run_id: str = "test-run-1",
+        force_acquiring: bool = False,
+    ) -> None:
         super().__init__()
         if busy:
-            self._active = _fake_active_run(run_id)
-        self._submitted: list[dict] = []
-        self._aborted = False
+            entry = _fake_job_entry(run_id, status="dispatched")
+            self._jobs[run_id] = entry
+            self._active_id = run_id
+        self.submitted: list[dict] = []
+        self.aborted = False
+        self._next_run_id = "queued-run-1"
+        self._force_acquiring = force_acquiring
 
-    def submit(self, script_name: str, job: dict, settings=None) -> ActiveRun:  # type: ignore[override]
+    def check_acquiring(self, settings=None) -> bool:  # type: ignore[override]
+        return self._force_acquiring
+
+    def submit_to_queue(  # type: ignore[override]
+        self,
+        script_name: str,
+        job: dict,
+        request_dict: dict,
+        settings=None,
+    ) -> tuple[str, int]:
         allowed = ["examples/agent_agilent.py"]
         if script_name not in allowed:
             raise ValueError(f"Script '{script_name}' is not in MOSES_ALLOWED_SCRIPTS.")
-        active = _fake_active_run()
-        self._active = active
-        self._submitted.append({"script_name": script_name, "job": job})
-        return active
+        settings_obj = settings or Settings()
+        if len(self._pending_ids) >= settings_obj.queue_max_depth and self._active_id is not None:
+            raise OverflowError(f"Queue is full ({settings_obj.queue_max_depth} pending runs).")
 
-    def abort(self, timeout_s: int = 10) -> bool:  # type: ignore[override]
-        if self._active is None:
-            return False
-        self._active = None
-        self._aborted = True
-        return True
+        run_id = self._next_run_id
+        self.submitted.append({"script_name": script_name, "job": job, "run_id": run_id})
 
-    def poll(self) -> None:
-        pass  # fake runner never auto-clears
+        if self._active_id is None and not self._olss_occupied:
+            entry = _fake_job_entry(run_id, status="dispatched", request_dict=request_dict)
+            self._jobs[run_id] = entry
+            self._active_id = run_id
+            return run_id, 0
+        else:
+            entry = _fake_job_entry(run_id, status="pending", request_dict=request_dict)
+            self._jobs[run_id] = entry
+            self._pending_ids.append(run_id)
+            return run_id, len(self._pending_ids)
+
+    def enqueue(self, script_name: str, job: dict, settings=None) -> tuple[str, int]:  # type: ignore[override]
+        return self.submit_to_queue(
+            script_name=script_name,
+            job=job,
+            request_dict={"script_name": script_name, **job},
+            settings=settings,
+        )
+
+    def abort(self, settings=None) -> tuple[bool, int]:  # type: ignore[override]
+        n_cleared = len(self._pending_ids)
+        for qid in list(self._pending_ids):
+            e = self._jobs.get(qid)
+            if e:
+                e.status = "failed"
+        self._pending_ids.clear()
+        if self._active_id is None:
+            return False, n_cleared
+        e = self._jobs.get(self._active_id)
+        if e:
+            e.status = "failed"
+        self._active_id = None
+        self.aborted = True
+        return True, n_cleared
+
+    def poll(self, settings=None) -> None:  # type: ignore[override]
+        pass
+
+    def start_poller(self, settings=None) -> None:  # type: ignore[override]
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -133,10 +196,10 @@ def test_startup_requires_init():
 
 
 # ---------------------------------------------------------------------------
-# /control/run
+# /control/run — accepted immediately when idle
 # ---------------------------------------------------------------------------
 
-def test_run_accepted():
+def test_run_accepted_when_idle():
     runner = FakeRunner(busy=False)
     client = _client(_load("signals_ready.json"), runner=runner)
     r = client.post("/control/run", json=VALID_RUN_BODY)
@@ -145,24 +208,31 @@ def test_run_accepted():
     assert body["status"] == "accepted"
     assert body["run_id"]
     assert body["pid"] == 12345
+    assert body["queue_position"] is None
 
 
-def test_run_409_when_runner_busy():
+def test_run_queued_when_busy():
     runner = FakeRunner(busy=True, run_id="existing-run")
     client = _client(_load("signals_ready.json"), runner=runner)
     r = client.post("/control/run", json=VALID_RUN_BODY)
-    assert r.status_code == 409
-    detail = r.json()["detail"]
-    assert detail["error"] == "equipment_busy"
-    assert detail["run_id"] == "existing-run"
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["status"] == "queued"
+    assert body["queue_position"] == 1
+    assert body["pid"] is None
 
 
-def test_run_409_when_probe_busy():
+def test_run_queued_when_olss_reports_external_acquisition():
     runner = FakeRunner(busy=False)
-    client = _client(_load("signals_busy.json"), runner=runner)
+    client = _client(_load("signals_olss_run.json"), runner=runner)
     r = client.post("/control/run", json=VALID_RUN_BODY)
-    assert r.status_code == 409
-    assert r.json()["detail"]["error"] == "equipment_busy"
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["status"] == "queued"
+    assert body["queue_position"] == 1
+    assert body["pid"] is None
+    assert runner.get_active() is None
+    assert runner.queue_depth() == 1
 
 
 def test_run_409_when_requires_init():
@@ -221,6 +291,156 @@ def test_run_422_sample_name_with_spaces():
 
 
 # ---------------------------------------------------------------------------
+# POST /control/queue
+# ---------------------------------------------------------------------------
+
+def test_post_queue_accepted_when_idle():
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_ready.json"), runner=runner)
+    r = client.post("/control/queue", json=VALID_RUN_BODY)
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["queue_id"]
+    assert body["status"] == "queued"
+    assert body["position"] == 0
+
+
+def test_post_queue_queued_when_busy():
+    runner = FakeRunner(busy=True, run_id="active-123")
+    client = _client(_load("signals_ready.json"), runner=runner)
+    r = client.post("/control/queue", json=VALID_RUN_BODY)
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["status"] == "queued"
+    assert body["position"] == 1
+
+
+def test_post_queue_queued_when_olss_reports_external_acquisition():
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_olss_run.json"), runner=runner)
+    r = client.post("/control/queue", json=VALID_RUN_BODY)
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["status"] == "queued"
+    assert body["position"] == 1
+    assert runner.get_active() is None
+
+
+def test_post_queue_409_requires_init():
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_requires_init.json"), runner=runner)
+    r = client.post("/control/queue", json=VALID_RUN_BODY)
+    assert r.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# GET /control/queue
+# ---------------------------------------------------------------------------
+
+def test_queue_empty_when_idle():
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_ready.json"), runner=runner)
+    r = client.get("/control/queue")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["pending_count"] == 0
+    assert body["active_run_id"] is None
+    assert body["queue"] == []
+    assert body["instrument_online"] is True
+
+
+def test_queue_shows_active_run():
+    runner = FakeRunner(busy=True, run_id="active-123")
+    client = _client(_load("signals_ready.json"), runner=runner)
+    r = client.get("/control/queue")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["active_run_id"] == "active-123"
+    assert body["pending_count"] == 0
+    assert body["instrument_online"] is True
+    assert body["accepting_jobs"] is True
+
+
+def test_queue_shows_pending_after_submit():
+    runner = FakeRunner(busy=True, run_id="active-123")
+    client = _client(_load("signals_ready.json"), runner=runner)
+    client.post("/control/run", json=VALID_RUN_BODY)
+    r = client.get("/control/queue")
+    body = r.json()
+    assert body["pending_count"] == 1
+    # pid is None = genuinely queued (not yet dispatched); distinguishes from dispatched-but-not-acquiring
+    not_started = [j for j in body["queue"] if j["pid"] is None]
+    assert len(not_started) == 1
+    assert len(not_started[0]["request"]["samples"]) == 1
+
+
+def test_queue_dispatched_shows_as_pending_before_acquisition():
+    """Dispatched job (script started, OpenLab not yet acquiring) shows as pending."""
+    runner = FakeRunner(busy=True, run_id="active-123")
+    # signals_ready has acquisition_active=False
+    client = _client(_load("signals_ready.json"), runner=runner)
+    r = client.get("/control/queue")
+    body = r.json()
+    active_jobs = [j for j in body["queue"] if j["queue_id"] == "active-123"]
+    assert len(active_jobs) == 1
+    assert active_jobs[0]["status"] == "pending"
+
+
+def test_queue_dispatched_becomes_acquiring_when_output_dir_active():
+    """Dispatched job transitions to acquiring when the job's own output_dir has sirslt activity."""
+    runner = FakeRunner(busy=True, run_id="active-123", force_acquiring=True)
+    client = _client(_load("signals_ready.json"), runner=runner)
+    r = client.get("/control/queue")
+    body = r.json()
+    active_jobs = [j for j in body["queue"] if j["queue_id"] == "active-123"]
+    assert len(active_jobs) == 1
+    assert active_jobs[0]["status"] == "acquiring"
+
+
+def test_queue_instrument_offline():
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_requires_init.json"), runner=runner)
+    r = client.get("/control/queue")
+    body = r.json()
+    assert body["instrument_online"] is False
+    assert body["accepting_jobs"] is False
+
+
+# ---------------------------------------------------------------------------
+# DELETE /control/queue/{id}
+# ---------------------------------------------------------------------------
+
+def test_delete_queue_cancels_pending():
+    runner = FakeRunner(busy=True, run_id="active-123")
+    client = _client(_load("signals_ready.json"), runner=runner)
+    # Queue a pending job
+    r = client.post("/control/queue", json=VALID_RUN_BODY)
+    queue_id = r.json()["queue_id"]
+
+    r2 = client.delete(f"/control/queue/{queue_id}")
+    assert r2.status_code == 200
+    assert r2.json()["cancelled_id"] == queue_id
+
+    # Verify it no longer shows as pending
+    body = client.get("/control/queue").json()
+    assert body["pending_count"] == 0
+
+
+def test_delete_queue_409_running():
+    runner = FakeRunner(busy=True, run_id="active-123")
+    client = _client(_load("signals_ready.json"), runner=runner)
+    r = client.delete("/control/queue/active-123")
+    assert r.status_code == 409
+
+
+def test_delete_queue_404_not_found():
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_ready.json"), runner=runner)
+    r = client.delete("/control/queue/nonexistent-id")
+    assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # /control/abort
 # ---------------------------------------------------------------------------
 
@@ -229,7 +449,9 @@ def test_abort_not_running():
     client = _client(_load("signals_ready.json"), runner=runner)
     r = client.post("/control/abort")
     assert r.status_code == 200
-    assert r.json()["status"] == "not_running"
+    body = r.json()
+    assert body["status"] == "not_running"
+    assert body["queue_cleared"] == 0
 
 
 def test_abort_active_run():
@@ -240,7 +462,19 @@ def test_abort_active_run():
     body = r.json()
     assert body["status"] == "aborted"
     assert body["run_id"] == "run-to-abort"
-    assert runner._aborted
+    assert runner.aborted
+
+
+def test_abort_clears_queue():
+    runner = FakeRunner(busy=True, run_id="active-run")
+    client = _client(_load("signals_ready.json"), runner=runner)
+    # Queue two more runs
+    client.post("/control/run", json=VALID_RUN_BODY)
+    client.post("/control/run", json=VALID_RUN_BODY)
+    r = client.post("/control/abort")
+    body = r.json()
+    assert body["queue_cleared"] == 2
+    assert runner.queue_depth() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -257,20 +491,21 @@ def test_shutdown_accepted_when_idle():
     assert body["run_id"]
 
 
-def test_shutdown_409_when_busy():
+def test_shutdown_queued_when_busy():
     runner = FakeRunner(busy=True, run_id="active-run")
     client = _client(_load("signals_ready.json"), runner=runner)
     r = client.post("/control/shutdown")
-    assert r.status_code == 409
-    assert r.json()["detail"]["error"] == "equipment_busy"
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["status"] == "queued"
+    assert body["queue_position"] == 1
 
 
 # ---------------------------------------------------------------------------
-# /status reflects runner busy state
+# /status reflects runner busy state and queue_length
 # ---------------------------------------------------------------------------
 
 def test_status_busy_when_runner_active():
-    """GET /status must return busy even when probe signals are 'ready'."""
     runner = FakeRunner(busy=True)
     client = _client(_load("signals_ready.json"), runner=runner)
     r = client.get("/status")
@@ -284,3 +519,66 @@ def test_status_ready_when_runner_idle():
     r = client.get("/status")
     assert r.status_code == 200
     assert r.json()["equipment_status"] == "ready"
+
+
+def test_status_busy_when_olss_reports_external_acquisition():
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_olss_run.json"), runner=runner)
+    r = client.get("/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["equipment_status"] == "busy"
+    assert body["message"] == "OpenLab acquisition active (instrument state: Run)"
+    assert body["details"]["olss_current_run"] == "Direct OpenLab sequence"
+
+
+def test_status_paused_when_olss_reports_paused_sequence():
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_olss_paused.json"), runner=runner)
+    r = client.get("/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["equipment_status"] == "paused"
+    assert body["required_actions"] == ["resume_paused_sequence"]
+    assert body["components"]["hplc"]["state"] == "paused"
+
+
+def test_status_details_queue_length():
+    runner = FakeRunner(busy=True, run_id="active-run")
+    client = _client(_load("signals_ready.json"), runner=runner)
+    # Queue one more
+    client.post("/control/run", json=VALID_RUN_BODY)
+    r = client.get("/status")
+    body = r.json()
+    assert body["details"]["queue_length"] == 1
+
+
+# ---------------------------------------------------------------------------
+# MosesRunner OLSS lifecycle handling
+# ---------------------------------------------------------------------------
+
+def test_runner_holds_active_job_while_olss_occupied_after_moses_exit():
+    runner = MosesRunner()
+    entry = _fake_job_entry("active-123", status="dispatched")
+    entry.process.poll.return_value = 0  # type: ignore[union-attr]
+    runner._jobs[entry.queue_id] = entry
+    runner._active_id = entry.queue_id
+
+    runner.notify_olss_state("Idle", "Paused")
+    runner.poll(settings=Settings())
+
+    assert runner.get_active() is not None
+    assert entry.status == "acquiring"
+    assert entry.process is None
+
+    runner.notify_olss_state("Run", "OK")
+    runner.poll(settings=Settings())
+
+    assert runner.get_active() is not None
+    assert entry.status == "acquiring"
+
+    runner.notify_olss_state("Idle", "OK")
+    runner.poll(settings=Settings())
+
+    assert runner.get_active() is None
+    assert entry.status == "done"
