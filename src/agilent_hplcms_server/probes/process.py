@@ -43,7 +43,7 @@ import psutil
 
 from ..config import Settings, load_settings
 from .openlab_rest import read_instrument_state
-from .rc_driver_log import read_rc_driver_log
+from .rc_driver_log import read_module_states, read_rc_driver_log
 from .sensor_file import read_sensor_file
 
 
@@ -376,6 +376,7 @@ def read_signals(settings: Settings | None = None) -> dict[str, Any]:
 
     sensor = read_sensor_file(settings.sensor_data_file)
     rc_driver = read_rc_driver_log(settings.rc_driver_log_dir)
+    module_states = read_module_states(settings.rc_driver_log_dir)
 
     return {
         "openlab_acquisition_alive": bool(acq_alive),
@@ -400,4 +401,6 @@ def read_signals(settings: Settings | None = None) -> dict[str, Any]:
         **sensor,
         # RC driver log signals (solvent/waste bottle levels from RCDriver.log)
         **rc_driver,
+        # Per-module LC status from LDT SendInstruction entries in RCDriver.log
+        **module_states,
     }

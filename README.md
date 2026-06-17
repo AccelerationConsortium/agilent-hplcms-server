@@ -98,8 +98,8 @@ A background daemon thread polls every 5 seconds and automatically starts the ne
 
 The queue is gated by live OpenLab Sharing Services (OLSS) state, not only by jobs submitted through this server.
 
-- If an operator starts a run directly in OpenLab and OLSS reports `olss_instrument_state` as `Run`, `Busy`, `Prerun`, or `PostRun`, then `GET /status` returns `equipment_status: "busy"` even when no server-managed Moses job exists.
-- While OLSS reports an active acquisition, new `/control/run` and `/control/queue` submissions are accepted into the FIFO queue instead of starting immediately.
+- If an operator starts a run directly in OpenLab and OLSS reports `olss_instrument_state` as `Run`, `Running`, `Busy`, `Prerun`, or `PostRun`, then `GET /status` returns `equipment_status: "busy"` even when no server-managed Moses job exists.
+- New `/control/run` and `/control/queue` submissions start Moses immediately — Moses submits the job to OpenLab's native run queue regardless of current instrument state. The job appears in the Agilent software queue right away and OpenLab handles the ordering.
 - If OpenLab reports `olss_software_status: "Paused"` while connected, `GET /status` returns `equipment_status: "paused"` with `required_actions: ["resume_paused_sequence"]`.
 - If a Moses subprocess exits while OLSS still reports the instrument as running or paused, the server keeps the active job linked as `acquiring` and does not dispatch the next queued job until OLSS returns to idle.
 - When an operator resumes a paused sequence directly in OpenLab, OLSS returning to an active run state keeps `/status` busy and keeps `/control/queue` attached to the active job.
@@ -118,42 +118,75 @@ The queue is gated by live OpenLab Sharing Services (OLSS) state, not only by jo
 3. Any `python.exe` under `C:\Users\sdl2\anaconda3\envs\moses*\` currently running.
 4. Trailing bytes of `C:\ProgramData\Agilent\LogFiles\InstrumentService.log` and the newest `AcquisitionServer-*.log` for recent `ERROR` / `CRITICAL` / `FATAL` events.
 5. Server-managed runner state — if a run was just submitted, `busy` is forced immediately (before the `*.sirslt` directory appears on disk).
-6. **OpenLab Sharing Services (OLSS) REST API** — `GET /status` and `GET /control/queue` include `instrument_state` (e.g. `"Idle"`, `"Run"`, `"Busy"`, `"Prerun"`, `"PostRun"`, `"Error"`, `"NotReady"`, `"NotConnected"`) from the live OpenLab CDS instrument, plus `olss_software_status` and `olss_current_run` in `details`. OLSS active states are treated as busy even for runs submitted directly in OpenLab.
-7. **Sensor daemon JSON file** — `GET /status` → `metrics` includes live hardware metrics populated by `tools/hplcms_sensor_daemon.py`. Keys absent from the file render as `"—"` in the dashboard.
+6. **OpenLab Sharing Services (OLSS) REST API** — `GET /status` and `GET /control/queue` include `instrument_state` (e.g. `"Idle"`, `"Running"`, `"Busy"`, `"Prerun"`, `"PostRun"`, `"Error"`, `"NotReady"`, `"NotConnected"`) from the live OpenLab CDS instrument, plus `olss_software_status` and `olss_current_run` in `details`. OLSS active states are treated as busy even for runs submitted directly in OpenLab.
+7. **Sensor daemon JSON file** — `GET /status` → `metrics` includes live MS hardware metrics populated by `tools/hplcms_sensor_daemon.py`.
+8. **`RCDriver.log`** (`C:\ProgramData\Agilent\LogFiles\LC Drivers\`) — parsed for two signal classes:
+   - **Bottle fill levels** (`DoRequestResponse` + `BottleSolvents` XML): solvent A1/A2/B1/B2 and waste volumes. Written whenever OpenLab polls pump device settings (prerun, opening Bottle Fillings dialog, etc.). All `*RCDriver*.log` files are searched newest-first; data up to 7 days old is accepted (levels change slowly).
+   - **Per-module STAT?** (`LDT SendInstruction`): individual `ready`/`busy`/`error` state for each LC module (pump, DAD, column thermostat, multisampler), plus DAD lamp hours, pump-on flag, drawer occupancy.
 
 ## Live hardware metrics
 
-`GET /status` → `metrics` returns these keys. Each value is `{"value": …, "unit": "…"}`.
+`GET /status` → `metrics` returns these keys. Each value is `{"value": …, "unit": "…"}`.  Keys absent from all sources are omitted from the response.
 
-| Key | Unit | Live? | Source |
-|---|---|---|---|
-| `turbopump_ready` | bool | ✅ | G6160B SWARM API |
-| `vacuum_level_mbar` | mbar | ✅ | G6160B SWARM API |
-| `source_temperature_c` | °C | ✅ | G6160B SWARM API (drying gas temp) |
-| `source_temperature_setpoint_c` | °C | ✅ | G6160B SWARM API |
-| `drying_gas_flow_lpm` | L/min | ✅ | G6160B SWARM API |
-| `drying_gas_temperature_c` | °C | ✅ | G6160B SWARM API |
-| `nebulizer_pressure_psig` | psig | ✅ | G6160B SWARM API |
-| `hv_ready` | bool | ✅ | G6160B SWARM API (capillary voltage > 1 kV) |
-| `ms_communication_ok` | bool | ✅ | OLSS REST state (no sensor daemon needed) |
-| `pump_communication_ok` | bool | ✅ | OLSS REST state |
-| `autosampler_communication_ok` | bool | ✅ | OLSS REST state |
-| `system_pressure_bar` | bar | — | OpenLab SignalBuffer (WCF/SOAP, not yet wired) |
-| `flow_rate_ml_min` | mL/min | — | OpenLab SignalBuffer (WCF/SOAP, not yet wired) |
-| `column_temperature_c` | °C | — | OpenLab SignalBuffer (WCF/SOAP, not yet wired) |
-| `column_temperature_setpoint_c` | °C | — | not available |
-| `system_pressure_limit_bar` | bar | — | not available |
-| `degasser_active` | bool | — | not available |
-| `solvent_a_volume_ml` | mL | — | `SolventSensingSupported = False` on this setup |
-| `solvent_b_volume_ml` | mL | — | `SolventSensingSupported = False` on this setup |
-| `wash_solvent_volume_ml` | mL | — | `SolventSensingSupported = False` on this setup |
-| `waste_volume_ml` | mL | — | `SolventSensingSupported = False` on this setup |
-| `waste_capacity_ml` | mL | — | `SolventSensingSupported = False` on this setup |
-| `calibrant_ok` | bool | — | not available |
-| `last_calibration_date` | ISO 8601 | — | not available |
-| `leak_detected` | bool | — | not available |
+**MS (G6160B)**
 
-"—" keys are omitted from the response and displayed as "—" in the dashboard.
+| Key | Unit | Source |
+|---|---|---|
+| `turbopump_ready` | bool | G6160B SWARM API |
+| `vacuum_level_mbar` | mbar | G6160B SWARM API |
+| `source_temperature_c` | °C | G6160B SWARM API |
+| `source_temperature_setpoint_c` | °C | G6160B SWARM API |
+| `drying_gas_flow_lpm` | L/min | G6160B SWARM API |
+| `drying_gas_temperature_c` | °C | G6160B SWARM API |
+| `nebulizer_pressure_psig` | psig | G6160B SWARM API |
+| `hv_ready` | bool | G6160B SWARM API (capillary voltage > 1 kV) |
+
+**LC communication (derived from OLSS — always present when OpenLab is connected)**
+
+| Key | Unit | Source |
+|---|---|---|
+| `ms_communication_ok` | bool | OLSS REST state |
+| `pump_communication_ok` | bool | OLSS REST state |
+| `autosampler_communication_ok` | bool | OLSS REST state |
+
+**LC consumables (from `RCDriver.log` — updated whenever OpenLab polls the pump device settings)**
+
+Agilent UI slot labels: A1 → `a1`, A2 → `a2`, B1 → `b1`, B2 → `b2`.  Slots with max capacity 0 (unconfigured) are omitted.
+
+| Key | Unit | Notes |
+|---|---|---|
+| `solvent_a1_volume_ml` / `solvent_a1_capacity_ml` | mL | Bottle A1 |
+| `solvent_a2_volume_ml` / `solvent_a2_capacity_ml` | mL | Bottle A2 (omitted if unconfigured) |
+| `solvent_b1_volume_ml` / `solvent_b1_capacity_ml` | mL | Bottle B1 |
+| `solvent_b2_volume_ml` / `solvent_b2_capacity_ml` | mL | Bottle B2 (omitted if unconfigured) |
+| `solvent_a1_low` / `solvent_a2_low` / `solvent_b1_low` / `solvent_b2_low` | bool | True when volume ≤ not-ready limit (default 100 mL) |
+| `waste_volume_ml` / `waste_capacity_ml` | mL | Waste bottle |
+| `waste_near_capacity` | bool | True when waste ≥ not-ready limit (default 1900 mL) |
+
+Low-level bottles appear in `required_actions` as `refill_solvent_a1`, `refill_solvent_b1`, etc.
+
+**Not available**
+
+| Key | Reason |
+|---|---|
+| `system_pressure_bar`, `flow_rate_ml_min`, `column_temperature_c` | OpenLab SignalBuffer (port 9753) — WCF/SOAP endpoint, REST sub-paths return 404 |
+| `calibrant_ok`, `last_calibration_date`, `leak_detected` | No accessible source on this setup |
+
+## Per-module LC components
+
+`GET /status` → `components` includes one entry per LC module, populated from `RCDriver.log` `LDT SendInstruction` entries.
+
+| Component key | Module | Extra info in `message` |
+|---|---|---|
+| `binary_pump` | G7120A | `"pumping"` / `"pump off"` |
+| `dad_detector` | G7117B | lamp state + `NNN/2000h lamp` |
+| `column_thermostat` | G7116B | `"thermostat on"` / `"thermostat off"` |
+| `multisampler` | G7167B | `"N/M drawers occupied"` |
+
+Each component has `state`: `ready` / `busy` / `error` / `not_ready` / `unknown`.
+
+- While OLSS reports an active run (`Running`, `Busy`, etc.), all module states are forced to `"busy"`.
+- When OLSS is idle, each module uses its own STAT? readiness flags (`READY` / `NOT_READY` / `ERROR`), ignoring stale run-phase tokens.
 
 ## Sensor daemon
 
@@ -164,9 +197,8 @@ The live MS hardware metrics come from a companion daemon that runs in the `mose
 - **OpenLab InstrumentController** (Named Pipe) — used only for connection events and to know OpenLab is online. Does not supply any sensor readings.
 
 **Data sources confirmed unavailable:**
-- OpenLab SignalBufferService (`DESKTOP-V2PV40S:9753`) — WCF/SOAP POST-only endpoint; REST sub-paths return 404. Deferred.
+- OpenLab SignalBufferService (`DESKTOP-V2PV40S:9753`) — WCF/SOAP POST-only endpoint; REST sub-paths return 404. Would give live pressure, flow rate, column temperature. Deferred.
 - LC module hardware (`192.168.254.59`) — no HTTP API on that LAN card; telnet port 23 is LAN config only.
-- Solvent/waste volumes — `SolventSensingSupported = False` on this OpenLab configuration.
 
 ### Run the daemon
 
@@ -200,7 +232,7 @@ Writes to `C:\SDL_Tools\hplcms_sensor_data.json` every 30 seconds (override via 
 | `requires_init` | Any required OpenLab core process missing. |
 | `error` | An `ERROR` / `CRITICAL` / `FATAL` event in the last `ERROR_WINDOW_S` of OpenLab logs. |
 | `paused` | OLSS reports `olss_software_status: "Paused"` while OpenLab is connected. Response includes `required_actions: ["resume_paused_sequence"]`. |
-| `busy` | Newest `*.sirslt` mtime within `BUSY_THRESHOLD_S`, a moses-env `python.exe` running, server-managed run active, or OLSS instrument state is `Run`, `Busy`, `Prerun`, or `PostRun`. |
+| `busy` | Newest `*.sirslt` mtime within `BUSY_THRESHOLD_S`, a moses-env `python.exe` running, server-managed run active, or OLSS instrument state is `Run`, `Running`, `Busy`, `Prerun`, or `PostRun`. |
 | `ready` | OpenLab core processes up, no recent error, no recent acquisition activity, no active run. |
 | `unknown` | Probe could not stat the OpenLab log dir or the CDS results dir. |
 

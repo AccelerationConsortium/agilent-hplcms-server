@@ -27,7 +27,7 @@ EQUIPMENT_KIND = "hplc"
 
 # OLSS instrument states that indicate an active acquisition. Must match
 # _OLSS_ACTIVE_STATES in control/runner.py (duplicated to avoid import coupling).
-_OLSS_ACTIVE_STATES: frozenset[str] = frozenset({"Run", "Busy", "Prerun", "PostRun"})
+_OLSS_ACTIVE_STATES: frozenset[str] = frozenset({"Run", "Running", "Busy", "Prerun", "PostRun"})
 
 
 def build_status(
@@ -65,8 +65,10 @@ def build_status(
     probe_error: str | None = signals.get("probe_error")
 
     waste_near_capacity: bool = bool(signals.get("waste_near_capacity"))
-    solvent_a_low: bool = bool(signals.get("solvent_a_low"))
-    solvent_c_low: bool = bool(signals.get("solvent_c_low"))
+    solvent_a1_low: bool = bool(signals.get("solvent_a1_low"))
+    solvent_a2_low: bool = bool(signals.get("solvent_a2_low"))
+    solvent_b1_low: bool = bool(signals.get("solvent_b1_low"))
+    solvent_b2_low: bool = bool(signals.get("solvent_b2_low"))
 
     olss_state: str | None = signals.get("olss_instrument_state")
     olss_sw_status: str | None = signals.get("olss_software_status")
@@ -132,10 +134,14 @@ def build_status(
     # client can act on them even during a run.
     if waste_near_capacity:
         required_actions = list(required_actions) + ["empty_waste_bottle"]
-    if solvent_a_low:
-        required_actions = list(required_actions) + ["refill_solvent_a"]
-    if solvent_c_low:
-        required_actions = list(required_actions) + ["refill_solvent_c"]
+    if solvent_a1_low:
+        required_actions = list(required_actions) + ["refill_solvent_a1"]
+    if solvent_a2_low:
+        required_actions = list(required_actions) + ["refill_solvent_a2"]
+    if solvent_b1_low:
+        required_actions = list(required_actions) + ["refill_solvent_b1"]
+    if solvent_b2_low:
+        required_actions = list(required_actions) + ["refill_solvent_b2"]
 
     # Map OLSS instrument state to a component state string understood by clients.
     def _olss_to_component_state(s: str | None) -> str:
@@ -151,6 +157,7 @@ def build_status(
             "Busy": "busy",
             "Prerun": "busy",
             "Run": "busy",
+            "Running": "busy",
             "PostRun": "busy",
         }.get(s, s.lower())
 
@@ -189,6 +196,19 @@ def build_status(
         ),
     }
 
+    # Per-module LC components derived from RCDriver.log LDT entries.
+    # Only added when signal data is present; absent = no component card shown.
+    _lc_module_conn = olss_connected or bool(signals.get("openlab_acquisition_alive"))
+
+    for role, comp in [
+        ("binary_pump",       _build_pump_component(signals, _lc_module_conn, olss_state)),
+        ("dad_detector",      _build_dad_component(signals, _lc_module_conn, olss_state)),
+        ("column_thermostat", _build_column_component(signals, _lc_module_conn, olss_state)),
+        ("multisampler",      _build_multisampler_component(signals, _lc_module_conn, olss_state)),
+    ]:
+        if comp is not None:
+            components[role] = comp
+
     details: dict[str, Any] = {
         "instrument_label": settings.instrument_label,
         "openlab_log_dir": settings.openlab_log_dir,
@@ -220,10 +240,9 @@ def build_status(
         details["rc_driver_data_age_s"] = signals["rc_driver_data_age_s"]
     if waste_near_capacity:
         details["waste_near_capacity"] = True
-    if solvent_a_low:
-        details["solvent_a_low"] = True
-    if solvent_c_low:
-        details["solvent_c_low"] = True
+    for _slot in ("a1", "a2", "b1", "b2"):
+        if signals.get(f"solvent_{_slot}_low"):
+            details[f"solvent_{_slot}_low"] = True
 
     # Keep the runner's OLSS-occupied flag current so poll() can gate job
     # completion and next-job dispatch correctly without importing any probe.
@@ -244,6 +263,133 @@ def build_status(
         metrics=_build_metrics(signals),
         last_error=last_error,
         details=details,
+    )
+
+
+def _module_state_with_olss(
+    module_state: str | None,
+    olss_state: str | None,
+    stat_age_s: float | None,
+    stat_flags: list[str] | None = None,
+) -> str:
+    """Reconcile STAT? module state with the current OLSS overall state.
+
+    OLSS is only used to detect active acquisition (Run/Prerun/Busy/PostRun →
+    "busy").  For non-active OLSS states, each module keeps its own individual
+    state derived from its STAT? readiness flags — the overall OLSS aggregate
+    (e.g. "NotReady") may reflect a *different* module still warming up and
+    should not be blindly applied to all modules.
+
+    When STAT? is stale (> 5 min) the run-phase token (PRERUN/RUN/POSTRUN) is
+    from the previous run and is ignored; only the READY / NOT_READY / ERROR
+    flags are used.
+    """
+    if module_state is None:
+        return "unknown"
+    if olss_state in ("Run", "Busy", "Prerun", "PostRun"):
+        return "busy"
+    _stale = stat_age_s is None or stat_age_s > 300
+    if _stale and stat_flags is not None:
+        # Stale STAT?: strip run-phase tokens and read readiness only.
+        fs = {f.upper() for f in stat_flags}
+        if "ERROR" in fs:
+            return "error"
+        if "NOT_READY" in fs or "NOTREADY" in fs:
+            return "not_ready"
+        if "READY" in fs:
+            return "ready"
+    if _stale and olss_state == "Idle":
+        # No flags, but OLSS confirms the whole system is idle → safe to say ready.
+        return "ready"
+    return module_state
+
+
+def _build_pump_component(
+    signals: dict[str, Any], connected: bool, olss_state: str | None
+) -> ComponentStatus | None:
+    state_raw = signals.get("module_binary_pump_state")
+    if state_raw is None:
+        return None
+    age = signals.get("module_binary_pump_stat_age_s")
+    flags: list[str] | None = signals.get("module_binary_pump_stat_flags")
+    parts: list[str] = []
+    pump_on = signals.get("module_binary_pump_on")
+    if pump_on is not None:
+        parts.append("pumping" if pump_on else "standby")
+    if age is not None and age > 3600:
+        parts.append(f"last seen {age / 3600:.1f}h ago")
+    return ComponentStatus(
+        connected=connected,
+        state=_module_state_with_olss(state_raw, olss_state, age, flags),
+        message=", ".join(parts) or None,
+    )
+
+
+def _build_dad_component(
+    signals: dict[str, Any], connected: bool, olss_state: str | None
+) -> ComponentStatus | None:
+    state_raw = signals.get("module_dad_detector_state")
+    if state_raw is None:
+        return None
+    age = signals.get("module_dad_detector_stat_age_s")
+    flags: list[str] | None = signals.get("module_dad_detector_stat_flags")
+    parts: list[str] = []
+    lamp_on = signals.get("module_dad_lamp_on")
+    if lamp_on is not None:
+        parts.append("lamp on" if lamp_on else "lamp off")
+    hours_used = signals.get("module_dad_lamp_hours_used")
+    hours_rated = signals.get("module_dad_lamp_rated_hours")
+    if hours_used is not None and hours_rated:
+        parts.append(f"{hours_used:.0f}/{hours_rated}h lamp")
+    if age is not None and age > 3600:
+        parts.append(f"last seen {age / 3600:.1f}h ago")
+    return ComponentStatus(
+        connected=connected,
+        state=_module_state_with_olss(state_raw, olss_state, age, flags),
+        message=", ".join(parts) or None,
+    )
+
+
+def _build_column_component(
+    signals: dict[str, Any], connected: bool, olss_state: str | None
+) -> ComponentStatus | None:
+    state_raw = signals.get("module_column_thermostat_state")
+    if state_raw is None:
+        return None
+    age = signals.get("module_column_thermostat_stat_age_s")
+    flags: list[str] | None = signals.get("module_column_thermostat_stat_flags")
+    parts: list[str] = []
+    thrm_on = signals.get("module_column_thermostat_on")
+    if thrm_on is not None:
+        parts.append("thermostat on" if thrm_on else "thermostat off")
+    if age is not None and age > 3600:
+        parts.append(f"last seen {age / 3600:.1f}h ago")
+    return ComponentStatus(
+        connected=connected,
+        state=_module_state_with_olss(state_raw, olss_state, age, flags),
+        message=", ".join(parts) or None,
+    )
+
+
+def _build_multisampler_component(
+    signals: dict[str, Any], connected: bool, olss_state: str | None
+) -> ComponentStatus | None:
+    state_raw = signals.get("module_multisampler_state")
+    if state_raw is None:
+        return None
+    age = signals.get("module_multisampler_stat_age_s")
+    flags: list[str] | None = signals.get("module_multisampler_stat_flags")
+    parts: list[str] = []
+    occupied = signals.get("module_multisampler_drawers_occupied")
+    total = signals.get("module_multisampler_drawers_total")
+    if occupied is not None and total is not None:
+        parts.append(f"{occupied}/{total} drawers occupied")
+    if age is not None and age > 3600:
+        parts.append(f"last seen {age / 3600:.1f}h ago")
+    return ComponentStatus(
+        connected=connected,
+        state=_module_state_with_olss(state_raw, olss_state, age, flags),
+        message=", ".join(parts) or None,
     )
 
 
@@ -287,17 +433,14 @@ def _build_metrics(signals: dict[str, Any]) -> dict[str, MetricValue]:
     _put("degasser_active",               signals.get("degasser_active"))
 
     # --- Consumables (from RC driver log + sensor daemon JSON file) ---
-    _put("solvent_a_volume_ml",           signals.get("solvent_a_volume_ml"),          "mL")
-    _put("solvent_a_capacity_ml",         signals.get("solvent_a_capacity_ml"),        "mL")
-    _put("solvent_b_volume_ml",           signals.get("solvent_b_volume_ml"),          "mL")
-    _put("solvent_c_volume_ml",           signals.get("solvent_c_volume_ml"),          "mL")
-    _put("solvent_c_capacity_ml",         signals.get("solvent_c_capacity_ml"),        "mL")
+    for _slot in ("a1", "a2", "b1", "b2"):
+        _put(f"solvent_{_slot}_volume_ml",   signals.get(f"solvent_{_slot}_volume_ml"),  "mL")
+        _put(f"solvent_{_slot}_capacity_ml", signals.get(f"solvent_{_slot}_capacity_ml"), "mL")
+        _put(f"solvent_{_slot}_low",         signals.get(f"solvent_{_slot}_low"))
     _put("wash_solvent_volume_ml",        signals.get("wash_solvent_volume_ml"),       "mL")
     _put("waste_volume_ml",               signals.get("waste_volume_ml"),              "mL")
     _put("waste_capacity_ml",             signals.get("waste_capacity_ml"),            "mL")
     _put("waste_near_capacity",           signals.get("waste_near_capacity"))
-    _put("solvent_a_low",                 signals.get("solvent_a_low"))
-    _put("solvent_c_low",                 signals.get("solvent_c_low"))
     _put("calibrant_ok",                  signals.get("calibrant_ok"))
 
     # --- Calibration & Comms (from sensor daemon JSON file) ---

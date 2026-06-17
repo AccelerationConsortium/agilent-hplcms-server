@@ -121,7 +121,7 @@ def test_olss_run_marks_status_busy_without_filesystem_acquisition():
     body = client.get("/status").json()
 
     assert body["equipment_status"] == "busy"
-    assert body["message"] == "OpenLab acquisition active (instrument state: Run)"
+    assert body["message"] == "OpenLab acquisition active (instrument state: Running)"
     assert body["details"]["olss_current_run"] == "Direct OpenLab sequence"
     assert body["components"]["hplc"]["state"] == "busy"
     assert body["components"]["ms"]["state"] == "busy"
