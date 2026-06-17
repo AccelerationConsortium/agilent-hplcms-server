@@ -528,7 +528,7 @@ def test_status_busy_when_olss_reports_external_acquisition():
     assert r.status_code == 200
     body = r.json()
     assert body["equipment_status"] == "busy"
-    assert body["message"] == "OpenLab acquisition active (instrument state: Run)"
+    assert body["message"] == "OpenLab acquisition active (instrument state: Running)"
     assert body["details"]["olss_current_run"] == "Direct OpenLab sequence"
 
 

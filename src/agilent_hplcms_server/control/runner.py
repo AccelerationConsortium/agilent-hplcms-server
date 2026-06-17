@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # OLSS instrument states that mean the instrument is actively acquiring.
 # When the runner is notified of these states it holds open any tracked job
 # (even if Moses has exited) and refuses to start the next pending job.
-_OLSS_ACTIVE_STATES: frozenset[str] = frozenset({"Run", "Busy", "Prerun", "PostRun"})
+_OLSS_ACTIVE_STATES: frozenset[str] = frozenset({"Run", "Running", "Busy", "Prerun", "PostRun"})
 
 
 @dataclass
@@ -112,6 +112,10 @@ class MosesRunner:
         Called by ``build_status()`` on every ``/status`` poll so the runner
         stays current without importing any probe code.  ``_olss_occupied`` is
         True while the instrument is actively running *or* in a paused sequence.
+        Used to hold a Moses job open after Moses exits early (the job stays
+        "acquiring" until OLSS confirms the run is done).  It does NOT gate new
+        job submissions — Moses submits directly to OpenLab's native queue and
+        the instrument handles ordering.
         """
         occupied = olss_state in _OLSS_ACTIVE_STATES or (
             olss_sw_status == "Paused"
@@ -201,10 +205,7 @@ class MosesRunner:
                 self._active_id = None
                 self._evict_history()
 
-            # Don't start the next job while the instrument is occupied via
-            # OLSS (e.g. a run submitted directly in OpenLab, or a paused
-            # sequence that has no active runner job).
-            if self._active_id is not None or not self._pending_ids or self._olss_occupied:
+            if self._active_id is not None or not self._pending_ids:
                 return
             next_id = self._pending_ids.popleft()
             next_entry = self._jobs.get(next_id)
@@ -285,7 +286,7 @@ class MosesRunner:
         with self._lock:
             self._jobs[queue_id] = entry
 
-            if self._active_id is None and not self._olss_occupied:
+            if self._active_id is None:
                 self._launch_locked(entry, settings)
                 return queue_id, 0
 
