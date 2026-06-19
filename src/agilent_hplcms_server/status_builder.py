@@ -1,4 +1,4 @@
-"""Map probe signals to a STATUS_SPEC v1.0 ``EquipmentStatus`` envelope."""
+"""Map probe signals to a STATUS_SPEC v1.1 ``EquipmentStatus`` envelope."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Any
 
 from . import __version__
 from .config import Settings, load_settings
+from .control.actions import allowed_actions as _allowed_actions
 from .models import (
     ComponentStatus,
     EquipmentStatus,
@@ -15,9 +16,11 @@ from .models import (
     MetricValue,
 )
 
-# Avoid a hard import cycle: MosesRunner is only imported for type-checking.
+# Avoid a hard import cycle: MosesRunner / ClaimHolder are only imported for
+# type-checking.
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
+    from .control.claims import ClaimHolder
     from .control.runner import MosesRunner
 
 
@@ -34,6 +37,7 @@ def build_status(
     signals: dict[str, Any],
     settings: Settings | None = None,
     runner: "MosesRunner | None" = None,
+    claims: "ClaimHolder | None" = None,
 ) -> EquipmentStatus:
     """Build an ``EquipmentStatus`` from a probe ``read_signals()`` dict."""
     settings = settings or load_settings()
@@ -113,7 +117,11 @@ def build_status(
         message = "Recent OpenLab error event in log tail"
         required_actions = []
     elif sequence_paused:
-        equipment_state = "paused"
+        # OLSS "Paused" is not a legal EquipmentState (v1.1 dropped "paused").
+        # Report "busy" — the instrument is mid-sequence and unavailable — and
+        # surface the resume action. The precise OLSS status is preserved in
+        # details.olss_software_status and the hplc/ms component state below.
+        equipment_state = "busy"
         message = "OpenLab sequence paused — click Resume in OpenLab run queue to continue"
         required_actions = ["resume_paused_sequence"]
     elif signals.get("acquisition_active") or signals.get("moses_process_alive") or olss_acquiring:
@@ -244,10 +252,25 @@ def build_status(
         if signals.get(f"solvent_{_slot}_low"):
             details[f"solvent_{_slot}_low"] = True
 
+    # v1.1: surface the current claim holder (null when unclaimed/expired).
+    claimed_by = claims.current() if claims is not None else None
+    details["claimed_by"] = claimed_by.model_dump(mode="json") if claimed_by is not None else None
+
     # Keep the runner's OLSS-occupied flag current so poll() can gate job
     # completion and next-job dispatch correctly without importing any probe.
     if runner is not None:
         runner.notify_olss_state(olss_state, olss_sw_status)
+
+    # v1.1 allowed_actions (§6.2): single source of truth shared with the
+    # /control/* router so the advisory list can never disagree with what the
+    # endpoints would actually honour. probe_error → we cannot reason about the
+    # instrument, so offer nothing.
+    queue_full = runner.is_queue_full(settings) if runner is not None else False
+    allowed = _allowed_actions(
+        service_operational=(probe_error is None),
+        requires_init=(equipment_state == "requires_init"),
+        queue_full=queue_full,
+    )
 
     return EquipmentStatus(
         equipment_id=EQUIPMENT_ID,
@@ -262,6 +285,7 @@ def build_status(
         components=components,
         metrics=_build_metrics(signals),
         last_error=last_error,
+        allowed_actions=allowed,
         details=details,
     )
 

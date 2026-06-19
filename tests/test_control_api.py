@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from subprocess import Popen
@@ -38,7 +39,7 @@ def _fake_job_entry(
     status: str = "dispatched",
     request_dict: dict | None = None,
 ) -> JobEntry:
-    active = status in ("dispatched", "acquiring")
+    active = status in ("dispatched", "enqueued", "acquiring")
     return JobEntry(
         queue_id=run_id,
         script_name="examples/agent_agilent.py",
@@ -62,9 +63,10 @@ class FakeRunner(MosesRunner):
         busy: bool = False,
         run_id: str = "test-run-1",
         force_acquiring: bool = False,
+        queue_full: bool = False,
     ) -> None:
         super().__init__()
-        if busy:
+        if busy or queue_full:
             entry = _fake_job_entry(run_id, status="dispatched")
             self._jobs[run_id] = entry
             self._active_id = run_id
@@ -72,9 +74,13 @@ class FakeRunner(MosesRunner):
         self.aborted = False
         self._next_run_id = "queued-run-1"
         self._force_acquiring = force_acquiring
+        self._queue_full = queue_full
 
     def check_acquiring(self, settings=None) -> bool:  # type: ignore[override]
         return self._force_acquiring
+
+    def is_queue_full(self, settings=None) -> bool:  # type: ignore[override]
+        return self._queue_full
 
     def submit_to_queue(  # type: ignore[override]
         self,
@@ -87,6 +93,8 @@ class FakeRunner(MosesRunner):
         if script_name not in allowed:
             raise ValueError(f"Script '{script_name}' is not in MOSES_ALLOWED_SCRIPTS.")
         settings_obj = settings or Settings()
+        if self._queue_full:
+            raise OverflowError(f"Queue is full ({settings_obj.queue_max_depth} pending runs).")
         if len(self._pending_ids) >= settings_obj.queue_max_depth and self._active_id is not None:
             raise OverflowError(f"Queue is full ({settings_obj.queue_max_depth} pending runs).")
 
@@ -151,6 +159,28 @@ def _client(signals: dict, runner: MosesRunner | None = None) -> TestClient:
     return TestClient(app)
 
 
+def _authed_client(
+    signals: dict,
+    runner: MosesRunner | None = None,
+    *,
+    owner: str = "test-operator",
+    session_id: str = "test-session",
+) -> TestClient:
+    """A client that holds a valid claim, with ``X-Claim-Token`` pre-set as a
+    default header on every request — mirrors how the aggregator drives a
+    hard-enforcement (v1.1) device. Use for tests that hit mutating
+    ``/control/*`` endpoints; read-only tests can use :func:`_client`.
+    """
+    client = _client(signals, runner=runner)
+    r = client.post(
+        "/control/claim",
+        json={"owner": owner, "session_id": session_id, "ttl_s": 30.0},
+    )
+    assert r.status_code == 200, r.text
+    client.headers["X-Claim-Token"] = r.json()["claim_token"]
+    return client
+
+
 # ---------------------------------------------------------------------------
 # Valid job fixture
 # ---------------------------------------------------------------------------
@@ -169,7 +199,7 @@ VALID_RUN_BODY = {
         "gradient_table": [[0.0, 0.05], [1.0, 0.05], [7.0, 1.0], [9.8, 1.0], [9.9, 0.05]],
     },
     "samples": [
-        {"sample_name": "cpd_01", "sample_position": "D4B-A1", "injection_volume": 2.0}
+        {"sample_name": "cpd_01", "tray": "front", "well": "A1", "injection_volume": 2.0}
     ],
 }
 
@@ -201,7 +231,7 @@ def test_startup_requires_init():
 
 def test_run_accepted_when_idle():
     runner = FakeRunner(busy=False)
-    client = _client(_load("signals_ready.json"), runner=runner)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
     r = client.post("/control/run", json=VALID_RUN_BODY)
     assert r.status_code == 202, r.text
     body = r.json()
@@ -213,7 +243,7 @@ def test_run_accepted_when_idle():
 
 def test_run_queued_when_busy():
     runner = FakeRunner(busy=True, run_id="existing-run")
-    client = _client(_load("signals_ready.json"), runner=runner)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
     r = client.post("/control/run", json=VALID_RUN_BODY)
     assert r.status_code == 202, r.text
     body = r.json()
@@ -224,7 +254,7 @@ def test_run_queued_when_busy():
 
 def test_run_queued_when_olss_reports_external_acquisition():
     runner = FakeRunner(busy=False)
-    client = _client(_load("signals_olss_run.json"), runner=runner)
+    client = _authed_client(_load("signals_olss_run.json"), runner=runner)
     r = client.post("/control/run", json=VALID_RUN_BODY)
     assert r.status_code == 202, r.text
     body = r.json()
@@ -237,7 +267,7 @@ def test_run_queued_when_olss_reports_external_acquisition():
 
 def test_run_409_when_requires_init():
     runner = FakeRunner(busy=False)
-    client = _client(_load("signals_requires_init.json"), runner=runner)
+    client = _authed_client(_load("signals_requires_init.json"), runner=runner)
     r = client.post("/control/run", json=VALID_RUN_BODY)
     assert r.status_code == 409
     detail = r.json()["detail"]
@@ -249,7 +279,7 @@ def test_run_422_injection_volume_too_large():
     runner = FakeRunner(busy=False)
     client = _client(_load("signals_ready.json"), runner=runner)
     bad = {**VALID_RUN_BODY, "samples": [
-        {"sample_name": "s1", "sample_position": "D4B-A1", "injection_volume": 999.0}
+        {"sample_name": "s1", "tray": "front", "well": "A1", "injection_volume": 999.0}
     ]}
     r = client.post("/control/run", json=bad)
     assert r.status_code == 422
@@ -273,8 +303,11 @@ def test_run_422_empty_samples():
 
 
 def test_run_422_invalid_script_name():
+    # script_name is a free-form field (no Pydantic pattern); the allowlist
+    # rejection is a runtime 422 raised inside enqueue, so a valid claim is
+    # needed to get past hard enforcement and reach it.
     runner = FakeRunner(busy=False)
-    client = _client(_load("signals_ready.json"), runner=runner)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
     bad = {**VALID_RUN_BODY, "script_name": "../../evil.py"}
     r = client.post("/control/run", json=bad)
     assert r.status_code == 422
@@ -284,7 +317,7 @@ def test_run_422_sample_name_with_spaces():
     runner = FakeRunner(busy=False)
     client = _client(_load("signals_ready.json"), runner=runner)
     bad = {**VALID_RUN_BODY, "samples": [
-        {"sample_name": "has spaces", "sample_position": "D4B-A1", "injection_volume": 2.0}
+        {"sample_name": "has spaces", "tray": "front", "well": "A1", "injection_volume": 2.0}
     ]}
     r = client.post("/control/run", json=bad)
     assert r.status_code == 422
@@ -296,7 +329,7 @@ def test_run_422_sample_name_with_spaces():
 
 def test_post_queue_accepted_when_idle():
     runner = FakeRunner(busy=False)
-    client = _client(_load("signals_ready.json"), runner=runner)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
     r = client.post("/control/queue", json=VALID_RUN_BODY)
     assert r.status_code == 202, r.text
     body = r.json()
@@ -307,7 +340,7 @@ def test_post_queue_accepted_when_idle():
 
 def test_post_queue_queued_when_busy():
     runner = FakeRunner(busy=True, run_id="active-123")
-    client = _client(_load("signals_ready.json"), runner=runner)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
     r = client.post("/control/queue", json=VALID_RUN_BODY)
     assert r.status_code == 202, r.text
     body = r.json()
@@ -317,7 +350,7 @@ def test_post_queue_queued_when_busy():
 
 def test_post_queue_queued_when_olss_reports_external_acquisition():
     runner = FakeRunner(busy=False)
-    client = _client(_load("signals_olss_run.json"), runner=runner)
+    client = _authed_client(_load("signals_olss_run.json"), runner=runner)
     r = client.post("/control/queue", json=VALID_RUN_BODY)
     assert r.status_code == 202, r.text
     body = r.json()
@@ -328,7 +361,7 @@ def test_post_queue_queued_when_olss_reports_external_acquisition():
 
 def test_post_queue_409_requires_init():
     runner = FakeRunner(busy=False)
-    client = _client(_load("signals_requires_init.json"), runner=runner)
+    client = _authed_client(_load("signals_requires_init.json"), runner=runner)
     r = client.post("/control/queue", json=VALID_RUN_BODY)
     assert r.status_code == 409
 
@@ -363,7 +396,7 @@ def test_queue_shows_active_run():
 
 def test_queue_shows_pending_after_submit():
     runner = FakeRunner(busy=True, run_id="active-123")
-    client = _client(_load("signals_ready.json"), runner=runner)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
     client.post("/control/run", json=VALID_RUN_BODY)
     r = client.get("/control/queue")
     body = r.json()
@@ -412,7 +445,7 @@ def test_queue_instrument_offline():
 
 def test_delete_queue_cancels_pending():
     runner = FakeRunner(busy=True, run_id="active-123")
-    client = _client(_load("signals_ready.json"), runner=runner)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
     # Queue a pending job
     r = client.post("/control/queue", json=VALID_RUN_BODY)
     queue_id = r.json()["queue_id"]
@@ -428,14 +461,14 @@ def test_delete_queue_cancels_pending():
 
 def test_delete_queue_409_running():
     runner = FakeRunner(busy=True, run_id="active-123")
-    client = _client(_load("signals_ready.json"), runner=runner)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
     r = client.delete("/control/queue/active-123")
     assert r.status_code == 409
 
 
 def test_delete_queue_404_not_found():
     runner = FakeRunner(busy=False)
-    client = _client(_load("signals_ready.json"), runner=runner)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
     r = client.delete("/control/queue/nonexistent-id")
     assert r.status_code == 404
 
@@ -446,7 +479,7 @@ def test_delete_queue_404_not_found():
 
 def test_abort_not_running():
     runner = FakeRunner(busy=False)
-    client = _client(_load("signals_ready.json"), runner=runner)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
     r = client.post("/control/abort")
     assert r.status_code == 200
     body = r.json()
@@ -456,7 +489,7 @@ def test_abort_not_running():
 
 def test_abort_active_run():
     runner = FakeRunner(busy=True, run_id="run-to-abort")
-    client = _client(_load("signals_ready.json"), runner=runner)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
     r = client.post("/control/abort")
     assert r.status_code == 200
     body = r.json()
@@ -467,7 +500,7 @@ def test_abort_active_run():
 
 def test_abort_clears_queue():
     runner = FakeRunner(busy=True, run_id="active-run")
-    client = _client(_load("signals_ready.json"), runner=runner)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
     # Queue two more runs
     client.post("/control/run", json=VALID_RUN_BODY)
     client.post("/control/run", json=VALID_RUN_BODY)
@@ -478,23 +511,23 @@ def test_abort_clears_queue():
 
 
 # ---------------------------------------------------------------------------
-# /control/shutdown
+# /control/standby
 # ---------------------------------------------------------------------------
 
-def test_shutdown_accepted_when_idle():
+def test_standby_accepted_when_idle():
     runner = FakeRunner(busy=False)
-    client = _client(_load("signals_ready.json"), runner=runner)
-    r = client.post("/control/shutdown")
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    r = client.post("/control/standby")
     assert r.status_code == 202, r.text
     body = r.json()
     assert body["status"] == "accepted"
     assert body["run_id"]
 
 
-def test_shutdown_queued_when_busy():
+def test_standby_queued_when_busy():
     runner = FakeRunner(busy=True, run_id="active-run")
-    client = _client(_load("signals_ready.json"), runner=runner)
-    r = client.post("/control/shutdown")
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    r = client.post("/control/standby")
     assert r.status_code == 202, r.text
     body = r.json()
     assert body["status"] == "queued"
@@ -532,20 +565,25 @@ def test_status_busy_when_olss_reports_external_acquisition():
     assert body["details"]["olss_current_run"] == "Direct OpenLab sequence"
 
 
-def test_status_paused_when_olss_reports_paused_sequence():
+def test_status_paused_sequence_maps_to_busy():
+    """v1.1: OLSS 'Paused' is reported as equipment_status 'busy' (paused is not
+    a legal EquipmentState). The precise OLSS status is preserved in details and
+    the hplc component state."""
     runner = FakeRunner(busy=False)
     client = _client(_load("signals_olss_paused.json"), runner=runner)
     r = client.get("/status")
     assert r.status_code == 200
     body = r.json()
-    assert body["equipment_status"] == "paused"
+    assert body["equipment_status"] == "busy"
     assert body["required_actions"] == ["resume_paused_sequence"]
+    assert "paused" in body["message"].lower()
     assert body["components"]["hplc"]["state"] == "paused"
+    assert body["details"]["olss_software_status"] == "Paused"
 
 
 def test_status_details_queue_length():
     runner = FakeRunner(busy=True, run_id="active-run")
-    client = _client(_load("signals_ready.json"), runner=runner)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
     # Queue one more
     client.post("/control/run", json=VALID_RUN_BODY)
     r = client.get("/status")
@@ -567,18 +605,492 @@ def test_runner_holds_active_job_while_olss_occupied_after_moses_exit():
     runner.notify_olss_state("Idle", "Paused")
     runner.poll(settings=Settings())
 
+    # Moses exited while OLSS was occupied → job submitted to OpenLab queue
     assert runner.get_active() is not None
-    assert entry.status == "acquiring"
+    assert entry.status == "enqueued"
     assert entry.process is None
 
+    # OLSS reports Running → instrument picked up the job
     runner.notify_olss_state("Run", "OK")
     runner.poll(settings=Settings())
 
     assert runner.get_active() is not None
     assert entry.status == "acquiring"
 
+    # OLSS returns to idle. Entry has no output_dir → _has_sirslt returns True
+    # (cannot verify, assume done). notify_olss_state finalises before poll().
     runner.notify_olss_state("Idle", "OK")
     runner.poll(settings=Settings())
 
     assert runner.get_active() is None
     assert entry.status == "done"
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: abort() atomicity — job shows "failed" immediately after abort
+# ---------------------------------------------------------------------------
+
+def test_abort_active_run_shows_failed_in_queue():
+    """After POST /control/abort the job appears as failed in GET /control/queue."""
+    runner = FakeRunner(busy=True, run_id="run-to-abort")
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    client.post("/control/abort")
+    body = client.get("/control/queue").json()
+    jobs = {j["queue_id"]: j for j in body["queue"]}
+    assert "run-to-abort" in jobs
+    assert jobs["run-to-abort"]["status"] == "failed"
+    assert body["active_run_id"] is None
+
+
+def test_abort_active_run_real_runner():
+    """MosesRunner.abort() marks the job failed inside the lock (no second lock race)."""
+    runner = MosesRunner()
+    entry = _fake_job_entry("active-123", status="dispatched")
+    runner._jobs[entry.queue_id] = entry
+    runner._active_id = entry.queue_id
+
+    was_active, n_cleared = runner.abort(settings=Settings())
+
+    assert was_active is True
+    assert n_cleared == 0
+    assert entry.status == "failed"
+    assert entry.error_msg == "Aborted by operator"
+    assert runner.get_active() is None
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: OLSS→idle sync — correct lifecycle when preceding job finishes first
+# ---------------------------------------------------------------------------
+
+def test_runner_keeps_enqueued_when_olss_idle_no_results():
+    """OLSS going idle with no sirslt → job demoted to enqueued (preceding job may have finished,
+    ours is still waiting in OpenLab's queue)."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        runner = MosesRunner()
+        entry = _fake_job_entry(
+            "active-123",
+            status="acquiring",
+            request_dict={
+                "script_name": "examples/agent_agilent.py",
+                "output_dir": tmp_dir,
+            },
+        )
+        entry.process = None  # Moses already exited
+        runner._jobs[entry.queue_id] = entry
+        runner._active_id = entry.queue_id
+        runner._olss_occupied = True  # instrument was Running
+
+        # OLSS returns to idle; output_dir exists but no sirslt files yet
+        runner.notify_olss_state("Idle", None)
+
+        # Job should be "enqueued" — it may still be waiting in OpenLab's queue
+        assert runner.get_active() is not None
+        assert entry.status == "enqueued"
+
+
+def test_runner_marks_acquiring_job_done_on_olss_idle_with_results():
+    """OLSS going idle with sirslt present → job marked done (run completed normally)."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        runner = MosesRunner()
+        entry = _fake_job_entry(
+            "active-123",
+            status="acquiring",
+            request_dict={
+                "script_name": "examples/agent_agilent.py",
+                "output_dir": tmp_dir,
+            },
+        )
+        entry.process = None
+        runner._jobs[entry.queue_id] = entry
+        runner._active_id = entry.queue_id
+        runner._olss_occupied = True
+
+        # Simulate sirslt file written by OpenLab
+        (tmp_path / "sample1.sirslt").touch()
+
+        runner.notify_olss_state("Idle", None)
+
+        assert runner.get_active() is None
+        assert entry.status == "done"
+
+
+def test_runner_no_false_failure_when_olss_never_occupied():
+    """No transition detection fires when OLSS was already idle before the job."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        runner = MosesRunner()
+        entry = _fake_job_entry(
+            "active-123",
+            status="acquiring",
+            request_dict={
+                "script_name": "examples/agent_agilent.py",
+                "output_dir": tmp_dir,
+            },
+        )
+        entry.process = None
+        runner._jobs[entry.queue_id] = entry
+        runner._active_id = entry.queue_id
+        # _olss_occupied stays False (default) — no occupied→idle transition
+
+        runner.notify_olss_state("Idle", None)
+
+        # No transition (was_occupied=False) → job untouched
+        assert runner.get_active() is not None
+        assert entry.status == "acquiring"
+
+
+def test_poll_keeps_enqueued_when_moses_exits_cleanly_no_sirslt():
+    """Moses exits rc=0, OLSS idle, no sirslt yet → job set to enqueued (queued in OpenLab)."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        runner = MosesRunner()
+        entry = _fake_job_entry(
+            "active-123",
+            status="dispatched",
+            request_dict={
+                "script_name": "examples/agent_agilent.py",
+                "output_dir": tmp_dir,
+            },
+        )
+        entry.process.poll.return_value = 0  # Moses exited cleanly
+        runner._jobs[entry.queue_id] = entry
+        runner._active_id = entry.queue_id
+        runner._olss_occupied = False  # OLSS idle at this moment
+
+        runner.poll(settings=Settings())
+
+        # No sirslt files → job may be queued in OpenLab; show as enqueued
+        assert runner.get_active() is not None
+        assert entry.status == "enqueued"
+        assert entry.process is None  # process handle released
+
+
+def test_poll_marks_done_when_moses_exits_cleanly_with_sirslt():
+    """Moses exits rc=0, OLSS idle, sirslt present → job immediately marked done."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        runner = MosesRunner()
+        entry = _fake_job_entry(
+            "active-123",
+            status="dispatched",
+            request_dict={
+                "script_name": "examples/agent_agilent.py",
+                "output_dir": tmp_dir,
+            },
+        )
+        entry.process.poll.return_value = 0  # Moses exited cleanly
+        runner._jobs[entry.queue_id] = entry
+        runner._active_id = entry.queue_id
+        runner._olss_occupied = False
+
+        # Sirslt file already present when Moses exits
+        (tmp_path / "result.sirslt").touch()
+
+        runner.poll(settings=Settings())
+
+        assert runner.get_active() is None
+        assert entry.status == "done"
+
+
+# ---------------------------------------------------------------------------
+# v1.1 claim protocol (STATUS_SPEC §5)
+# ---------------------------------------------------------------------------
+
+def _claim(client: TestClient, owner="agent:test", session_id="s-1", ttl_s=30.0):
+    return client.post(
+        "/control/claim",
+        json={"owner": owner, "session_id": session_id, "ttl_s": ttl_s},
+    )
+
+
+def test_claim_grants_token_and_expiry():
+    client = _client(_load("signals_ready.json"), runner=FakeRunner())
+    r = _claim(client)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["claim_token"]
+    assert body["heartbeat_interval_s"] > 0
+    assert body["heartbeat_interval_s"] < 30.0  # strictly more often than TTL
+    assert body["expires_at"]
+
+
+def test_claim_idempotent_for_same_session_rotates_token():
+    client = _client(_load("signals_ready.json"), runner=FakeRunner())
+    t1 = _claim(client, session_id="same").json()["claim_token"]
+    r2 = _claim(client, session_id="same")
+    assert r2.status_code == 200
+    # Re-claiming the same session always succeeds (token may rotate).
+    assert r2.json()["claim_token"]
+
+
+def test_claim_conflict_when_held_by_other_session():
+    client = _client(_load("signals_ready.json"), runner=FakeRunner())
+    assert _claim(client, owner="agent:a", session_id="aaa").status_code == 200
+    r = _claim(client, owner="agent:b", session_id="bbb")
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["claimed_by"]["session_id"] == "aaa"
+    assert detail["claimed_by"]["owner"] == "agent:a"
+
+
+def test_heartbeat_extends_and_returns_204():
+    client = _client(_load("signals_ready.json"), runner=FakeRunner())
+    token = _claim(client).json()["claim_token"]
+    r = client.post("/control/heartbeat", headers={"X-Claim-Token": token})
+    assert r.status_code == 204
+
+
+def test_heartbeat_401_on_unknown_token():
+    client = _client(_load("signals_ready.json"), runner=FakeRunner())
+    _claim(client)
+    r = client.post("/control/heartbeat", headers={"X-Claim-Token": "not-the-token"})
+    assert r.status_code == 401
+
+
+def test_release_is_idempotent():
+    client = _client(_load("signals_ready.json"), runner=FakeRunner())
+    token = _claim(client).json()["claim_token"]
+    r1 = client.post("/control/release", headers={"X-Claim-Token": token})
+    assert r1.status_code == 204
+    # Releasing again (now-unknown token) still 204 — never blocks the client.
+    r2 = client.post("/control/release", headers={"X-Claim-Token": token})
+    assert r2.status_code == 204
+    # Releasing with no token at all is also a 204 no-op.
+    r3 = client.post("/control/release")
+    assert r3.status_code == 204
+
+
+def test_release_frees_slot_for_next_session():
+    client = _client(_load("signals_ready.json"), runner=FakeRunner())
+    token = _claim(client, session_id="first").json()["claim_token"]
+    # A different session is blocked while the first holds the claim...
+    assert _claim(client, session_id="second").status_code == 409
+    # ...but can claim once the first releases.
+    assert client.post("/control/release", headers={"X-Claim-Token": token}).status_code == 204
+    assert _claim(client, session_id="second").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# v1.1 hard claim enforcement — 423 Locked on /control/* without a valid token
+# ---------------------------------------------------------------------------
+
+def test_run_423_without_token():
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_ready.json"), runner=runner)
+    r = client.post("/control/run", json=VALID_RUN_BODY)
+    assert r.status_code == 423
+    assert r.json()["detail"]["claimed_by"] is None
+    assert runner.get_active() is None  # action never executed
+
+
+def test_run_423_with_stale_token():
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_ready.json"), runner=runner)
+    r = client.post(
+        "/control/run", json=VALID_RUN_BODY, headers={"X-Claim-Token": "bogus"}
+    )
+    assert r.status_code == 423
+    assert runner.get_active() is None
+
+
+def test_mutations_423_when_claim_held_by_other_session():
+    runner = FakeRunner(busy=True, run_id="active-1")
+    client = _client(_load("signals_ready.json"), runner=runner)
+    # Someone else holds the claim.
+    _claim(client, owner="agent:other", session_id="other")
+    # We POST with no token → 423, body names the current holder.
+    for call in (
+        lambda: client.post("/control/abort"),
+        lambda: client.post("/control/standby"),
+        lambda: client.delete("/control/queue/active-1"),
+    ):
+        r = call()
+        assert r.status_code == 423, r.text
+        assert r.json()["detail"]["claimed_by"]["owner"] == "agent:other"
+
+
+def test_read_endpoints_open_without_token():
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_ready.json"), runner=runner)
+    assert client.get("/control/queue").status_code == 200
+    assert client.post("/control/startup").status_code == 200
+    assert client.get("/status").status_code == 200
+
+
+def test_status_surfaces_claimed_by():
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_ready.json"), runner=runner)
+    # Unclaimed → details.claimed_by is null (present, per spec example).
+    body = client.get("/status").json()
+    assert body["details"]["claimed_by"] is None
+    # After a claim, /status surfaces the holder.
+    _claim(client, owner="agent:screening", session_id="sess-9")
+    body = client.get("/status").json()
+    cb = body["details"]["claimed_by"]
+    assert cb["owner"] == "agent:screening"
+    assert cb["session_id"] == "sess-9"
+    assert cb["expires_at"]
+
+
+# ---------------------------------------------------------------------------
+# v1.1 §6 — queue_full → 412 (not 409) + Retry-After; allowed_actions mirror
+# ---------------------------------------------------------------------------
+
+def test_queue_full_returns_412_with_retry_after():
+    runner = FakeRunner(queue_full=True, run_id="active-1")
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    r = client.post("/control/run", json=VALID_RUN_BODY)
+    assert r.status_code == 412
+    detail = r.json()["detail"]
+    assert detail["error"] == "queue_full"
+    assert detail["retry_after_s"] is not None
+    assert r.headers.get("Retry-After") is not None
+
+
+def test_standby_queue_full_returns_412():
+    runner = FakeRunner(queue_full=True, run_id="active-1")
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    r = client.post("/control/standby")
+    assert r.status_code == 412
+    assert r.json()["detail"]["error"] == "queue_full"
+
+
+def test_allowed_actions_ready_lists_all_verbs():
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_ready.json"), runner=runner)
+    actions = client.get("/status").json()["allowed_actions"]
+    assert actions == ["run.submit", "run.abort", "queue.cancel", "instrument.standby"]
+
+
+def test_allowed_actions_requires_init_drops_enqueue_verbs():
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_requires_init.json"), runner=runner)
+    actions = client.get("/status").json()["allowed_actions"]
+    assert "run.submit" not in actions
+    assert "instrument.standby" not in actions
+    # abort / cancel carry no enqueue precondition.
+    assert "run.abort" in actions
+    assert "queue.cancel" in actions
+
+
+def test_allowed_actions_unknown_state_is_empty():
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_unknown.json"), runner=runner)
+    body = client.get("/status").json()
+    assert body["equipment_status"] == "unknown"
+    assert body["allowed_actions"] == []
+
+
+def test_allowed_actions_mirror_412_when_queue_full():
+    """§6.2 invariant, end-to-end: when the queue is full, /status drops the
+    enqueue verbs AND POSTing them 412s; the non-enqueue verbs stay listed."""
+    runner = FakeRunner(queue_full=True, run_id="active-1")
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+
+    actions = client.get("/status").json()["allowed_actions"]
+    assert "run.submit" not in actions
+    assert "instrument.standby" not in actions
+    assert "run.abort" in actions and "queue.cancel" in actions
+
+    # The dropped verbs really do 412 (allowed_actions never lies).
+    assert client.post("/control/run", json=VALID_RUN_BODY).status_code == 412
+    assert client.post("/control/standby").status_code == 412
+
+
+def test_allowed_actions_helper_matches_refusal_property():
+    """Unit-level §6.2 property: ``verb in allowed_actions`` iff an enqueue POST
+    would NOT refuse, across every combination of the gating conditions."""
+    from agilent_hplcms_server.control.actions import allowed_actions
+
+    for requires_init in (False, True):
+        for queue_full in (False, True):
+            actions = allowed_actions(
+                service_operational=True,
+                requires_init=requires_init,
+                queue_full=queue_full,
+            )
+            can_enqueue = (not requires_init) and (not queue_full)
+            assert ("run.submit" in actions) is can_enqueue
+            assert ("instrument.standby" in actions) is can_enqueue
+            # Non-enqueue verbs are always offered while operational.
+            assert "run.abort" in actions
+            assert "queue.cancel" in actions
+
+    # Not operational (probe_error) → nothing offered.
+    assert allowed_actions(
+        service_operational=False, requires_init=False, queue_full=False
+    ) == []
+
+
+# ---------------------------------------------------------------------------
+# tray + well → sample_position composition, plate geometry, robot reservation
+# ---------------------------------------------------------------------------
+
+def test_run_composes_sample_position_from_tray_well():
+    """The device composes {drawer}-{well} from logical {tray, well}; the
+    sidecar-only fields plate_format/submitter are not forwarded to Moses."""
+    runner = FakeRunner(busy=False)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    body = {**VALID_RUN_BODY, "samples": [
+        {"sample_name": "cpd_01", "tray": "front", "well": "A1", "injection_volume": 2.0},
+        {"sample_name": "cpd_02", "tray": "rear", "well": "H12", "injection_volume": 1.0},
+    ], "submitter": "robot"}  # robot so the rear (reserved) sample is allowed
+    r = client.post("/control/run", json=body)
+    assert r.status_code == 202, r.text
+    job = runner.submitted[0]["job"]
+    # Defaults: front → D1F, rear → D4B (config.Settings).
+    assert job["samples"][0]["sample_position"] == "D1F-A1"
+    assert job["samples"][1]["sample_position"] == "D4B-H12"
+    assert "tray" not in job["samples"][0]
+    assert "well" not in job["samples"][0]
+    assert "plate_format" not in job
+    assert "submitter" not in job
+
+
+def test_run_422_well_off_plate_for_format():
+    """Wells are validated against plate_format: A13/I1 are off a 96-well plate."""
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_ready.json"), runner=runner)
+    for well in ("A13", "I1"):
+        bad = {**VALID_RUN_BODY, "samples": [
+            {"sample_name": "x", "tray": "front", "well": well, "injection_volume": 2.0}
+        ]}
+        r = client.post("/control/run", json=bad)
+        assert r.status_code == 422, f"{well!r} should be off a 96-well plate, got {r.status_code}"
+
+
+def test_run_384_well_plate_accepts_high_wells():
+    """A 384-well plate accepts P24, which is off a 96-well plate."""
+    runner = FakeRunner(busy=False)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    body = {**VALID_RUN_BODY, "plate_format": "384-well", "submitter": "robot", "samples": [
+        {"sample_name": "x", "tray": "rear", "well": "P24", "injection_volume": 2.0}
+    ]}
+    r = client.post("/control/run", json=body)
+    assert r.status_code == 202, r.text
+    assert runner.submitted[0]["job"]["samples"][0]["sample_position"] == "D4B-P24"
+
+
+def test_run_412_reserved_tray_for_manual_submitter():
+    """A manual run targeting the robot-reserved tray (default 'rear') is refused 412."""
+    runner = FakeRunner(busy=False)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    body = {**VALID_RUN_BODY, "samples": [
+        {"sample_name": "x", "tray": "rear", "well": "A1", "injection_volume": 2.0}
+    ]}  # submitter defaults to "manual"
+    r = client.post("/control/run", json=body)
+    assert r.status_code == 412, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "reserved_for_robot"
+    assert detail["reserved_tray"] == "rear"
+    assert runner.submitted == []  # never enqueued
+
+
+def test_run_robot_submitter_allowed_on_reserved_tray():
+    """submitter='robot' bypasses the reservation."""
+    runner = FakeRunner(busy=False)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    body = {**VALID_RUN_BODY, "submitter": "robot", "samples": [
+        {"sample_name": "x", "tray": "rear", "well": "A1", "injection_volume": 2.0}
+    ]}
+    r = client.post("/control/run", json=body)
+    assert r.status_code == 202, r.text
