@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from ..models import ClaimedBy
+
+
+# Autosampler tray + plate geometry. Kept byte-for-byte in sync with the lab
+# skill catalog (ac-organic-lab: lab_skills/skill_catalog/hplc.py) so the SDK
+# and this device validate sample addresses identically. The device is the
+# authoritative validator; the catalog mirrors these definitions.
+TrayName = Literal["front", "rear"]
+PlateFormat = Literal["96-well", "384-well"]
+_PLATE_GEOMETRY: dict[str, tuple[int, int]] = {"96-well": (8, 12), "384-well": (16, 24)}
+_WELL_RE = re.compile(r"^([A-Za-z])(\d{1,2})$")
 
 
 class GradientConfig(BaseModel):
@@ -27,10 +40,11 @@ class SampleConfig(BaseModel):
         pattern=r"^[A-Za-z0-9_\-]+$",
         description="Alphanumeric identifier (no spaces)",
     )
-    sample_position: str = Field(
-        min_length=1,
-        max_length=16,
-        description='Autosampler position, e.g. "D4B-A1" or "3"',
+    tray: TrayName = Field(description="Autosampler tray holding this sample (front or rear).")
+    well: str = Field(
+        min_length=2,
+        max_length=4,
+        description='Plate well, e.g. "A1" or "H12". Validated against the run\'s plate_format.',
     )
     injection_volume: float = Field(gt=0, le=20.0, description="Injection volume in µL (max 20)")
 
@@ -52,6 +66,36 @@ class RunRequest(BaseModel):
     standby_after: bool = True
     gradient: GradientConfig
     samples: list[SampleConfig] = Field(min_length=1, description="At least one sample required.")
+    plate_format: PlateFormat = Field(
+        default="96-well", description="Plate format for all samples in this run."
+    )
+    submitter: Literal["manual", "robot"] = Field(
+        default="manual",
+        description=(
+            "Runs targeting a tray reserved for robotic submission (RESERVED_ROBOT_TRAY) "
+            "are refused with HTTP 412 reserved_for_robot unless submitter='robot'."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_wells(self) -> "RunRequest":
+        """Reject wells that fall off the plate for the declared plate_format.
+
+        Mirrors the lab skill catalog's geometry check so a request rejected by
+        the SDK and one rejected by the device fail for the identical reason.
+        """
+        rows, cols = _PLATE_GEOMETRY[self.plate_format]
+        for s in self.samples:
+            m = _WELL_RE.match(s.well)
+            if m is None:
+                raise ValueError(f"Malformed well {s.well!r} (expected like 'A1', 'H12').")
+            row_idx = ord(m.group(1).upper()) - ord("A")
+            col = int(m.group(2))
+            if not (0 <= row_idx < rows) or not (1 <= col <= cols):
+                raise ValueError(
+                    f"Well {s.well!r} is out of range for a {self.plate_format} plate."
+                )
+        return self
 
 
 class RunResponse(BaseModel):
@@ -71,7 +115,7 @@ class QueuedRun(BaseModel):
     queue_id: str
     request: dict[str, Any]
     queued_at: datetime
-    status: Literal["pending", "acquiring", "done", "failed"]
+    status: Literal["pending", "enqueued", "acquiring", "done", "failed"]
     started_at: datetime | None = None
     finished_at: datetime | None = None
     pid: int | None = None
@@ -118,7 +162,11 @@ class StartupResponse(BaseModel):
     missing_processes: list[str] = Field(default_factory=list)
 
 
-class ShutdownResponse(BaseModel):
+class StandbyResponse(BaseModel):
+    """Response for POST /control/standby (parks the instrument in low-flow
+    standby — this is NOT a full instrument shutdown, which is a manual,
+    careful operator procedure)."""
+
     run_id: str
     status: Literal["accepted", "queued"]
     message: str
@@ -138,7 +186,62 @@ class RequiresInitError(BaseModel):
 
 
 class QueueFullError(BaseModel):
+    """Body for HTTP 412 from an enqueue action while the queue is full.
+
+    412 (precondition) per §6.1: the request would be valid once the queue
+    drains. ``retry_after_s`` is advisory and mirrored into the ``Retry-After``
+    header; 412 refusals MUST NOT populate ``last_error`` (§6.3).
+    """
+
     error: Literal["queue_full"] = "queue_full"
-    message: str
+    detail: str
     max_depth: int
     current_depth: int
+    retry_after_s: float | None = None
+
+
+class ReservedForRobotError(BaseModel):
+    """Body for HTTP 412 when a non-robot run targets the robot-reserved tray.
+
+    412 (precondition): the request is well-formed but the tray reservation
+    forbids it right now; it would succeed with ``submitter="robot"`` or against
+    an unreserved tray. Like other 412 refusals it MUST NOT populate
+    ``last_error`` (§6.3).
+    """
+
+    error: Literal["reserved_for_robot"] = "reserved_for_robot"
+    detail: str
+    reserved_tray: str
+
+
+# ---------------------------------------------------------------------------
+# v1.1 claim protocol (STATUS_SPEC §5)
+# ---------------------------------------------------------------------------
+
+
+class ClaimRequest(BaseModel):
+    owner: str = Field(min_length=1, description="Human/agent identifier; surfaced in details.claimed_by")
+    session_id: str = Field(min_length=1, description="Opaque per-session id (UUID recommended)")
+    ttl_s: float = Field(default=30.0, gt=0, description="Requested TTL; device clamps to its own min/max")
+
+
+class ClaimResponse(BaseModel):
+    claim_token: str
+    heartbeat_interval_s: float
+    expires_at: datetime
+
+
+class ClaimRejection(BaseModel):
+    """Body for HTTP 409 (claim contended) and HTTP 423 (control call without a
+    valid token). The SDK treats 409/423 identically."""
+
+    detail: str
+    claimed_by: ClaimedBy | None = None
+    retry_after_s: float | None = None
+
+
+class HeartbeatResponse(BaseModel):
+    """Optional 200 body for POST /control/heartbeat (device returns 204 by
+    default; this lets a client observe the extended TTL when it asks)."""
+
+    expires_at: datetime

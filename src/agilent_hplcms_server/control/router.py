@@ -2,21 +2,27 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request, Response
 
 from ..config import Settings, load_settings
+from .claims import ClaimConflict, ClaimHolder
 from .models import (
     AbortResponse,
     CancelResponse,
+    ClaimRejection,
+    ClaimRequest,
+    ClaimResponse,
     EquipmentBusyError,
+    HeartbeatResponse,
     QueueFullError,
     QueueResponse,
     QueueStatusResponse,
+    ReservedForRobotError,
     QueuedRun,
     RequiresInitError,
     RunRequest,
     RunResponse,
-    ShutdownResponse,
+    StandbyResponse,
     StartupResponse,
 )
 from .runner import JobEntry, MosesRunner
@@ -30,6 +36,32 @@ def _get_runner(request: Request) -> MosesRunner:
 
 def _get_settings(request: Request) -> Settings:
     return request.app.state.settings  # type: ignore[no-any-return]
+
+
+def _get_claims(request: Request) -> ClaimHolder:
+    return request.app.state.claims  # type: ignore[no-any-return]
+
+
+def _require_claim(request: Request) -> None:
+    """Hard claim enforcement (§5): mutating /control/* requires a valid
+    ``X-Claim-Token`` matching the live claim. Missing or stale → 423 Locked,
+    body carries the current holder so the caller can back off / retry."""
+    claims = _get_claims(request)
+    token = request.headers.get("x-claim-token")
+    if claims.validate(token):
+        return
+    held = claims.current()
+    raise HTTPException(
+        status_code=423,
+        detail=ClaimRejection(
+            detail=(
+                "A valid X-Claim-Token is required for this action. Acquire one "
+                "via POST /control/claim."
+            ),
+            claimed_by=held,
+            retry_after_s=None,
+        ).model_dump(mode="json"),
+    )
 
 
 def _read_signals(request: Request) -> dict:
@@ -57,8 +89,9 @@ def _missing_openlab_processes(signals: dict) -> list[str]:
 
 
 def _entry_to_queued_run(entry: JobEntry) -> QueuedRun:
-    # "dispatched" is internal: script started but OpenLab not yet confirming.
-    # Show as "pending" to the client until acquisition is confirmed.
+    # "dispatched" is internal: script started but OpenLab not yet confirmed.
+    # Show as "pending" to the client. All other statuses pass through as-is,
+    # including "enqueued" (submitted to OpenLab queue, awaiting its turn).
     api_status = entry.status if entry.status != "dispatched" else "pending"
     return QueuedRun(
         queue_id=entry.queue_id,
@@ -83,6 +116,56 @@ def _check_requires_init(signals: dict) -> None:
         )
 
 
+def _compose_moses_job(body: RunRequest, settings: Settings) -> dict:
+    """Build the Moses job dict from a RunRequest.
+
+    Each sample's logical ``{tray, well}`` is composed into the Agilent
+    multisampler ``{drawer}-{well}`` address Moses consumes, using the
+    tray→drawer mapping in settings (e.g. tray "rear" + well "A1" → "D4B-A1").
+    ``plate_format`` and ``submitter`` are sidecar-side concerns (well-geometry
+    validation and the robot-tray reservation) and are not forwarded to Moses.
+    """
+    tray_to_drawer = {
+        "front": settings.tray_front_drawer,
+        "rear": settings.tray_rear_drawer,
+    }
+    job = body.model_dump(exclude={"script_name", "samples", "plate_format", "submitter"})
+    job["samples"] = [
+        {
+            "sample_name": s.sample_name,
+            "sample_position": f"{tray_to_drawer[s.tray]}-{s.well}",
+            "injection_volume": s.injection_volume,
+        }
+        for s in body.samples
+    ]
+    return job
+
+
+def _check_reserved_tray(body: RunRequest, settings: Settings) -> None:
+    """Refuse a non-robot run that targets the robot-reserved tray (412).
+
+    The reservation is a soft interlock so an agent and the robot don't fight
+    over the same tray; ``submitter="robot"`` bypasses it, and an empty
+    ``RESERVED_ROBOT_TRAY`` disables it. Raised before enqueue so the job never
+    reaches Moses. Like queue_full this is a precondition refusal — 412, no
+    ``last_error`` (§6.3).
+    """
+    reserved = settings.reserved_robot_tray
+    if not reserved or body.submitter == "robot":
+        return
+    if any(s.tray == reserved for s in body.samples):
+        raise HTTPException(
+            status_code=412,
+            detail=ReservedForRobotError(
+                detail=(
+                    f"Tray {reserved!r} is reserved for robotic submission; "
+                    "set submitter='robot' to target it."
+                ),
+                reserved_tray=reserved,
+            ).model_dump(mode="json"),
+        )
+
+
 def _do_enqueue(
     script_name: str,
     job: dict,
@@ -103,13 +186,19 @@ def _do_enqueue(
     except FileNotFoundError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except OverflowError as exc:
+        # §6.1: queue-full is a *precondition* refusal (the request becomes
+        # valid once the queue drains), so 412 — not 409 — with a Retry-After.
+        # 412 refusals MUST NOT touch last_error (§6.3); we only raise here.
+        retry_after_s = float(settings.queue_full_retry_after_s)
         raise HTTPException(
-            status_code=409,
+            status_code=412,
             detail=QueueFullError(
-                message=str(exc),
+                detail=str(exc),
                 max_depth=settings.queue_max_depth,
                 current_depth=runner.queue_depth(),
-            ).model_dump(),
+                retry_after_s=retry_after_s,
+            ).model_dump(mode="json"),
+            headers={"Retry-After": str(int(retry_after_s))},
         ) from exc
 
 
@@ -132,7 +221,11 @@ def startup(request: Request) -> StartupResponse:
     response_model=RunResponse,
     status_code=202,
     summary="Quick-submit a run (starts immediately if idle, queues if busy)",
-    responses={409: {"model": RequiresInitError | QueueFullError}},
+    responses={
+        409: {"model": RequiresInitError},
+        412: {"model": QueueFullError | ReservedForRobotError},
+        423: {"model": ClaimRejection},
+    },
 )
 def submit_run(body: RunRequest, request: Request) -> RunResponse:
     """Submit a batch run.
@@ -140,9 +233,12 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     - Idle instrument → starts immediately (``status: accepted``).
     - Busy instrument → FIFO queue (``status: queued``, ``queue_position`` is 1-based).
     - HTTP 409 ``requires_init`` if any OpenLab core process is missing.
-    - HTTP 409 ``queue_full`` if the queue is at max depth.
-    - HTTP 422 if any parameter is out of hardware range (Layer 1).
+    - HTTP 412 ``queue_full`` if the queue is at max depth (with ``Retry-After``).
+    - HTTP 412 ``reserved_for_robot`` if a non-robot run targets the reserved tray.
+    - HTTP 422 if any parameter is out of hardware range or a ``well`` is off-plate.
+    - HTTP 423 if the ``X-Claim-Token`` is missing or stale.
     """
+    _require_claim(request)
     runner = _get_runner(request)
     settings = _get_settings(request)
 
@@ -150,8 +246,9 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     _notify_runner_from_signals(runner, signals)
     runner.poll(settings=settings)
     _check_requires_init(signals)
+    _check_reserved_tray(body, settings)
 
-    job = body.model_dump(exclude={"script_name"})
+    job = _compose_moses_job(body, settings)
     run_id, position = _do_enqueue(
         script_name=body.script_name,
         job=job,
@@ -185,7 +282,11 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     response_model=QueueResponse,
     status_code=202,
     summary="Submit a run to the job queue",
-    responses={409: {"model": RequiresInitError | QueueFullError}},
+    responses={
+        409: {"model": RequiresInitError},
+        412: {"model": QueueFullError | ReservedForRobotError},
+        423: {"model": ClaimRejection},
+    },
 )
 def post_to_queue(body: RunRequest, request: Request) -> QueueResponse:
     """Submit a run to the queue and get back a ``queue_id`` to track it.
@@ -193,6 +294,7 @@ def post_to_queue(body: RunRequest, request: Request) -> QueueResponse:
     Use ``GET /control/queue`` to check status and ``DELETE /control/queue/{queue_id}``
     to cancel before it starts. ``position`` is 0 if started immediately, 1-based otherwise.
     """
+    _require_claim(request)
     runner = _get_runner(request)
     settings = _get_settings(request)
 
@@ -200,8 +302,9 @@ def post_to_queue(body: RunRequest, request: Request) -> QueueResponse:
     _notify_runner_from_signals(runner, signals)
     runner.poll(settings=settings)
     _check_requires_init(signals)
+    _check_reserved_tray(body, settings)
 
-    job = body.model_dump(exclude={"script_name"})
+    job = _compose_moses_job(body, settings)
     queue_id, position = _do_enqueue(
         script_name=body.script_name,
         job=job,
@@ -262,14 +365,16 @@ def get_queue(request: Request) -> QueueStatusResponse:
     "/queue/{queue_id}",
     response_model=CancelResponse,
     summary="Cancel a pending job",
-    responses={404: {}, 409: {}},
+    responses={404: {}, 409: {}, 423: {"model": ClaimRejection}},
 )
 def cancel_queue_entry(queue_id: str, request: Request) -> CancelResponse:
     """Remove a pending job from the queue.
 
     - HTTP 404 if the job is not found or already completed.
     - HTTP 409 if the job is currently running (use ``POST /control/abort`` instead).
+    - HTTP 423 if the ``X-Claim-Token`` is missing or stale.
     """
+    _require_claim(request)
     runner = _get_runner(request)
     try:
         runner.cancel_queued(queue_id)
@@ -282,9 +387,18 @@ def cancel_queue_entry(queue_id: str, request: Request) -> CancelResponse:
     return CancelResponse(cancelled_id=queue_id, message="Job cancelled and removed from queue.")
 
 
-@router.post("/abort", response_model=AbortResponse, summary="Abort active run and clear queue")
+@router.post(
+    "/abort",
+    response_model=AbortResponse,
+    summary="Abort active run and clear queue",
+    responses={423: {"model": ClaimRejection}},
+)
 def abort_run(request: Request) -> AbortResponse:
-    """Abort the active Moses process and clear all pending queued runs."""
+    """Abort the active Moses process and clear all pending queued runs.
+
+    HTTP 423 if the ``X-Claim-Token`` is missing or stale.
+    """
+    _require_claim(request)
     runner = _get_runner(request)
     settings = _get_settings(request)
 
@@ -317,14 +431,25 @@ def abort_run(request: Request) -> AbortResponse:
 
 
 @router.post(
-    "/shutdown",
-    response_model=ShutdownResponse,
+    "/standby",
+    response_model=StandbyResponse,
     status_code=202,
     summary="Park the instrument in low-flow standby",
-    responses={409: {"model": QueueFullError | RequiresInitError}},
+    responses={
+        409: {"model": RequiresInitError},
+        412: {"model": QueueFullError},
+        423: {"model": ClaimRejection},
+    },
 )
-def shutdown(request: Request) -> ShutdownResponse:
-    """Submit a standby-only Moses job. Queues behind any active run."""
+def standby(request: Request) -> StandbyResponse:
+    """Submit a standby-only Moses job (low-flow park). Queues behind any active run.
+
+    This is NOT a full instrument shutdown — powering the UPLC-MS down is a
+    deliberate, manual operator procedure done at the instrument, not via the API.
+
+    HTTP 423 if the ``X-Claim-Token`` is missing or stale.
+    """
+    _require_claim(request)
     runner = _get_runner(request)
     settings = _get_settings(request)
 
@@ -339,7 +464,7 @@ def shutdown(request: Request) -> ShutdownResponse:
         "ms_mode": "positive_negative",
         "standby_after": True,
         "gradient": {
-            "name": "shutdown_standby",
+            "name": "standby_park",
             "solvent_a": "H2O_0.1%FA",
             "solvent_b": "ACN_0.1%FA",
             "run_time": 1.0,
@@ -352,7 +477,7 @@ def shutdown(request: Request) -> ShutdownResponse:
     standby_request_dict = {
         "script_name": "examples/agent_agilent.py",
         **standby_job,
-        "_type": "shutdown",
+        "_type": "standby",
     }
 
     run_id, position = _do_enqueue(
@@ -365,15 +490,103 @@ def shutdown(request: Request) -> ShutdownResponse:
 
     active = runner.get_active()
     if position == 0:
-        return ShutdownResponse(
+        return StandbyResponse(
             run_id=run_id,
             status="accepted",
             message=f"Standby job started. Moses PID {active.pid if active else '?'}.",
             queue_position=None,
         )
-    return ShutdownResponse(
+    return StandbyResponse(
         run_id=run_id,
         status="queued",
         message=f"Standby job queued at position {position}. Will run after current jobs finish.",
         queue_position=position,
     )
+
+
+# ---------------------------------------------------------------------------
+# v1.1 claim protocol (STATUS_SPEC §5). These endpoints are NOT claim-enforced:
+# /claim issues the token; /heartbeat and /release authenticate via the token
+# in the X-Claim-Token header through their own logic.
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/claim",
+    response_model=ClaimResponse,
+    summary="Acquire the instrument claim",
+    responses={409: {"model": ClaimRejection}},
+)
+def claim(body: ClaimRequest, request: Request) -> ClaimResponse:
+    """Acquire (or idempotently re-acquire) the single instrument claim.
+
+    - Free / expired slot, or same ``session_id`` → HTTP 200 with a token.
+    - Held by a different live session → HTTP 409 Conflict with ``claimed_by``.
+    """
+    claims = _get_claims(request)
+    try:
+        grant = claims.claim(owner=body.owner, session_id=body.session_id, ttl_s=body.ttl_s)
+    except ClaimConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=ClaimRejection(
+                detail="Instrument is already claimed by another session.",
+                claimed_by=exc.held_by,
+                retry_after_s=None,
+            ).model_dump(mode="json"),
+        ) from exc
+    return ClaimResponse(
+        claim_token=grant.claim_token,
+        heartbeat_interval_s=grant.heartbeat_interval_s,
+        expires_at=grant.expires_at,
+    )
+
+
+@router.post(
+    "/heartbeat",
+    summary="Refresh the claim TTL",
+    responses={204: {}, 200: {"model": HeartbeatResponse}, 401: {"model": ClaimRejection}},
+)
+def heartbeat(
+    request: Request,
+    response: Response,
+    x_claim_token: str | None = Header(default=None),
+):
+    """Extend the live claim's TTL.
+
+    - Valid token → HTTP 204 No Content (TTL extended).
+    - Unknown / expired / wrong-session token → HTTP 401; the client MUST treat
+      its claim as lost.
+    """
+    claims = _get_claims(request)
+    try:
+        claims.heartbeat(x_claim_token or "")
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail=ClaimRejection(
+                detail="Claim token is unknown, expired, or belongs to another session.",
+                claimed_by=claims.current(),
+                retry_after_s=None,
+            ).model_dump(mode="json"),
+        ) from exc
+    response.status_code = 204
+    return response
+
+
+@router.post(
+    "/release",
+    status_code=204,
+    summary="Release the claim (idempotent)",
+)
+def release(
+    request: Request,
+    response: Response,
+    x_claim_token: str | None = Header(default=None),
+):
+    """Release the claim. Idempotent (§5): releasing an unknown / already-released
+    token also returns HTTP 204 so a client can always move on."""
+    claims = _get_claims(request)
+    claims.release(x_claim_token)
+    response.status_code = 204
+    return response

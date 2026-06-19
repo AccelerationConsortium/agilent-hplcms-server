@@ -1,4 +1,4 @@
-"""Tests for the STATUS_SPEC v1.0 endpoints exposed by the sidecar."""
+"""Tests for the STATUS_SPEC v1.1 endpoints exposed by the sidecar."""
 
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ def test_openapi_present():
         ("signals_ready.json", "ready"),
         ("signals_busy.json", "busy"),
         ("signals_olss_run.json", "busy"),
-        ("signals_olss_paused.json", "paused"),
+        ("signals_olss_paused.json", "busy"),
         ("signals_requires_init.json", "requires_init"),
         ("signals_error.json", "error"),
         ("signals_unknown.json", "unknown"),
@@ -127,11 +127,14 @@ def test_olss_run_marks_status_busy_without_filesystem_acquisition():
     assert body["components"]["ms"]["state"] == "busy"
 
 
-def test_olss_paused_marks_status_paused_with_required_action():
+def test_olss_paused_maps_to_busy_with_required_action():
+    """v1.1: a paused OpenLab sequence is reported as busy (paused is not a
+    legal EquipmentState) but still surfaces the resume action; the precise
+    OLSS status survives in details + the component state."""
     client, _ = _client_with_signals(_load("signals_olss_paused.json"))
     body = client.get("/status").json()
 
-    assert body["equipment_status"] == "paused"
+    assert body["equipment_status"] == "busy"
     assert body["required_actions"] == ["resume_paused_sequence"]
     assert body["details"]["olss_software_status"] == "Paused"
     assert body["components"]["hplc"]["state"] == "paused"

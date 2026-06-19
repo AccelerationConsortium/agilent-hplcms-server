@@ -2,7 +2,7 @@
 
 Status and control sidecar for the Agilent UPLC-MS instrument (`SDL2_LC1290`) on this lab PC. Runs alongside the existing `moses` Python controller and the always-on Agilent OpenLab CDS supervisor.
 
-Conforms to the AC Organic Self-Driving Lab status contract: see [`docs/STATUS_SPEC.md`](https://github.com/AccelerationConsortium/ac-organic-lab/blob/main/docs/STATUS_SPEC.md) (v1.0).
+This repo conforms to lab status spec v1.1: see [`docs/STATUS_SPEC.md`](https://github.com/AccelerationConsortium/ac-organic-lab/blob/main/docs/STATUS_SPEC.md). v1.1 adds cooperative claims (`/control/claim` · `/control/heartbeat` · `/control/release`), `allowed_actions` on `/status`, and `details.claimed_by`. **Claims are hard-enforced**: mutating `/control/*` calls require a valid `X-Claim-Token` and are rejected with HTTP 423 Locked otherwise (read-only `GET /control/queue` and `POST /control/startup` stay open).
 
 ## Install / run
 
@@ -34,20 +34,47 @@ Start-Process powershell -Verb RunAs -ArgumentList "-Command C:\SDL_Tools\nssm.e
 |---|---|
 | `GET /` | `{equipment_id, equipment_name, protocol_version}` |
 | `GET /health` | `{status: "healthy"}` |
-| `GET /status` | `EquipmentStatus` envelope per STATUS_SPEC v1.0 |
+| `GET /status` | `EquipmentStatus` envelope per STATUS_SPEC v1.1 (incl. `allowed_actions`, `details.claimed_by`) |
 | `GET /openapi.json` | Generated OpenAPI spec |
 
 ### Control
 
+Mutating endpoints (marked 🔒) require a valid `X-Claim-Token` header — acquire one with `POST /control/claim` first, or get HTTP 423 Locked.
+
 | Endpoint | Description |
 |---|---|
+| `POST /control/claim` | Acquire the single instrument claim. Body `{owner, session_id, ttl_s}` → `{claim_token, heartbeat_interval_s, expires_at}`. 409 if held by another session. |
+| `POST /control/heartbeat` | Refresh the claim TTL (header `X-Claim-Token`). 204 on success; 401 if the token is unknown/expired. |
+| `POST /control/release` | Release the claim (header `X-Claim-Token`). Idempotent — always 204. |
 | `POST /control/startup` | Read-only readiness check — reports whether OpenLab processes are running. Never starts OpenLab. |
-| `POST /control/run` | Submit a run. Starts immediately if idle; queues behind the active run if busy. Returns `status: "accepted"` or `"queued"`. |
-| `POST /control/queue` | Submit a run and get back a `queue_id` for tracking. Same semantics as `/control/run` with a richer response. |
+| 🔒 `POST /control/run` | Submit a run. Starts immediately if idle; queues behind the active run if busy. Returns `status: "accepted"` or `"queued"`. 412 `queue_full` (with `Retry-After`) when the queue is at depth; 412 `reserved_for_robot` when a manual run targets the robot-reserved tray. |
+| 🔒 `POST /control/queue` | Submit a run and get back a `queue_id` for tracking. Same semantics as `/control/run` with a richer response. |
 | `GET /control/queue` | View all jobs (pending, running, recent done/failed) plus `instrument_online` and `accepting_jobs` signals. |
-| `DELETE /control/queue/{queue_id}` | Cancel a pending job. 409 if it is currently running (use abort instead), 404 if already done. |
-| `POST /control/abort` | Abort the active run and clear the entire queue. |
-| `POST /control/shutdown` | Submit a low-flow standby job to park the instrument. Queues behind any active run. |
+| 🔒 `DELETE /control/queue/{queue_id}` | Cancel a pending job. 409 if it is currently running (use abort instead), 404 if already done. |
+| 🔒 `POST /control/abort` | Abort the active run and clear the entire queue. |
+| 🔒 `POST /control/standby` | Submit a low-flow standby job to park the instrument. Queues behind any active run. 412 `queue_full` when the queue is at depth. **Not a full shutdown** — powering the instrument down is a deliberate manual procedure at the instrument, not an API action. |
+
+`GET /status.allowed_actions` reports which of `run.submit` · `run.abort` · `queue.cancel` · `instrument.standby` the device will currently honour, mirroring the control-side precondition refusals (the enqueue verbs drop out when the queue is full or OpenLab is down).
+
+### Sample submission & trays
+
+A run carries a `plate_format` (`96-well` / `384-well`) and a list of samples addressed by **tray + well**; the sidecar composes the Agilent autosampler position (`{drawer}-{well}`, e.g. `D4B-A1`) for Moses and rejects off-plate wells with `422`.
+
+```jsonc
+{
+  "output_dir": "C:/CDSProjects/Installation/Results/Batch",
+  "plate_format": "96-well",
+  "submitter": "manual",            // or "robot"
+  "gradient": { /* ... */ },
+  "samples": [
+    {"sample_name": "cpd_01", "tray": "front", "well": "A1", "injection_volume": 2.0}
+  ]
+}
+```
+
+**Tray reservation.** One tray can be reserved for robotic sample submission (`RESERVED_ROBOT_TRAY`, default `rear`). A run with `submitter != "robot"` that targets the reserved tray is refused with **412 `reserved_for_robot`**; a `submitter: "robot"` run is allowed in.
+
+> ⚠ **Confirm the drawer codes before deploying.** The logical tray → Agilent drawer-code mapping is config: `TRAY_FRONT_DRAWER` (default `D1F`, **placeholder**) and `TRAY_REAR_DRAWER` (default `D4B`, matches the existing example). Set these to the real codes for this instrument's multisampler.
 
 ## Loopback verification
 
@@ -323,6 +350,6 @@ while True:
 
 ## See also
 
-- [`STATUS_SPEC.md`](https://github.com/AccelerationConsortium/ac-organic-lab/blob/main/docs/STATUS_SPEC.md) — v1.0 contract this repo implements.
+- [`STATUS_SPEC.md`](https://github.com/AccelerationConsortium/ac-organic-lab/blob/main/docs/STATUS_SPEC.md) — v1.1 contract this repo implements.
 - [`INTERLOCKS.md`](https://github.com/AccelerationConsortium/ac-organic-lab/blob/main/docs/INTERLOCKS.md) — interlock layer design this server conforms to.
 - [`DEVICE_PC_SETUP.md`](https://github.com/AccelerationConsortium/ac-organic-lab/blob/main/docs/DEVICE_PC_SETUP.md) — canonical Windows install recipe (uv at `C:\SDL_Tools\uv.exe`, NSSM, lab-user run, log paths).

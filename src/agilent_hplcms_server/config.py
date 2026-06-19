@@ -61,6 +61,23 @@ class Settings:
     )
     queue_max_depth: int = _env_int("QUEUE_MAX_DEPTH", 20)
     queue_poll_interval_s: int = _env_int("QUEUE_POLL_INTERVAL_S", 5)
+    # Advisory Retry-After (seconds) returned with HTTP 412 queue_full refusals.
+    # A run is bounded by GradientConfig.run_time (<= 120 min); 60 s is a coarse
+    # "check back soon" hint, not a guarantee.
+    queue_full_retry_after_s: int = _env_int("QUEUE_FULL_RETRY_AFTER_S", 60)
+
+    # Autosampler tray → Agilent multisampler drawer-code mapping. A run
+    # addresses samples by logical {tray, well}; the control layer composes the
+    # "{drawer}-{well}" position string Moses consumes (see control/router.py).
+    # ⚠ TRAY_FRONT_DRAWER is a placeholder — confirm both codes against this
+    # instrument's multisampler before deploying. TRAY_REAR_DRAWER matches the
+    # code used in the existing example job.
+    tray_front_drawer: str = os.environ.get("TRAY_FRONT_DRAWER", "D1F")
+    tray_rear_drawer: str = os.environ.get("TRAY_REAR_DRAWER", "D4B")
+    # Tray reserved for robotic sample submission. A run with submitter != "robot"
+    # that targets this tray is refused with HTTP 412 reserved_for_robot. Set to
+    # "" to disable the reservation entirely.
+    reserved_robot_tray: str = os.environ.get("RESERVED_ROBOT_TRAY", "rear")
 
     # OpenLab Sharing Services REST API (instrument state probe)
     openlab_olss_url: str = os.environ.get(

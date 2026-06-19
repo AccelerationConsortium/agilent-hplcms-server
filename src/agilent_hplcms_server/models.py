@@ -1,9 +1,15 @@
-"""Lab Equipment Status Spec v1.0 Pydantic models.
+"""Lab Equipment Status Spec v1.1 Pydantic models.
 
 Copied verbatim from ``ac-organic-lab/docs/STATUS_SPEC.md`` so the sidecar has
 no runtime dependency on the dashboard repo. Field names are snake_case and
 match the spec exactly; the dashboard's ``HttpStatusAdapter`` is strict about
 shape.
+
+v1.1 adds, additively over v1.0:
+- ``EquipmentStatus.allowed_actions`` — skill names the device will honour right
+  now (see ``status_builder.allowed_actions`` for the single source of truth).
+- ``ClaimedBy`` — surfaced under ``details.claimed_by`` (``null`` when unclaimed).
+- cooperative claims on ``/control/*`` (see ``control/claims.py``).
 """
 
 from datetime import datetime
@@ -12,7 +18,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-PROTOCOL_VERSION = "1.0"
+PROTOCOL_VERSION = "1.1"
 
 
 EquipmentKind = Literal[
@@ -32,7 +38,6 @@ EquipmentKind = Literal[
 EquipmentState = Literal[
     "ready",
     "busy",
-    "paused",
     "requires_init",
     "degraded",
     "dry_run",
@@ -40,6 +45,10 @@ EquipmentState = Literal[
     "e_stop",
     "unknown",
 ]
+# Note: OLSS "Paused" is not a legal EquipmentState (v1.1 dropped "paused").
+# A paused OpenLab sequence is reported as "busy" with required_actions
+# ["resume_paused_sequence"]; the precise OLSS status is preserved in
+# details.olss_software_status and the hplc/ms component state. See status_builder.
 
 
 class ComponentStatus(BaseModel):
@@ -62,6 +71,16 @@ class ErrorInfo(BaseModel):
     timestamp: datetime
 
 
+class ClaimedBy(BaseModel):
+    """v1.1: identity of the current claim holder. Surfaced under
+    ``details.claimed_by`` so every reader sees who controls the device without
+    a side trip. ``null`` (absent) when no claim is active."""
+
+    session_id: str
+    owner: str
+    expires_at: datetime
+
+
 class EquipmentStatus(BaseModel):
     protocol_version: str = PROTOCOL_VERSION
 
@@ -81,6 +100,11 @@ class EquipmentStatus(BaseModel):
     components: dict[str, ComponentStatus] = Field(default_factory=dict)
     metrics: dict[str, MetricValue] = Field(default_factory=dict)
     last_error: ErrorInfo | None = None
+
+    # NEW in v1.1: skill names the device will currently honour. Mirrors
+    # control-side precondition refusals (§6.2). `details.claimed_by` is a
+    # ClaimedBy | None nested under details to keep the top-level shape stable.
+    allowed_actions: list[str] = Field(default_factory=list)
 
     details: dict[str, Any] = Field(default_factory=dict)
 
