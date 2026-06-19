@@ -89,15 +89,18 @@ def _section(title: str) -> None:
 # Stages
 # ----------------------------------------------------------------------------
 
-def stage_readonly(base: str) -> None:
+def stage_readonly(base: str) -> bool:
+    """Read-only status checks. Returns True iff the instrument is idle (no active
+    run and an empty queue) — the caller uses this to gate the abort stage."""
     _section("Stage 1 — read-only status (no hardware motion)")
+    idle = False
 
     code, body = _request("GET", f"{base}/health")
     _check("GET /health is 200", code == 200, str(body))
 
     code, body = _request("GET", f"{base}/status")
     if not _check("GET /status is 200", code == 200, str(body)[:200]):
-        return
+        return False
     assert isinstance(body, dict)
     print(f"      protocol_version : {body.get('protocol_version')}")
     print(f"      equipment_status : {body.get('equipment_status')}")
@@ -120,11 +123,13 @@ def stage_readonly(base: str) -> None:
         print(f"      accepting_jobs   : {body.get('accepting_jobs')}")
         print(f"      active_run_id    : {body.get('active_run_id')}")
         print(f"      pending_count    : {body.get('pending_count')}")
+        idle = body.get("active_run_id") is None and not body.get("pending_count")
         _check(
             "no active run before we start (instrument idle)",
-            body.get("active_run_id") is None,
-            "ABORT the test if something else is running",
+            idle,
+            "something is running/queued — the abort stage will be skipped",
         )
+    return idle
 
 
 def stage_claim(base: str, owner: str, session_id: str) -> dict:
@@ -292,7 +297,7 @@ def main() -> int:
             args.run_hardware = False
 
     try:
-        stage_readonly(base)
+        idle = stage_readonly(base)
         grant = stage_claim(base, args.owner, args.session_id)
         if not grant:
             print("\nClaim failed — cannot run mutating stages. Stopping.")
@@ -303,7 +308,12 @@ def main() -> int:
             stage_hardware_run(base, args.tray, args.well, args.output_dir, hb_interval)
         else:
             print("\n(Skipping Stage 4 hardware run — pass --run-hardware to enable.)")
-        stage_abort(base)
+        # /control/abort is a no-op when idle but would kill an active run, so only
+        # exercise it when we confirmed idle at start (or after our own hardware run).
+        if idle or args.run_hardware:
+            stage_abort(base)
+        else:
+            print("\n(Skipping abort stage — instrument was not idle at start.)")
     finally:
         stage_release(base)
 
