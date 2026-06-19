@@ -75,16 +75,18 @@ catalog validates identically on the device.
   device-side only and not forwarded to Moses.
 - **Geometry validation (422).** Wells are checked against `plate_format`
   geometry (`96 → 8×12`, `384 → 16×24`); off-plate wells are rejected with 422.
-- **Robot-tray reservation (412).** `RESERVED_ROBOT_TRAY` (default `rear`) is
-  reserved for robotic submission: a run with `submitter != "robot"` targeting it
-  is refused with **412 `reserved_for_robot`** (a precondition refusal — no
-  `last_error`). `submitter="robot"` bypasses it; `""` disables the reservation.
+- **Robot-tray reservation (412).** The **front** tray (`RESERVED_ROBOT_TRAY`,
+  default `front`) is reserved for robotic submission; manual runs use the rear
+  tray. A run with `submitter != "robot"` targeting the reserved tray is refused
+  with **412 `reserved_for_robot`** (a precondition refusal — no `last_error`).
+  `submitter="robot"` bypasses it; `""` disables the reservation.
 - **Cross-repo alignment.** The `SampleConfig` / `RunRequest` field set, plate
   geometry, and well regex are kept in sync with the lab skill catalog
   (`ac-organic-lab: lab_skills/skill_catalog/hplc.py`). The device is the
   authoritative validator; the catalog mirrors these definitions.
-- ⚠ `TRAY_FRONT_DRAWER` default `D1F` is a **placeholder** — confirm both drawer
-  codes against this instrument's multisampler before deploying.
+- Drawer codes: `TRAY_FRONT_DRAWER=D1F` is the confirmed robot tray;
+  `TRAY_REAR_DRAWER=D4B` matches the existing example job — confirm it against
+  this instrument's multisampler before deploying.
 
 ## Hard constraints (unchanged)
 

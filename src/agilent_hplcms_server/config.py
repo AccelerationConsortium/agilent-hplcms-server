@@ -69,15 +69,15 @@ class Settings:
     # Autosampler tray → Agilent multisampler drawer-code mapping. A run
     # addresses samples by logical {tray, well}; the control layer composes the
     # "{drawer}-{well}" position string Moses consumes (see control/router.py).
-    # ⚠ TRAY_FRONT_DRAWER is a placeholder — confirm both codes against this
-    # instrument's multisampler before deploying. TRAY_REAR_DRAWER matches the
-    # code used in the existing example job.
+    # The front drawer (D1F) is the robot's reserved tray — confirmed against the
+    # instrument. The rear drawer (D4B) matches the code in the existing example
+    # job; confirm it against this instrument's multisampler before deploying.
     tray_front_drawer: str = os.environ.get("TRAY_FRONT_DRAWER", "D1F")
     tray_rear_drawer: str = os.environ.get("TRAY_REAR_DRAWER", "D4B")
-    # Tray reserved for robotic sample submission. A run with submitter != "robot"
-    # that targets this tray is refused with HTTP 412 reserved_for_robot. Set to
-    # "" to disable the reservation entirely.
-    reserved_robot_tray: str = os.environ.get("RESERVED_ROBOT_TRAY", "rear")
+    # Tray reserved for robotic sample submission (the front tray, D1F). A run
+    # with submitter != "robot" that targets it is refused with HTTP 412
+    # reserved_for_robot. Set to "" to disable the reservation entirely.
+    reserved_robot_tray: str = os.environ.get("RESERVED_ROBOT_TRAY", "front")
 
     # OpenLab Sharing Services REST API (instrument state probe)
     openlab_olss_url: str = os.environ.get(

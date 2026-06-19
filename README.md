@@ -67,14 +67,14 @@ A run carries a `plate_format` (`96-well` / `384-well`) and a list of samples ad
   "submitter": "manual",            // or "robot"
   "gradient": { /* ... */ },
   "samples": [
-    {"sample_name": "cpd_01", "tray": "front", "well": "A1", "injection_volume": 2.0}
+    {"sample_name": "cpd_01", "tray": "rear", "well": "A1", "injection_volume": 2.0}
   ]
 }
 ```
 
-**Tray reservation.** One tray can be reserved for robotic sample submission (`RESERVED_ROBOT_TRAY`, default `rear`). A run with `submitter != "robot"` that targets the reserved tray is refused with **412 `reserved_for_robot`**; a `submitter: "robot"` run is allowed in.
+**Tray reservation.** The **front** tray is reserved for robotic sample submission (`RESERVED_ROBOT_TRAY`, default `front`); manual runs use the rear tray. A run with `submitter != "robot"` that targets the reserved tray is refused with **412 `reserved_for_robot`**; a `submitter: "robot"` run is allowed in. Set `RESERVED_ROBOT_TRAY=""` to disable the reservation.
 
-> ⚠ **Confirm the drawer codes before deploying.** The logical tray → Agilent drawer-code mapping is config: `TRAY_FRONT_DRAWER` (default `D1F`, **placeholder**) and `TRAY_REAR_DRAWER` (default `D4B`, matches the existing example). Set these to the real codes for this instrument's multisampler.
+> The logical tray → Agilent drawer-code mapping is config: `TRAY_FRONT_DRAWER` (default `D1F`, the confirmed robot tray) and `TRAY_REAR_DRAWER` (default `D4B`, matches the existing example — confirm against this instrument's multisampler before deploying).
 
 ## Loopback verification
 
