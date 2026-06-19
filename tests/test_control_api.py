@@ -199,7 +199,8 @@ VALID_RUN_BODY = {
         "gradient_table": [[0.0, 0.05], [1.0, 0.05], [7.0, 1.0], [9.8, 1.0], [9.9, 0.05]],
     },
     "samples": [
-        {"sample_name": "cpd_01", "tray": "front", "well": "A1", "injection_volume": 2.0}
+        # Rear tray is the manual/open tray; front is reserved for the robot.
+        {"sample_name": "cpd_01", "tray": "rear", "well": "A1", "injection_volume": 2.0}
     ],
 }
 
@@ -279,7 +280,7 @@ def test_run_422_injection_volume_too_large():
     runner = FakeRunner(busy=False)
     client = _client(_load("signals_ready.json"), runner=runner)
     bad = {**VALID_RUN_BODY, "samples": [
-        {"sample_name": "s1", "tray": "front", "well": "A1", "injection_volume": 999.0}
+        {"sample_name": "s1", "tray": "rear", "well": "A1", "injection_volume": 999.0}
     ]}
     r = client.post("/control/run", json=bad)
     assert r.status_code == 422
@@ -317,7 +318,7 @@ def test_run_422_sample_name_with_spaces():
     runner = FakeRunner(busy=False)
     client = _client(_load("signals_ready.json"), runner=runner)
     bad = {**VALID_RUN_BODY, "samples": [
-        {"sample_name": "has spaces", "tray": "front", "well": "A1", "injection_volume": 2.0}
+        {"sample_name": "has spaces", "tray": "rear", "well": "A1", "injection_volume": 2.0}
     ]}
     r = client.post("/control/run", json=bad)
     assert r.status_code == 422
@@ -1033,7 +1034,7 @@ def test_run_composes_sample_position_from_tray_well():
     body = {**VALID_RUN_BODY, "samples": [
         {"sample_name": "cpd_01", "tray": "front", "well": "A1", "injection_volume": 2.0},
         {"sample_name": "cpd_02", "tray": "rear", "well": "H12", "injection_volume": 1.0},
-    ], "submitter": "robot"}  # robot so the rear (reserved) sample is allowed
+    ], "submitter": "robot"}  # robot so the front (reserved) sample is allowed
     r = client.post("/control/run", json=body)
     assert r.status_code == 202, r.text
     job = runner.submitted[0]["job"]
@@ -1071,17 +1072,17 @@ def test_run_384_well_plate_accepts_high_wells():
 
 
 def test_run_412_reserved_tray_for_manual_submitter():
-    """A manual run targeting the robot-reserved tray (default 'rear') is refused 412."""
+    """A manual run targeting the robot-reserved tray (default 'front') is refused 412."""
     runner = FakeRunner(busy=False)
     client = _authed_client(_load("signals_ready.json"), runner=runner)
     body = {**VALID_RUN_BODY, "samples": [
-        {"sample_name": "x", "tray": "rear", "well": "A1", "injection_volume": 2.0}
+        {"sample_name": "x", "tray": "front", "well": "A1", "injection_volume": 2.0}
     ]}  # submitter defaults to "manual"
     r = client.post("/control/run", json=body)
     assert r.status_code == 412, r.text
     detail = r.json()["detail"]
     assert detail["error"] == "reserved_for_robot"
-    assert detail["reserved_tray"] == "rear"
+    assert detail["reserved_tray"] == "front"
     assert runner.submitted == []  # never enqueued
 
 
@@ -1090,7 +1091,7 @@ def test_run_robot_submitter_allowed_on_reserved_tray():
     runner = FakeRunner(busy=False)
     client = _authed_client(_load("signals_ready.json"), runner=runner)
     body = {**VALID_RUN_BODY, "submitter": "robot", "samples": [
-        {"sample_name": "x", "tray": "rear", "well": "A1", "injection_volume": 2.0}
+        {"sample_name": "x", "tray": "front", "well": "A1", "injection_volume": 2.0}
     ]}
     r = client.post("/control/run", json=body)
     assert r.status_code == 202, r.text
