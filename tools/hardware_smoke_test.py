@@ -21,7 +21,7 @@ Usage (PowerShell, on the instrument PC):
 Exit code 0 = all attempted stages passed; non-zero = a check failed (the claim
 is always released on the way out).
 
-Stdlib only — no third-party deps, so it runs with any Python on the PC.
+Stdlib only - no third-party deps, so it runs with any Python on the PC.
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ def _check(label: str, ok: bool, detail: str = "") -> bool:
     mark = "PASS" if ok else "FAIL"
     line = f"  [{mark}] {label}"
     if detail:
-        line += f"  — {detail}"
+        line += f"  - {detail}"
     print(line)
     if not ok:
         _FAILURES.append(label)
@@ -91,8 +91,8 @@ def _section(title: str) -> None:
 
 def stage_readonly(base: str) -> bool:
     """Read-only status checks. Returns True iff the instrument is idle (no active
-    run and an empty queue) — the caller uses this to gate the abort stage."""
-    _section("Stage 1 — read-only status (no hardware motion)")
+    run and an empty queue) - the caller uses this to gate the abort stage."""
+    _section("Stage 1 - read-only status (no hardware motion)")
     idle = False
 
     code, body = _request("GET", f"{base}/health")
@@ -127,7 +127,7 @@ def stage_readonly(base: str) -> bool:
         _check(
             "no active run before we start (instrument idle)",
             idle,
-            "something is running/queued — the abort stage will be skipped",
+            "something is running/queued - the abort stage will be skipped",
         )
     return idle
 
@@ -135,17 +135,17 @@ def stage_readonly(base: str) -> bool:
 def stage_claim(base: str, owner: str, session_id: str) -> dict:
     """Acquire the claim and verify hard enforcement. Returns the claim grant."""
     global _TOKEN
-    _section("Stage 2 — claim protocol + hard enforcement (423)")
+    _section("Stage 2 - claim protocol + hard enforcement (423)")
 
     # Tokenless mutating call MUST be locked out first.
     code, _ = _request("POST", f"{base}/control/abort")
-    _check("tokenless POST /control/abort → 423 Locked", code == 423, f"got {code}")
+    _check("tokenless POST /control/abort -> 423 Locked", code == 423, f"got {code}")
 
     code, body = _request(
         "POST", f"{base}/control/claim",
         {"owner": owner, "session_id": session_id, "ttl_s": 30.0},
     )
-    if not _check("POST /control/claim → 200", code == 200, str(body)[:200]):
+    if not _check("POST /control/claim -> 200", code == 200, str(body)[:200]):
         return {}
     assert isinstance(body, dict)
     _TOKEN = body["claim_token"]
@@ -153,13 +153,13 @@ def stage_claim(base: str, owner: str, session_id: str) -> dict:
     print(f"      expires_at          : {body.get('expires_at')}")
 
     code, _ = _request("POST", f"{base}/control/heartbeat")
-    _check("POST /control/heartbeat (valid token) → 204", code == 204, f"got {code}")
+    _check("POST /control/heartbeat (valid token) -> 204", code == 204, f"got {code}")
     return body
 
 
 def stage_refusals(base: str, reserved_tray: str) -> None:
     """Submit bodies that MUST be refused *before* any hardware action."""
-    _section("Stage 3 — precondition refusals (refused before hardware)")
+    _section("Stage 3 - precondition refusals (refused before hardware)")
 
     base_grad = {
         "name": "smoke_iso", "solvent_a": "H2O_0.1%FA", "solvent_b": "ACN_0.1%FA",
@@ -167,16 +167,16 @@ def stage_refusals(base: str, reserved_tray: str) -> None:
         "gradient_table": [[0.0, 0.05], [2.0, 0.05]],
     }
 
-    # Off-plate well → 422 (geometry).
+    # Off-plate well -> 422 (geometry).
     off_plate = {
         "output_dir": "C:/CDSProjects/Installation/Results/SmokeTest",
         "gradient": base_grad, "plate_format": "96-well",
         "samples": [{"sample_name": "x", "tray": "front", "well": "A13", "injection_volume": 1.0}],
     }
     code, _ = _request("POST", f"{base}/control/run", off_plate)
-    _check("off-plate well A13 on 96-well → 422", code == 422, f"got {code}")
+    _check("off-plate well A13 on 96-well -> 422", code == 422, f"got {code}")
 
-    # Manual run targeting the robot-reserved tray → 412 reserved_for_robot.
+    # Manual run targeting the robot-reserved tray -> 412 reserved_for_robot.
     reserved = {
         "output_dir": "C:/CDSProjects/Installation/Results/SmokeTest",
         "gradient": base_grad, "submitter": "manual",
@@ -186,7 +186,7 @@ def stage_refusals(base: str, reserved_tray: str) -> None:
     detail = body.get("detail") if isinstance(body, dict) else {}
     err = detail.get("error") if isinstance(detail, dict) else None
     _check(
-        f"manual run on reserved tray {reserved_tray!r} → 412 reserved_for_robot",
+        f"manual run on reserved tray {reserved_tray!r} -> 412 reserved_for_robot",
         code == 412 and err == "reserved_for_robot",
         f"got {code} / {err}",
     )
@@ -200,7 +200,7 @@ def _heartbeat(base: str) -> None:
 
 def stage_hardware_run(base: str, tray: str, well: str, output_dir: str, hb_interval: float) -> None:
     """GATED: submit ONE real run, watch it through, then standby."""
-    _section("Stage 4 — ONE real run + standby (HARDWARE MOVES)")
+    _section("Stage 4 - ONE real run + standby (HARDWARE MOVES)")
     print(f"      tray={tray} well={well} output_dir={output_dir}")
 
     run_body = {
@@ -217,7 +217,7 @@ def stage_hardware_run(base: str, tray: str, well: str, output_dir: str, hb_inte
         "samples": [{"sample_name": "smoke_blank", "tray": tray, "well": well, "injection_volume": 1.0}],
     }
     code, body = _request("POST", f"{base}/control/queue", run_body)
-    if not _check("POST /control/queue (real run) → 202", code == 202, str(body)[:250]):
+    if not _check("POST /control/queue (real run) -> 202", code == 202, str(body)[:250]):
         return
     assert isinstance(body, dict)
     queue_id = body.get("queue_id")
@@ -250,21 +250,21 @@ def stage_hardware_run(base: str, tray: str, well: str, output_dir: str, hb_inte
 
     # Park the instrument.
     code, body = _request("POST", f"{base}/control/standby")
-    _check("POST /control/standby → 202", code == 202, str(body)[:200])
+    _check("POST /control/standby -> 202", code == 202, str(body)[:200])
 
 
 def stage_abort(base: str) -> None:
-    _section("Stage 5 — abort clears the queue")
+    _section("Stage 5 - abort clears the queue")
     code, body = _request("POST", f"{base}/control/abort")
-    _check("POST /control/abort → 200", code == 200, str(body)[:200])
+    _check("POST /control/abort -> 200", code == 200, str(body)[:200])
 
 
 def stage_release(base: str) -> None:
-    _section("Stage 6 — release claim (idempotent)")
+    _section("Stage 6 - release claim (idempotent)")
     code, _ = _request("POST", f"{base}/control/release")
-    _check("POST /control/release → 204", code == 204, f"got {code}")
+    _check("POST /control/release -> 204", code == 204, f"got {code}")
     code, _ = _request("POST", f"{base}/control/release")
-    _check("second release also → 204 (idempotent)", code == 204, f"got {code}")
+    _check("second release also -> 204 (idempotent)", code == 204, f"got {code}")
 
 
 # ----------------------------------------------------------------------------
@@ -300,20 +300,20 @@ def main() -> int:
         idle = stage_readonly(base)
         grant = stage_claim(base, args.owner, args.session_id)
         if not grant:
-            print("\nClaim failed — cannot run mutating stages. Stopping.")
+            print("\nClaim failed - cannot run mutating stages. Stopping.")
             return 1
         hb_interval = float(grant.get("heartbeat_interval_s", 15.0))
         stage_refusals(base, args.reserved_tray)
         if args.run_hardware:
             stage_hardware_run(base, args.tray, args.well, args.output_dir, hb_interval)
         else:
-            print("\n(Skipping Stage 4 hardware run — pass --run-hardware to enable.)")
+            print("\n(Skipping Stage 4 hardware run - pass --run-hardware to enable.)")
         # /control/abort is a no-op when idle but would kill an active run, so only
         # exercise it when we confirmed idle at start (or after our own hardware run).
         if idle or args.run_hardware:
             stage_abort(base)
         else:
-            print("\n(Skipping abort stage — instrument was not idle at start.)")
+            print("\n(Skipping abort stage - instrument was not idle at start.)")
     finally:
         stage_release(base)
 
