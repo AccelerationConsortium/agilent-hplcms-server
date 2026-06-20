@@ -327,8 +327,10 @@ job = {
         "run_time": 10.0, "flow_rate": 0.6, "equilibration_time": 1.0,
         "gradient_table": [[0.0,0.05],[1.0,0.05],[7.0,1.0],[9.8,1.0],[9.9,0.05]]
     },
+    "plate_format": "96-well",
+    "submitter": "manual",
     "samples": [
-        {"sample_name": "cpd_01", "sample_position": "D4B-A1", "injection_volume": 2.0}
+        {"sample_name": "cpd_01", "tray": "rear", "well": "A1", "injection_volume": 2.0}
     ]
 }
 r = httpx.post(f"{BASE}/control/queue", json=job, timeout=10)
