@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__
 from .config import Settings, load_settings
-from .control import MosesRunner, router as control_router
+from .control import MosesRunner, RosterProvider, router as control_router
 from .control.claims import ClaimHolder
 from .models import EquipmentStatus, HealthResponse, PROTOCOL_VERSION, ProbeResponse
 from .probes import read_signals as _default_read_signals
@@ -47,17 +47,21 @@ def create_app(
     reader: SignalReader | None = None,
     runner: MosesRunner | None = None,
     claims: ClaimHolder | None = None,
+    roster: RosterProvider | None = None,
 ) -> FastAPI:
     """Build the FastAPI app. Tests can inject a fake ``reader`` or ``runner``."""
     settings = settings or load_settings()
     reader_fn: SignalReader = reader or _adapt()
     runner_instance = runner if runner is not None else MosesRunner()
     claims_instance = claims if claims is not None else ClaimHolder()
+    roster_instance = roster if roster is not None else RosterProvider()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         runner_instance.start_poller(settings=settings)
+        roster_instance.start_poller(settings=settings)
         yield
+        roster_instance.stop_poller()
         runner_instance.stop_poller()
 
     app = FastAPI(
@@ -90,6 +94,7 @@ def create_app(
     app.state.settings = settings
     app.state.reader = reader_fn
     app.state.claims = claims_instance
+    app.state.roster = roster_instance
 
     app.include_router(control_router)
 

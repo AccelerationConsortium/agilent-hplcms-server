@@ -152,6 +152,8 @@ Mutating `/control/*` calls require a valid `X-Claim-Token` (hard enforcement, `
 
 An unknown owner is refused `403 user_not_recognized`; an under-privileged owner calling a gated action gets `403 role_forbidden`. The roster is **always enforced**: when every list is empty the built-in defaults (`Hplcms-User` / `HTE-User` / `Service-Account`) apply, so a fresh install always has a service account and never bricks. A literal `"*"` in a list matches any owner — an explicit open mode for dev, distinct from an accidental empty config. `HPLCMS_ADMINS` is seeded with the single `Service-Account` the dashboard claims under to toggle service mode; broadening it later is just adding names.
 
+**Central roster (optional).** Set `ROSTER_URL` to the central auth service's owner→role projection (ac-organic-lab `GET /equipment/{key}/roster`) and the sidecar polls it every `ROSTER_REFRESH_INTERVAL_S` (default 60 s) — the central roster is then **authoritative** for owner→role resolution, so per-user roles are managed centrally instead of via the `*_USERS` env lists. The static env roster above becomes the fallback used **only until the first successful pull** (the device never bricks if the auth service is unreachable at startup); once a roster is pulled, a later refresh failure keeps the last-good copy. A successfully-pulled *empty* roster is authoritative (nobody is allowed). Leave `ROSTER_URL` unset to run fully standalone on the env lists. The pull is stdlib-only (`urllib`) and Tailnet-only by deployment; set `ROSTER_API_KEY` only if the central service ever gates the device-plane endpoint.
+
 ## What the server never does
 
 - Does **not** import or share an environment with `moses`.
@@ -320,6 +322,10 @@ Writes to `C:\SDL_Tools\hplcms_sensor_data.json` every 30 seconds (override via 
 | `HPLCMS_USERS` | `Hplcms-User` | Roster: owners with role `hplcms_user` (submit samples). Comma-separated; `"*"` = any owner. |
 | `HTE_USERS` | `HTE-User` | Roster: owners with role `hte` (submit + `workflow.*`). |
 | `HPLCMS_ADMINS` | `Service-Account` | Roster: owners with role `hplcms_admin` (submit + `service.*`). |
+| `ROSTER_URL` | _(empty)_ | Central roster projection URL (`…/equipment/{key}/roster`). Set → central is authoritative for owner→role; empty → static env roster only. |
+| `ROSTER_REFRESH_INTERVAL_S` | `60` | How often to re-pull the central roster. |
+| `ROSTER_HTTP_TIMEOUT_S` | `5` | Timeout for a single central-roster pull. |
+| `ROSTER_API_KEY` | _(empty)_ | Optional `X-Api-Key` sent with the roster pull (endpoint is Tailnet-only by default). |
 
 ### Sensor daemon
 

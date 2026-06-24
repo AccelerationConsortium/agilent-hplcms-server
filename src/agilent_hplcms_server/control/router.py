@@ -32,7 +32,8 @@ from .models import (
     WorkflowEndResponse,
     WorkflowStartResponse,
 )
-from .roster import can_service, can_workflow, resolve_role
+from .roster import can_service, can_workflow
+from .roster_sync import RosterProvider
 from .runner import JobEntry, MosesRunner
 
 router = APIRouter(prefix="/control", tags=["control"])
@@ -48,6 +49,10 @@ def _get_settings(request: Request) -> Settings:
 
 def _get_claims(request: Request) -> ClaimHolder:
     return request.app.state.claims  # type: ignore[no-any-return]
+
+
+def _get_roster(request: Request) -> RosterProvider:
+    return request.app.state.roster  # type: ignore[no-any-return]
 
 
 def _require_claim(request: Request) -> str:
@@ -581,10 +586,11 @@ def claim(body: ClaimRequest, request: Request) -> ClaimResponse:
     claims = _get_claims(request)
     settings = _get_settings(request)
 
-    role = resolve_role(body.owner, settings)
+    role = _get_roster(request).resolve(body.owner, settings)
     if role is None:
-        # Roster is enabled (else resolve_role returns a role for any owner) and
-        # this owner is not on any list. Identity attribution, not auth → 403.
+        # Owner not recognized: either the central roster projection (if pulled)
+        # or the static env roster has no role for them. Identity attribution,
+        # not auth → 403. (A "*" static list or a central entry would yield one.)
         raise HTTPException(
             status_code=403,
             detail=UserNotRecognizedError(
