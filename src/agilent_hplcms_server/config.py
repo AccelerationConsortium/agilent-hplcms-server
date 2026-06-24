@@ -65,6 +65,31 @@ class Settings:
     # A run is bounded by GradientConfig.run_time (<= 120 min); 60 s is a coarse
     # "check back soon" hint, not a guarantee.
     queue_full_retry_after_s: int = _env_int("QUEUE_FULL_RETRY_AFTER_S", 60)
+    # Advisory Retry-After (seconds) returned with HTTP 423 workflow_active
+    # refusals (a robot/agent campaign holds the equipment-blocking lock).
+    workflow_active_retry_after_s: int = _env_int("WORKFLOW_ACTIVE_RETRY_AFTER_S", 60)
+    # Servicing detection debounce: number of consecutive /status observations
+    # of "OLSS busy AND no active sidecar job" required before the sidecar
+    # declares a technician is driving OpenLab directly and halts the queue /
+    # rejects submissions with 409 instrument_servicing. >=2 avoids a false
+    # positive in the one-poll gap after our Moses process exits but before OLSS
+    # returns to Idle. Fails safe: a transient over-count only briefly halts the
+    # queue and self-clears when OLSS goes Idle.
+    servicing_debounce_polls: int = _env_int("SERVICING_DEBOUNCE_POLLS", 2)
+
+    # Lab user roster → claim role (identity only, NOT authentication; the
+    # network ACL / dashboard login is the real access boundary). Comma-separated
+    # owner names per group. Capabilities by role:
+    #   hplcms_user  (HPLCMS_USERS)  → submit samples into the queue
+    #   hte          (HTE_USERS)     → submit + start equipment-blocking workflows
+    #   hplcms_admin (HPLCMS_ADMINS) → submit + toggle service mode
+    # The roster is ALWAYS enforced: when every list is empty the built-in
+    # defaults below apply (so a fresh install always has a Service-Account and
+    # never bricks). A literal "*" in a list matches any owner (explicit open
+    # mode for dev). See control/roster.py.
+    hplcms_users: str = os.environ.get("HPLCMS_USERS", "Hplcms-User")
+    hte_users: str = os.environ.get("HTE_USERS", "HTE-User")
+    hplcms_admins: str = os.environ.get("HPLCMS_ADMINS", "Service-Account")
 
     # Autosampler tray → Agilent multisampler drawer-code mapping. A run
     # addresses samples by logical {tray, well}; the control layer composes the

@@ -45,6 +45,8 @@ class ClaimGrant:
     expires_at: datetime
     session_id: str
     owner: str
+    role: str | None = None
+    workflow: bool = False
 
 
 class ClaimConflict(Exception):
@@ -74,6 +76,11 @@ class ClaimHolder:
         self._owner: str | None = None
         self._session_id: str | None = None
         self._expires_at: datetime | None = None
+        self._role: str | None = None
+        # True while the holder has taken the equipment-blocking workflow lock.
+        # Lives on the claim so it inherits TTL/heartbeat/auto-expiry for free —
+        # a crashed workflow holder loses the lock when its claim lapses.
+        self._workflow: bool = False
 
     # ------------------------------------------------------------------
     # Internal helpers (call WITH the lock held)
@@ -91,6 +98,8 @@ class ClaimHolder:
         self._owner = None
         self._session_id = None
         self._expires_at = None
+        self._role = None
+        self._workflow = False
 
     def _clamp_ttl(self, ttl_s: float) -> float:
         return max(self._min_ttl_s, min(self._max_ttl_s, ttl_s))
@@ -105,30 +114,77 @@ class ClaimHolder:
             expires_at=expires_at,
             session_id=self._session_id,
             owner=self._owner,
+            role=self._role,
+            workflow=self._workflow,
         )
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def claim(self, owner: str, session_id: str, ttl_s: float | None = None) -> ClaimGrant:
+    def claim(
+        self,
+        owner: str,
+        session_id: str,
+        ttl_s: float | None = None,
+        role: str | None = None,
+    ) -> ClaimGrant:
         """Acquire (or re-acquire) the claim.
 
-        - Free slot (or expired claim) → grant a fresh token.
+        - Free slot (or expired claim) → grant a fresh token; the workflow lock
+          starts cleared.
         - Same ``session_id`` re-claiming → idempotent; rotate to a fresh token
-          and extend the TTL (the SDK handles token rotation).
+          and extend the TTL (the SDK handles token rotation). An active workflow
+          lock is *preserved* across the re-claim so a heartbeating workflow
+          holder keeps its lock.
         - Held by a *different* live session → raise :class:`ClaimConflict`.
+
+        ``role`` is the owner's resolved lab role (see ``control/roster.py``);
+        it is attribution only, recorded so ``workflow.start`` can be gated.
         """
         ttl = self._clamp_ttl(self._default_ttl_s if ttl_s is None else ttl_s)
         now = self._now()
         with self._lock:
+            same_session = self._is_active_locked(now) and self._session_id == session_id
             if self._is_active_locked(now) and self._session_id != session_id:
                 raise ClaimConflict(self._claimed_by_locked())
             # Free, expired, or same-session: (re)issue.
             self._token = uuid.uuid4().hex
             self._owner = owner
             self._session_id = session_id
+            self._role = role
+            if not same_session:
+                # Fresh claim (new or expired slot): workflow lock starts clear.
+                self._workflow = False
             return self._grant_locked(now, ttl)
+
+    def start_workflow(self, token: str) -> ClaimGrant:
+        """Take the equipment-blocking workflow lock. Raises :class:`KeyError`
+        if ``token`` is not the current live claim (caller must hold the claim).
+        Idempotent: re-starting while already held just returns the grant."""
+        now = self._now()
+        with self._lock:
+            if not self._is_active_locked(now) or token != self._token:
+                if not self._is_active_locked(now):
+                    self._clear_locked()
+                raise KeyError(token)
+            self._workflow = True
+            return self._grant_locked(now, self._clamp_ttl(self._default_ttl_s))
+
+    def end_workflow(self, token: str) -> None:
+        """Release the workflow lock while keeping the claim. Idempotent: a no-op
+        if the token is not the live holder or no workflow is active (never
+        raises) — symmetry with :meth:`release`."""
+        now = self._now()
+        with self._lock:
+            if self._is_active_locked(now) and token == self._token:
+                self._workflow = False
+
+    def is_workflow_active(self) -> bool:
+        """True iff a live claim currently holds the workflow lock."""
+        now = self._now()
+        with self._lock:
+            return self._is_active_locked(now) and self._workflow
 
     def heartbeat(self, token: str) -> ClaimGrant:
         """Extend the claim TTL. Raises :class:`KeyError` if the token is not
@@ -178,6 +234,8 @@ class ClaimHolder:
             session_id=self._session_id,
             owner=self._owner,
             expires_at=self._expires_at,
+            role=self._role,
+            workflow=self._workflow,
         )
 
 

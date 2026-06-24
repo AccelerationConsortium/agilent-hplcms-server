@@ -14,17 +14,25 @@ from .models import (
     ClaimResponse,
     EquipmentBusyError,
     HeartbeatResponse,
+    InstrumentServicingError,
     QueueFullError,
     QueueResponse,
     QueueStatusResponse,
     ReservedForRobotError,
     QueuedRun,
     RequiresInitError,
+    RoleForbiddenError,
     RunRequest,
     RunResponse,
+    ServiceModeResponse,
     StandbyResponse,
     StartupResponse,
+    UserNotRecognizedError,
+    WorkflowActiveError,
+    WorkflowEndResponse,
+    WorkflowStartResponse,
 )
+from .roster import can_service, can_workflow, resolve_role
 from .runner import JobEntry, MosesRunner
 
 router = APIRouter(prefix="/control", tags=["control"])
@@ -42,15 +50,36 @@ def _get_claims(request: Request) -> ClaimHolder:
     return request.app.state.claims  # type: ignore[no-any-return]
 
 
-def _require_claim(request: Request) -> None:
+def _require_claim(request: Request) -> str:
     """Hard claim enforcement (§5): mutating /control/* requires a valid
     ``X-Claim-Token`` matching the live claim. Missing or stale → 423 Locked,
-    body carries the current holder so the caller can back off / retry."""
+    body carries the current holder so the caller can back off / retry.
+
+    When the live claim holds the equipment-blocking workflow lock, a non-holder
+    is refused with the more specific ``workflow_active`` reason + an advisory
+    ``Retry-After`` (precedence #2). Returns the validated token for callers that
+    need it (e.g. workflow start/end)."""
     claims = _get_claims(request)
     token = request.headers.get("x-claim-token")
     if claims.validate(token):
-        return
+        return token or ""
+
     held = claims.current()
+    if claims.is_workflow_active():
+        settings = _get_settings(request)
+        retry_after_s = float(settings.workflow_active_retry_after_s)
+        raise HTTPException(
+            status_code=423,
+            detail=WorkflowActiveError(
+                detail=(
+                    "A robot/agent workflow holds the instrument. Only the "
+                    "workflow holder may submit until it ends."
+                ),
+                claimed_by=held,
+                retry_after_s=retry_after_s,
+            ).model_dump(mode="json"),
+            headers={"Retry-After": str(int(retry_after_s))},
+        )
     raise HTTPException(
         status_code=423,
         detail=ClaimRejection(
@@ -64,6 +93,26 @@ def _require_claim(request: Request) -> None:
     )
 
 
+def _check_servicing(request: Request, signals: dict) -> None:
+    """Refuse an enqueue while a technician is running samples directly in
+    OpenLab CDS (409 instrument_servicing, highest precedence). ``poll`` /
+    ``notify_olss_state`` must have run from the current signals first so the
+    runner's servicing debounce is up to date."""
+    runner = _get_runner(request)
+    settings = _get_settings(request)
+    if runner.is_servicing(settings):
+        raise HTTPException(
+            status_code=409,
+            detail=InstrumentServicingError(
+                detail=(
+                    "A technician is running samples directly in OpenLab CDS. "
+                    "The queue is halted; resubmit once servicing finishes."
+                ),
+                olss_state=signals.get("olss_instrument_state"),
+            ).model_dump(mode="json"),
+        )
+
+
 def _read_signals(request: Request) -> dict:
     settings = _get_settings(request)
     reader = request.app.state.reader
@@ -74,6 +123,7 @@ def _notify_runner_from_signals(runner: MosesRunner, signals: dict) -> None:
     runner.notify_olss_state(
         signals.get("olss_instrument_state"),
         signals.get("olss_software_status"),
+        signals.get("olss_current_run"),
     )
 
 
@@ -89,15 +139,13 @@ def _missing_openlab_processes(signals: dict) -> list[str]:
 
 
 def _entry_to_queued_run(entry: JobEntry) -> QueuedRun:
-    # "dispatched" is internal: script started but OpenLab not yet confirmed.
-    # Show as "pending" to the client. All other statuses pass through as-is,
-    # including "enqueued" (submitted to OpenLab queue, awaiting its turn).
-    api_status = entry.status if entry.status != "dispatched" else "pending"
+    # Status is process-exit authoritative and maps 1:1 to the API
+    # (pending / running / done / failed) — no internal aliasing.
     return QueuedRun(
         queue_id=entry.queue_id,
         request=entry.request_dict,
         queued_at=entry.queued_at,
-        status=api_status,  # type: ignore[arg-type]
+        status=entry.status,
         started_at=entry.started_at,
         finished_at=entry.finished_at,
         pid=entry.pid,
@@ -222,9 +270,9 @@ def startup(request: Request) -> StartupResponse:
     status_code=202,
     summary="Quick-submit a run (starts immediately if idle, queues if busy)",
     responses={
-        409: {"model": RequiresInitError},
+        409: {"model": RequiresInitError | InstrumentServicingError},
         412: {"model": QueueFullError | ReservedForRobotError},
-        423: {"model": ClaimRejection},
+        423: {"model": ClaimRejection | WorkflowActiveError},
     },
 )
 def submit_run(body: RunRequest, request: Request) -> RunResponse:
@@ -233,10 +281,12 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     - Idle instrument → starts immediately (``status: accepted``).
     - Busy instrument → FIFO queue (``status: queued``, ``queue_position`` is 1-based).
     - HTTP 409 ``requires_init`` if any OpenLab core process is missing.
+    - HTTP 409 ``instrument_servicing`` if a technician is driving OpenLab CDS.
     - HTTP 412 ``queue_full`` if the queue is at max depth (with ``Retry-After``).
     - HTTP 412 ``reserved_for_robot`` if a non-robot run targets the reserved tray.
     - HTTP 422 if any parameter is out of hardware range or a ``well`` is off-plate.
-    - HTTP 423 if the ``X-Claim-Token`` is missing or stale.
+    - HTTP 423 if the ``X-Claim-Token`` is missing or stale (``workflow_active`` if
+      a workflow holds the lock).
     """
     _require_claim(request)
     runner = _get_runner(request)
@@ -246,6 +296,7 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     _notify_runner_from_signals(runner, signals)
     runner.poll(settings=settings)
     _check_requires_init(signals)
+    _check_servicing(request, signals)
     _check_reserved_tray(body, settings)
 
     job = _compose_moses_job(body, settings)
@@ -283,9 +334,9 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     status_code=202,
     summary="Submit a run to the job queue",
     responses={
-        409: {"model": RequiresInitError},
+        409: {"model": RequiresInitError | InstrumentServicingError},
         412: {"model": QueueFullError | ReservedForRobotError},
-        423: {"model": ClaimRejection},
+        423: {"model": ClaimRejection | WorkflowActiveError},
     },
 )
 def post_to_queue(body: RunRequest, request: Request) -> QueueResponse:
@@ -302,6 +353,7 @@ def post_to_queue(body: RunRequest, request: Request) -> QueueResponse:
     _notify_runner_from_signals(runner, signals)
     runner.poll(settings=settings)
     _check_requires_init(signals)
+    _check_servicing(request, signals)
     _check_reserved_tray(body, settings)
 
     job = _compose_moses_job(body, settings)
@@ -335,19 +387,18 @@ def get_queue(request: Request) -> QueueStatusResponse:
     _notify_runner_from_signals(runner, signals)
     runner.poll(settings=settings)
 
-    # Promote dispatched → acquiring only if *this job's* output_dir shows sirslt activity
-    # after the job started. Uses scoped check to avoid false positives from concurrent
-    # OpenLab jobs writing to other result directories.
-    runner.maybe_promote_to_acquiring(settings)
-
     missing = _missing_openlab_processes(signals)
     instrument_online = len(missing) == 0
 
     active = runner.get_active()
     all_jobs = runner.get_all_jobs()
     pending_count = runner.queue_depth()
-    accepting_jobs = instrument_online and (
-        active is None or pending_count < settings.queue_max_depth
+    # Not accepting while a technician is servicing (queue halted) or the queue
+    # is at depth with an active run.
+    accepting_jobs = (
+        instrument_online
+        and not runner.is_servicing(settings)
+        and (active is None or pending_count < settings.queue_max_depth)
     )
 
     return QueueStatusResponse(
@@ -436,9 +487,9 @@ def abort_run(request: Request) -> AbortResponse:
     status_code=202,
     summary="Park the instrument in low-flow standby",
     responses={
-        409: {"model": RequiresInitError},
+        409: {"model": RequiresInitError | InstrumentServicingError},
         412: {"model": QueueFullError},
-        423: {"model": ClaimRejection},
+        423: {"model": ClaimRejection | WorkflowActiveError},
     },
 )
 def standby(request: Request) -> StandbyResponse:
@@ -457,6 +508,7 @@ def standby(request: Request) -> StandbyResponse:
     _notify_runner_from_signals(runner, signals)
     runner.poll(settings=settings)
     _check_requires_init(signals)
+    _check_servicing(request, signals)
 
     standby_job = {
         "instrument_config_path": "examples/hh_472_config.json",
@@ -515,17 +567,39 @@ def standby(request: Request) -> StandbyResponse:
     "/claim",
     response_model=ClaimResponse,
     summary="Acquire the instrument claim",
-    responses={409: {"model": ClaimRejection}},
+    responses={409: {"model": ClaimRejection}, 403: {"model": UserNotRecognizedError}},
 )
 def claim(body: ClaimRequest, request: Request) -> ClaimResponse:
     """Acquire (or idempotently re-acquire) the single instrument claim.
 
-    - Free / expired slot, or same ``session_id`` → HTTP 200 with a token.
+    - Free / expired slot, or same ``session_id`` → HTTP 200 with a token and the
+      owner's resolved lab role.
+    - ``owner`` not on the configured roster (while enabled) → HTTP 403
+      ``user_not_recognized``.
     - Held by a different live session → HTTP 409 Conflict with ``claimed_by``.
     """
     claims = _get_claims(request)
+    settings = _get_settings(request)
+
+    role = resolve_role(body.owner, settings)
+    if role is None:
+        # Roster is enabled (else resolve_role returns a role for any owner) and
+        # this owner is not on any list. Identity attribution, not auth → 403.
+        raise HTTPException(
+            status_code=403,
+            detail=UserNotRecognizedError(
+                detail=(
+                    f"Owner {body.owner!r} is not a recognized lab user. "
+                    "Submit as a configured HPLC-MS or HTE platform user."
+                ),
+                owner=body.owner,
+            ).model_dump(mode="json"),
+        )
+
     try:
-        grant = claims.claim(owner=body.owner, session_id=body.session_id, ttl_s=body.ttl_s)
+        grant = claims.claim(
+            owner=body.owner, session_id=body.session_id, ttl_s=body.ttl_s, role=role
+        )
     except ClaimConflict as exc:
         raise HTTPException(
             status_code=409,
@@ -539,6 +613,7 @@ def claim(body: ClaimRequest, request: Request) -> ClaimResponse:
         claim_token=grant.claim_token,
         heartbeat_interval_s=grant.heartbeat_interval_s,
         expires_at=grant.expires_at,
+        role=grant.role,
     )
 
 
@@ -590,3 +665,153 @@ def release(
     claims.release(x_claim_token)
     response.status_code = 204
     return response
+
+
+# ---------------------------------------------------------------------------
+# Workflow lock (queue-ownership precedence #2). An HTE platform user takes the
+# equipment-blocking lock for a robot/agent campaign (a series of runs); while
+# held, non-holders are refused (`workflow_active`). The lock rides on the claim
+# so it inherits TTL/heartbeat/auto-expiry — a crashed holder loses it.
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/workflow/start",
+    response_model=WorkflowStartResponse,
+    summary="Take the equipment-blocking workflow lock (HTE platform users only)",
+    responses={
+        403: {"model": RoleForbiddenError},
+        409: {"model": RequiresInitError | InstrumentServicingError},
+        423: {"model": ClaimRejection},
+    },
+)
+def workflow_start(request: Request) -> WorkflowStartResponse:
+    """Mark the active claim as an equipment-blocking workflow.
+
+    - HTTP 423 if the ``X-Claim-Token`` is missing or stale.
+    - HTTP 403 ``role_forbidden`` unless the claim owner's role is ``hte``.
+    - HTTP 409 ``requires_init`` / ``instrument_servicing`` (same enqueue gates
+      as a run): a workflow can't start if OpenLab is down or a technician holds
+      the instrument.
+    """
+    token = _require_claim(request)
+    claims = _get_claims(request)
+    runner = _get_runner(request)
+    settings = _get_settings(request)
+
+    held = claims.current()
+    if held is None or not can_workflow(held.role):  # type: ignore[arg-type]
+        raise HTTPException(
+            status_code=403,
+            detail=RoleForbiddenError(
+                detail=(
+                    "Starting an equipment-blocking workflow requires an HTE "
+                    "platform user."
+                ),
+                owner=held.owner if held else None,
+                role=held.role if held else None,
+                required_role="hte",
+            ).model_dump(mode="json"),
+        )
+
+    signals = _read_signals(request)
+    _notify_runner_from_signals(runner, signals)
+    runner.poll(settings=settings)
+    _check_requires_init(signals)
+    _check_servicing(request, signals)
+
+    grant = claims.start_workflow(token)
+    return WorkflowStartResponse(
+        message=f"Workflow lock taken by {grant.owner!r}. Non-holders are now refused.",
+        expires_at=grant.expires_at,
+        heartbeat_interval_s=grant.heartbeat_interval_s,
+    )
+
+
+@router.post(
+    "/workflow/end",
+    response_model=WorkflowEndResponse,
+    summary="Release the workflow lock (claim is retained)",
+    responses={423: {"model": ClaimRejection}},
+)
+def workflow_end(request: Request) -> WorkflowEndResponse:
+    """Release the equipment-blocking workflow lock while keeping the claim.
+
+    HTTP 423 if the ``X-Claim-Token`` is missing or stale. Idempotent: ending
+    when no workflow is active still returns 200.
+    """
+    token = _require_claim(request)
+    claims = _get_claims(request)
+    claims.end_workflow(token)
+    return WorkflowEndResponse(message="Workflow lock released; claim retained.")
+
+
+# ---------------------------------------------------------------------------
+# Service mode (queue-ownership precedence #1). A technician using OpenLab CDS
+# directly toggles this so the sidecar halts the queue and refuses submissions.
+# It is a PERSISTENT flag (not claim-bound): the dashboard claims as the
+# Service-Account only to authorize the toggle, then may release — the flag
+# stays set until explicitly cleared, so a dropped claim never un-blocks a
+# maintenance window. Auto-detect (a real OLSS run) is the fallback when nobody
+# flips the switch. Admin-only (today: the Service-Account).
+# ---------------------------------------------------------------------------
+
+
+def _require_service_role(request: Request) -> None:
+    """403 unless the current claim holder has the admin role (service toggle)."""
+    held = _get_claims(request).current()
+    if held is None or not can_service(held.role):  # type: ignore[arg-type]
+        raise HTTPException(
+            status_code=403,
+            detail=RoleForbiddenError(
+                detail="Toggling service mode requires an admin (service) account.",
+                owner=held.owner if held else None,
+                role=held.role if held else None,
+                required_role="hplcms_admin",
+            ).model_dump(mode="json"),
+        )
+
+
+@router.post(
+    "/service/start",
+    response_model=ServiceModeResponse,
+    summary="Enable service mode (halt queue for technician OpenLab use)",
+    responses={403: {"model": RoleForbiddenError}, 423: {"model": ClaimRejection}},
+)
+def service_start(request: Request) -> ServiceModeResponse:
+    """Turn on the persistent service-mode flag. New submissions are then
+    refused 409 instrument_servicing and the queue is halted until cleared.
+
+    - HTTP 423 if the ``X-Claim-Token`` is missing or stale.
+    - HTTP 403 ``role_forbidden`` unless the claim owner is an admin account.
+    """
+    _require_claim(request)
+    _require_service_role(request)
+    _get_runner(request).set_service_mode(True)
+    return ServiceModeResponse(
+        status="service_mode_on",
+        service_mode=True,
+        message="Service mode on. New submissions refused; queue halted until cleared.",
+    )
+
+
+@router.post(
+    "/service/end",
+    response_model=ServiceModeResponse,
+    summary="Clear service mode (resume the queue)",
+    responses={403: {"model": RoleForbiddenError}, 423: {"model": ClaimRejection}},
+)
+def service_end(request: Request) -> ServiceModeResponse:
+    """Clear the service-mode flag so queued/new jobs may run again. Idempotent.
+
+    - HTTP 423 if the ``X-Claim-Token`` is missing or stale.
+    - HTTP 403 ``role_forbidden`` unless the claim owner is an admin account.
+    """
+    _require_claim(request)
+    _require_service_role(request)
+    _get_runner(request).set_service_mode(False)
+    return ServiceModeResponse(
+        status="service_mode_off",
+        service_mode=False,
+        message="Service mode cleared. Queue resumes; submissions accepted.",
+    )

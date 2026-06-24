@@ -110,12 +110,16 @@ class RunResponse(BaseModel):
 
 
 class QueuedRun(BaseModel):
-    """Single job entry returned in GET /control/queue."""
+    """Single job entry returned in GET /control/queue.
+
+    Status is process-exit authoritative (queue-ownership pivot): ``pending``
+    (queued), ``running`` (Moses subprocess alive), ``done`` (exit 0),
+    ``failed`` (non-zero exit, aborted, or cancelled)."""
 
     queue_id: str
     request: dict[str, Any]
     queued_at: datetime
-    status: Literal["pending", "enqueued", "acquiring", "done", "failed"]
+    status: Literal["pending", "running", "done", "failed"]
     started_at: datetime | None = None
     finished_at: datetime | None = None
     pid: int | None = None
@@ -214,6 +218,52 @@ class ReservedForRobotError(BaseModel):
     reserved_tray: str
 
 
+class InstrumentServicingError(BaseModel):
+    """Body for HTTP 409 when a technician is running samples directly in
+    OpenLab CDS (highest precedence). The sidecar queue is halted and new
+    submissions are refused. No ``Retry-After`` — servicing duration is
+    unpredictable. Like requires_init this is a 409 (current-state conflict),
+    not a 412, and MUST NOT populate ``last_error``."""
+
+    error: Literal["instrument_servicing"] = "instrument_servicing"
+    detail: str
+    olss_state: str | None = None
+
+
+class WorkflowActiveError(BaseModel):
+    """Body for HTTP 423 when a robot/agent workflow holds the equipment-blocking
+    lock and a non-holder tries to submit. The single-slot claim already blocks
+    non-holders; this refines the rejection with a clearer reason and an advisory
+    ``Retry-After`` (mirrored into the header)."""
+
+    error: Literal["workflow_active"] = "workflow_active"
+    detail: str
+    claimed_by: ClaimedBy | None = None
+    retry_after_s: float | None = None
+
+
+class UserNotRecognizedError(BaseModel):
+    """Body for HTTP 403 when a claim ``owner`` is not on the configured lab
+    roster (see control/roster.py). Identity attribution, not authentication —
+    an unknown owner cannot claim the instrument while the roster is enabled."""
+
+    error: Literal["user_not_recognized"] = "user_not_recognized"
+    detail: str
+    owner: str
+
+
+class RoleForbiddenError(BaseModel):
+    """Body for HTTP 403 when the claim holder's role lacks permission for an
+    action (e.g. an ``hplcms`` user calling ``workflow.start``, which requires an
+    ``hte`` platform user)."""
+
+    error: Literal["role_forbidden"] = "role_forbidden"
+    detail: str
+    owner: str | None = None
+    role: str | None = None
+    required_role: str
+
+
 # ---------------------------------------------------------------------------
 # v1.1 claim protocol (STATUS_SPEC §5)
 # ---------------------------------------------------------------------------
@@ -229,6 +279,36 @@ class ClaimResponse(BaseModel):
     claim_token: str
     heartbeat_interval_s: float
     expires_at: datetime
+    # Resolved lab role of the owner (see control/roster.py). Lets the caller
+    # know up front whether it may start an equipment-blocking workflow.
+    role: str | None = None
+
+
+class WorkflowStartResponse(BaseModel):
+    """Response for POST /control/workflow/start (equipment-blocking lock taken)."""
+
+    status: Literal["workflow_started"] = "workflow_started"
+    message: str
+    expires_at: datetime
+    heartbeat_interval_s: float
+
+
+class WorkflowEndResponse(BaseModel):
+    """Response for POST /control/workflow/end (lock released; claim retained)."""
+
+    status: Literal["workflow_ended"] = "workflow_ended"
+    message: str
+
+
+class ServiceModeResponse(BaseModel):
+    """Response for POST /control/service/start and /control/service/end. The
+    flag is persistent (not claim-bound) so a maintenance window is never
+    silently un-blocked by a dropped claim — it stays set until explicitly
+    cleared by an admin."""
+
+    status: Literal["service_mode_on", "service_mode_off"]
+    service_mode: bool
+    message: str
 
 
 class ClaimRejection(BaseModel):

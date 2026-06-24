@@ -256,21 +256,42 @@ def build_status(
     claimed_by = claims.current() if claims is not None else None
     details["claimed_by"] = claimed_by.model_dump(mode="json") if claimed_by is not None else None
 
-    # Keep the runner's OLSS-occupied flag current so poll() can gate job
-    # completion and next-job dispatch correctly without importing any probe.
+    # Keep the runner's servicing auto-detect current (keyed on a real OLSS run,
+    # i.e. olss_current_run) without importing any probe code.
     if runner is not None:
-        runner.notify_olss_state(olss_state, olss_sw_status)
+        runner.notify_olss_state(olss_state, olss_sw_status, signals.get("olss_current_run"))
 
     # v1.1 allowed_actions (§6.2): single source of truth shared with the
     # /control/* router so the advisory list can never disagree with what the
     # endpoints would actually honour. probe_error → we cannot reason about the
-    # instrument, so offer nothing.
+    # instrument, so offer nothing. ``notify_olss_state`` above has already
+    # refreshed the runner's servicing debounce from this observation.
     queue_full = runner.is_queue_full(settings) if runner is not None else False
+    servicing = runner.is_servicing(settings) if runner is not None else False
+    workflow_active = claims.is_workflow_active() if claims is not None else False
     allowed = _allowed_actions(
         service_operational=(probe_error is None),
         requires_init=(equipment_state == "requires_init"),
         queue_full=queue_full,
+        servicing=servicing,
+        workflow_active=workflow_active,
     )
+
+    # Surface the precedence state so the dashboard can explain *why* the
+    # instrument is busy / not accepting. equipment_status stays "busy" (set
+    # above from the OLSS/acquisition signals); these refine the human message.
+    if runner is not None:
+        # Persistent admin toggle, distinct from the (possibly auto-detected)
+        # servicing state above. The dashboard reads this to render its toggle.
+        details["service_mode"] = runner.service_mode()
+    if servicing:
+        details["servicing"] = True
+        if equipment_state == "busy":
+            message = "Instrument in use via OpenLab CDS (technician servicing)"
+    if workflow_active:
+        details["workflow_active"] = True
+        if claimed_by is not None and equipment_state == "busy":
+            message = f"Autonomous workflow running (held by {claimed_by.owner!r})"
 
     return EquipmentStatus(
         equipment_id=EQUIPMENT_ID,

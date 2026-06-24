@@ -151,10 +151,98 @@ def stage_claim(base: str, owner: str, session_id: str) -> dict:
     _TOKEN = body["claim_token"]
     print(f"      heartbeat_interval_s: {body.get('heartbeat_interval_s')}")
     print(f"      expires_at          : {body.get('expires_at')}")
+    print(f"      role                : {body.get('role')}")
 
     code, _ = _request("POST", f"{base}/control/heartbeat")
     _check("POST /control/heartbeat (valid token) -> 204", code == 204, f"got {code}")
     return body
+
+
+def stage_workflow(base: str) -> None:
+    """Exercise the equipment-blocking workflow lock (no hardware motion).
+
+    Requires the claim owner to be an HTE platform user (role 'hte'); an
+    'hplcms' owner would get 403 role_forbidden here.
+    """
+    _section("Stage 3b - workflow lock (precedence #2, no hardware)")
+
+    code, body = _request("POST", f"{base}/control/workflow/start")
+    started = code == 200 and isinstance(body, dict) and body.get("status") == "workflow_started"
+    if not _check("POST /control/workflow/start -> 200 workflow_started", started, str(body)[:200]):
+        # If the owner lacks the hte role, skip the rest cleanly.
+        return
+
+    code, st = _request("GET", f"{base}/status")
+    details = st.get("details", {}) if isinstance(st, dict) else {}
+    actions = st.get("allowed_actions", []) if isinstance(st, dict) else []
+    _check("/status shows details.workflow_active = true", details.get("workflow_active") is True)
+    _check("/status offers workflow.end, not workflow.start",
+           "workflow.end" in actions and "workflow.start" not in actions, str(actions))
+
+    code, _ = _request("POST", f"{base}/control/workflow/end")
+    _check("POST /control/workflow/end -> 200", code == 200, f"got {code}")
+    code, st = _request("GET", f"{base}/status")
+    details = st.get("details", {}) if isinstance(st, dict) else {}
+    _check("/status workflow_active cleared after end",
+           not details.get("workflow_active"))
+
+
+def _min_run_body() -> dict:
+    """A minimal valid run body (rear/unreserved tray) for refusal checks."""
+    return {
+        "output_dir": "C:/CDSProjects/Installation/Results/SmokeTest",
+        "submitter": "manual", "plate_format": "96-well",
+        "gradient": {
+            "name": "smoke_iso", "solvent_a": "H2O_0.1%FA", "solvent_b": "ACN_0.1%FA",
+            "run_time": 2.0, "flow_rate": 0.3, "equilibration_time": 0.0,
+            "gradient_table": [[0.0, 0.05], [2.0, 0.05]],
+        },
+        "samples": [{"sample_name": "x", "tray": "rear", "well": "A1", "injection_volume": 1.0}],
+    }
+
+
+def stage_service(base: str, admin_owner: str, session_id: str) -> None:
+    """Service mode (precedence #1, admin-only) — its own claim episode so it
+    runs before the main run-owner claim. No hardware motion."""
+    global _TOKEN
+    _section("Stage 2b - service mode (admin-only, no hardware)")
+
+    code, _ = _request("POST", f"{base}/control/service/start")
+    _check("tokenless service/start -> 423 Locked", code == 423, f"got {code}")
+
+    code, body = _request(
+        "POST", f"{base}/control/claim",
+        {"owner": admin_owner, "session_id": f"{session_id}-svc", "ttl_s": 30.0},
+    )
+    if not _check(f"claim as admin {admin_owner!r} -> 200", code == 200, str(body)[:200]):
+        return
+    assert isinstance(body, dict)
+    _TOKEN = body["claim_token"]
+    if not _check(f"admin claim resolved role 'hplcms_admin' (is {admin_owner!r} in HPLCMS_ADMINS?)",
+                  body.get("role") == "hplcms_admin", f"role={body.get('role')}"):
+        _request("POST", f"{base}/control/release")
+        _TOKEN = None
+        return
+
+    code, body = _request("POST", f"{base}/control/service/start")
+    on = code == 200 and isinstance(body, dict) and body.get("service_mode") is True
+    _check("service/start -> 200 service_mode on", on, str(body)[:200])
+
+    code, st = _request("GET", f"{base}/status")
+    details = st.get("details", {}) if isinstance(st, dict) else {}
+    _check("/status details.service_mode = true", details.get("service_mode") is True)
+
+    code, body = _request("POST", f"{base}/control/run", _min_run_body())
+    err = (body.get("detail") or {}).get("error") if isinstance(body, dict) else None
+    _check("submit during service mode -> 409 instrument_servicing",
+           code == 409 and err == "instrument_servicing", f"got {code}/{err}")
+
+    code, body = _request("POST", f"{base}/control/service/end")
+    off = code == 200 and isinstance(body, dict) and body.get("service_mode") is False
+    _check("service/end -> 200 service_mode off", off, str(body)[:200])
+
+    _request("POST", f"{base}/control/release")
+    _TOKEN = None
 
 
 def stage_refusals(base: str, reserved_tray: str) -> None:
@@ -238,14 +326,14 @@ def stage_hardware_run(base: str, tray: str, well: str, output_dir: str, hb_inte
             st = entry.get("status") if entry else "?"
             print(f"      [{time.strftime('%H:%M:%S')}] status={st} "
                   f"active={q.get('active_run_id')} state={q.get('instrument_state')}")
-            if st in ("enqueued", "acquiring"):
+            if st == "running":
                 seen_active = True
             if st in ("done", "failed"):
                 final = st
                 break
         time.sleep(5)
 
-    _check("run reached enqueued/acquiring (instrument accepted it)", seen_active)
+    _check("run reached running (instrument accepted it)", seen_active)
     _check("run finalized as done (not failed)", final == "done", f"final status={final}")
 
     # Park the instrument.
@@ -275,7 +363,11 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--base-url", default="http://localhost:8011",
                    help="Sidecar base URL (use the STAGING port, e.g. :8011)")
-    p.add_argument("--owner", default="smoke-test-student")
+    p.add_argument("--owner", default="HTE-User",
+                   help="Run-owner claim; must be on the device roster (HPLCMS_USERS / "
+                        "HTE_USERS). An 'hte' user is needed for the workflow stage.")
+    p.add_argument("--admin-owner", default="Service-Account",
+                   help="Admin account for the service-mode stage (must be in HPLCMS_ADMINS).")
     p.add_argument("--session-id", default=f"smoke-{uuid.uuid4().hex[:8]}")
     p.add_argument("--reserved-tray", default="front",
                    help="Must match the device's RESERVED_ROBOT_TRAY (default front = robot tray)")
@@ -298,12 +390,14 @@ def main() -> int:
 
     try:
         idle = stage_readonly(base)
+        stage_service(base, args.admin_owner, args.session_id)
         grant = stage_claim(base, args.owner, args.session_id)
         if not grant:
             print("\nClaim failed - cannot run mutating stages. Stopping.")
             return 1
         hb_interval = float(grant.get("heartbeat_interval_s", 15.0))
         stage_refusals(base, args.reserved_tray)
+        stage_workflow(base)
         if args.run_hardware:
             stage_hardware_run(base, args.tray, args.well, args.output_dir, hb_interval)
         else:

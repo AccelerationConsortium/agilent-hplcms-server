@@ -43,18 +43,22 @@ Mutating endpoints (marked 🔒) require a valid `X-Claim-Token` header — acqu
 
 | Endpoint | Description |
 |---|---|
-| `POST /control/claim` | Acquire the single instrument claim. Body `{owner, session_id, ttl_s}` → `{claim_token, heartbeat_interval_s, expires_at}`. 409 if held by another session. |
+| `POST /control/claim` | Acquire the single instrument claim. Body `{owner, session_id, ttl_s}` → `{claim_token, heartbeat_interval_s, expires_at, role}`. 403 if `owner` is not on the roster; 409 if held by another session. |
 | `POST /control/heartbeat` | Refresh the claim TTL (header `X-Claim-Token`). 204 on success; 401 if the token is unknown/expired. |
 | `POST /control/release` | Release the claim (header `X-Claim-Token`). Idempotent — always 204. |
 | `POST /control/startup` | Read-only readiness check — reports whether OpenLab processes are running. Never starts OpenLab. |
-| 🔒 `POST /control/run` | Submit a run. Starts immediately if idle; queues behind the active run if busy. Returns `status: "accepted"` or `"queued"`. 412 `queue_full` (with `Retry-After`) when the queue is at depth; 412 `reserved_for_robot` when a manual run targets the robot-reserved tray. |
+| 🔒 `POST /control/run` | Submit a run. Starts immediately if idle; queues behind the active run if busy. Returns `status: "accepted"` or `"queued"`. 409 `instrument_servicing` when a technician holds the instrument; 412 `queue_full` (with `Retry-After`) when the queue is at depth; 412 `reserved_for_robot` when a manual run targets the robot-reserved tray; 423 `workflow_active` when a workflow holds the lock. |
 | 🔒 `POST /control/queue` | Submit a run and get back a `queue_id` for tracking. Same semantics as `/control/run` with a richer response. |
 | `GET /control/queue` | View all jobs (pending, running, recent done/failed) plus `instrument_online` and `accepting_jobs` signals. |
 | 🔒 `DELETE /control/queue/{queue_id}` | Cancel a pending job. 409 if it is currently running (use abort instead), 404 if already done. |
 | 🔒 `POST /control/abort` | Abort the active run and clear the entire queue. |
 | 🔒 `POST /control/standby` | Submit a low-flow standby job to park the instrument. Queues behind any active run. 412 `queue_full` when the queue is at depth. **Not a full shutdown** — powering the instrument down is a deliberate manual procedure at the instrument, not an API action. |
+| 🔒 `POST /control/workflow/start` | Take the equipment-blocking workflow lock for a robot/agent campaign. **HTE platform users only** (else 403 `role_forbidden`). |
+| 🔒 `POST /control/workflow/end` | Release the workflow lock (the claim is retained). Idempotent. |
+| 🔒 `POST /control/service/start` | Enable service mode — halt the queue and refuse submissions while a technician uses OpenLab CDS. Persistent until cleared. **Admin (service) account only** (else 403). |
+| 🔒 `POST /control/service/end` | Clear service mode and resume the queue. Idempotent. Admin-only. |
 
-`GET /status.allowed_actions` reports which of `run.submit` · `run.abort` · `queue.cancel` · `instrument.standby` the device will currently honour, mirroring the control-side precondition refusals (the enqueue verbs drop out when the queue is full or OpenLab is down).
+`GET /status.allowed_actions` reports which of `run.submit` · `run.abort` · `queue.cancel` · `instrument.standby` · `workflow.start` · `workflow.end` the device will currently honour, mirroring the control-side *state* precondition refusals (enqueue verbs drop out when the queue is full, OpenLab is down, or a technician is servicing; `workflow.start`/`workflow.end` toggle on workflow state). `service.*` is an operator/dashboard control rather than an agent skill, so it is reported via `details.service_mode` instead of `allowed_actions`.
 
 ### Sample submission & trays
 
@@ -97,7 +101,7 @@ curl http://sdl2-pc-06-uplc.tail6a1dd7.ts.net:8010/status
 Per [`INTERLOCKS.md`](https://github.com/AccelerationConsortium/ac-organic-lab/blob/main/docs/INTERLOCKS.md):
 
 - **Layer 1 — Hardware limits:** Pydantic field validators on all numeric parameters (e.g. injection volume ≤ 20 µL, run time ≤ 120 min, flow rate ≤ 2 mL/min). Violations → HTTP 422.
-- **Layer 2 — Device state machine:** HTTP 409 `requires_init` if any OpenLab core process is missing. HTTP 409 `queue_full` if the queue is at max depth (default 20).
+- **Layer 2 — Device state machine:** HTTP 409 `requires_init` if any OpenLab core process is missing; HTTP 409 `instrument_servicing` if a technician holds the instrument; HTTP 412 `queue_full` (with `Retry-After`) if the queue is at max depth (default 20); HTTP 423 `workflow_active` if a workflow holds the lock.
 - Moses is **never imported** — only called as a subprocess from the `moses_v4_yoyo` conda env. The sidecar stays in its own venv with no vendor dependencies.
 - A **script allowlist** (`MOSES_ALLOWED_SCRIPTS`) prevents arbitrary script execution.
 
@@ -121,15 +125,32 @@ DELETE /control/queue/{queue_id}  → cancel a pending job (409 if running, 404 
 
 A background daemon thread polls every 5 seconds and automatically starts the next pending run when the active one finishes. `POST /control/abort` terminates the active process and marks all pending jobs as failed.
 
-### OpenLab direct runs and pause/resume
+### Queue ownership and submission precedence
 
-The queue is gated by live OpenLab Sharing Services (OLSS) state, not only by jobs submitted through this server.
+This server's `MosesRunner` is the **sole** job queue. OpenLab's native sequence queue is not used for our jobs — OpenLab (OLSS) is reserved for technician servicing/maintenance. Because `moses.agilent` `start_run` runs **synchronously** (it blocks through Running → run → Idle before returning), job state is driven entirely by the subprocess: alive → `running`, exit `0` → `done`, non-zero → `failed`. No `.sirslt` polling or OpenLab-queue tracking is involved.
 
-- If an operator starts a run directly in OpenLab and OLSS reports `olss_instrument_state` as `Run`, `Running`, `Busy`, `Prerun`, or `PostRun`, then `GET /status` returns `equipment_status: "busy"` even when no server-managed Moses job exists.
-- New `/control/run` and `/control/queue` submissions start Moses immediately — Moses submits the job to OpenLab's native run queue regardless of current instrument state. The job appears in the Agilent software queue right away and OpenLab handles the ordering.
-- If OpenLab reports `olss_software_status: "Paused"` while connected, `GET /status` returns `equipment_status: "paused"` with `required_actions: ["resume_paused_sequence"]`.
-- If a Moses subprocess exits while OLSS still reports the instrument as running or paused, the server keeps the active job linked as `acquiring` and does not dispatch the next queued job until OLSS returns to idle.
-- When an operator resumes a paused sequence directly in OpenLab, OLSS returning to an active run state keeps `/status` busy and keeps `/control/queue` attached to the active job.
+Submissions are gated by precedence (highest wins):
+
+1. **Technician servicing** — the queue is *halted* (the next pending job waits, it is not dropped) and new submissions are refused `409 instrument_servicing` (no `Retry-After` — duration is unpredictable). Two sources:
+   - **Explicit service mode (primary).** A technician about to use OpenLab CDS directly flips a persistent flag via the dashboard → `POST /control/service/start` (and `…/service/end` to clear). It is *not* tied to a claim, so a dropped dashboard/claim never silently un-blocks a maintenance window — it stays on until explicitly cleared. Admin-only (see roles).
+   - **Auto-detect (fallback)** for when nobody flips the switch: OLSS shows a real acquisition (a `runQueue.currentRun`, i.e. `olss_current_run` is present) while this server holds no active job, sustained over `SERVICING_DEBOUNCE_POLLS` `/status` observations. Keyed on `currentRun`, **not** bare `state=="Busy"`, so data analysis / reprocessing does *not* halt the queue.
+2. **Workflow** — a robot/agent campaign (a series of runs) holding the equipment-blocking lock via `POST /control/workflow/start`. Non-holders are refused `423 workflow_active` (with `Retry-After`); only the lock holder submits. The lock rides on the claim, so it inherits TTL/heartbeat/auto-expiry — a crashed holder loses it.
+3. **Our queue job running** — normal FIFO queue; ETA is bounded by the gradient `run_time`.
+4. **Idle** — a single sample is submitted into the queue.
+
+`details.service_mode` reflects the explicit flag; `details.servicing` reflects either source. A paused OpenLab sequence (`olss_software_status: "Paused"`) is reported as `equipment_status: "busy"` with `required_actions: ["resume_paused_sequence"]` — `paused` is not a legal v1.1 `EquipmentState`.
+
+### Claims, roles, and the lab roster
+
+Mutating `/control/*` calls require a valid `X-Claim-Token` (hard enforcement, `423` otherwise). A claim records its `owner`, and the device resolves the owner to a lab **role** from a configured roster (identity attribution, *not* authentication — the network ACL / dashboard login is the real access boundary). Capabilities by role:
+
+| group (env) | role | `run.submit` | `workflow.start/end` | `service.start/end` |
+|---|---|:--:|:--:|:--:|
+| `HPLCMS_USERS` | `hplcms_user` | ✓ | | |
+| `HTE_USERS` | `hte` | ✓ | ✓ | |
+| `HPLCMS_ADMINS` | `hplcms_admin` | ✓ | | ✓ |
+
+An unknown owner is refused `403 user_not_recognized`; an under-privileged owner calling a gated action gets `403 role_forbidden`. The roster is **always enforced**: when every list is empty the built-in defaults (`Hplcms-User` / `HTE-User` / `Service-Account`) apply, so a fresh install always has a service account and never bricks. A literal `"*"` in a list matches any owner — an explicit open mode for dev, distinct from an accidental empty config. `HPLCMS_ADMINS` is seeded with the single `Service-Account` the dashboard claims under to toggle service mode; broadening it later is just adding names.
 
 ## What the server never does
 
@@ -293,6 +314,12 @@ Writes to `C:\SDL_Tools\hplcms_sensor_data.json` every 30 seconds (override via 
 | `RUN_JOBS_DIR` | `C:\SDL_Tools\hplcms_jobs` | Persistent directory for job JSON files (kept for post-mortem). |
 | `QUEUE_MAX_DEPTH` | `20` | Maximum number of runs that can be pending in the queue. |
 | `QUEUE_POLL_INTERVAL_S` | `5` | How often the background thread checks if the active run finished. |
+| `QUEUE_FULL_RETRY_AFTER_S` | `60` | Advisory `Retry-After` (s) returned with 412 `queue_full`. |
+| `WORKFLOW_ACTIVE_RETRY_AFTER_S` | `60` | Advisory `Retry-After` (s) returned with 423 `workflow_active`. |
+| `SERVICING_DEBOUNCE_POLLS` | `2` | Consecutive `/status` observations of a real OLSS run (no active job) before auto-detect declares servicing. |
+| `HPLCMS_USERS` | `Hplcms-User` | Roster: owners with role `hplcms_user` (submit samples). Comma-separated; `"*"` = any owner. |
+| `HTE_USERS` | `HTE-User` | Roster: owners with role `hte` (submit + `workflow.*`). |
+| `HPLCMS_ADMINS` | `Service-Account` | Roster: owners with role `hplcms_admin` (submit + `service.*`). |
 
 ### Sensor daemon
 
