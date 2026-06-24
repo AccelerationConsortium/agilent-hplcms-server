@@ -15,9 +15,9 @@ v1.1 control device in the lab. This spans **two repos**:
    **not** a legal `EquipmentState` in v1.0 or v1.1. Report
    `equipment_status: "busy"` with `message="OpenLab sequence paused…"` and
    `required_actions: ["resume_paused_sequence"]`; keep the precise `Paused` value in
-   `details.olss_software_status` and the `hplc` / `ms` component `state`. Queue-gating
-   is unchanged — it keys off the OLSS "occupied" flag in `control/runner.py`, not the
-   envelope string.
+   `details.olss_software_status` and the `hplc` / `ms` component `state`. (Queue
+   ownership and submission gating were subsequently reworked — see the
+   *Queue-ownership pivot* addendum below.)
 2. **Hard claim enforcement.** Require a valid `X-Claim-Token` on the mutating
    `/control/*` endpoints; reject mismatch / missing with **HTTP 423 Locked** plus
    `claimed_by`. Read-only endpoints (`GET /control/queue`, `POST /control/startup`)
@@ -39,7 +39,9 @@ v1.1 control device in the lab. This spans **two repos**:
   - Back them with an in-memory single-slot claim holder (TTL + owner + session_id)
     in/beside `MosesRunner`. A repeat claim from the same `session_id` is idempotent.
 - **Enforce token** on `/control/run`, `POST /control/queue`, `/control/abort`,
-  `/control/shutdown`, `DELETE /control/queue/{id}` → 423 on missing/stale token.
+  `/control/standby`, `DELETE /control/queue/{id}` → 423 on missing/stale token.
+  (The park endpoint is `/control/standby`, not `shutdown` — a real power-down is a
+  manual operator procedure, never an API action.)
 - **HTTP code reconciliation (§6.1):**
   - Keep `requires_init` → **409** (device-state conflict) and hardware-limit
     violations → **422** (invalid body).
@@ -57,8 +59,10 @@ v1.1 control device in the lab. This spans **two repos**:
   on the aggregator's per-request claim dance); revisit `do_not_call_connect`.
 - **`docs/SKILLS_CATALOG.md`** + skill defs: add HPLC control verbs using the
   `<role>.<verb>` naming convention (`run.submit`, `run.abort`, `queue.cancel`,
-  `instrument.shutdown`) with `requires_states` + arg schemas mapping to the
-  `/control/*` endpoints — mirror the existing `dose` / `xArm` v1.1 migration commits.
+  `instrument.standby`, and the workflow verbs `workflow.start` / `workflow.end`) with
+  `requires_states` + arg schemas mapping to the `/control/*` endpoints — mirror the
+  existing `dose` / `xArm` v1.1 migration commits. (`service.start` / `service.end` are
+  operator/dashboard controls, not agent skills — keep them out of the catalog.)
 - **`ROADMAP.md`**: move `agilent_uplc_ms` from "read-only sidecar" to v1.1 control.
 
 ## Addendum: sample-submission contract (tray + well)
@@ -87,6 +91,58 @@ catalog validates identically on the device.
 - Drawer codes: `TRAY_FRONT_DRAWER=D1F` is the confirmed robot tray;
   `TRAY_REAR_DRAWER=D4B` matches the existing example job — confirm it against
   this instrument's multisampler before deploying.
+
+## Addendum: queue-ownership pivot, servicing, and roles
+
+Decided and implemented 2026-06-23, after the v1.1 control surface above shipped.
+
+- **The sidecar owns the queue.** `MosesRunner` is the sole job queue; OpenLab's
+  native sequence queue is no longer used for our jobs (OpenLab is for technician
+  servicing/maintenance). Verified that `moses.agilent` `start_run` runs
+  **synchronously**, so **process exit is authoritative**: subprocess alive →
+  `running`, exit `0` → `done`, non-zero → `failed`. This was a net deletion of the
+  old `enqueued`/`acquiring`/`.sirslt`/`_olss_occupied` finalization logic. Job status
+  is now `pending → running → done | failed`.
+
+- **Submission precedence (highest wins):**
+  1. **Servicing** → `409 instrument_servicing`; queue halted (pending jobs wait, not
+     dropped). Two sources: an **explicit, persistent admin toggle**
+     (`POST /control/service/start` | `…/service/end`, *not* claim-bound so a dropped
+     dashboard never un-blocks a maintenance window), and an **auto-detect fallback**
+     keyed on `olss_current_run` (a real acquisition) while no sidecar job is active,
+     debounced over `SERVICING_DEBOUNCE_POLLS`. Keyed on `currentRun`, not bare
+     `state=="Busy"`, because OLSS `state` cannot distinguish a run from data analysis.
+  2. **Workflow** → non-holder gets `423 workflow_active` (+ `Retry-After`). The
+     equipment-blocking lock is a `workflow` flag on the single-slot claim
+     (`POST /control/workflow/start` | `…/end`); it inherits TTL/heartbeat/auto-expiry.
+  3. **Our queue job running** → normal FIFO queue.
+  4. **Idle** → single sample queued.
+
+- **Roster-driven roles (identity, NOT authentication — no passwords in the device).**
+  `control/roster.py` maps a claim `owner` to one of three roles. Capabilities:
+
+  | group (env) | role | `run.submit` | `workflow.*` | `service.*` |
+  |---|---|:--:|:--:|:--:|
+  | `HPLCMS_USERS` | `hplcms_user` | ✓ | | |
+  | `HTE_USERS` | `hte` | ✓ | ✓ | |
+  | `HPLCMS_ADMINS` | `hplcms_admin` | ✓ | | ✓ |
+
+  Unknown owner → `403 user_not_recognized`; under-privileged action → `403
+  role_forbidden`. The roster is always enforced; all-empty falls back to built-in
+  defaults (`Hplcms-User`/`HTE-User`/`Service-Account`) so a fresh install never bricks,
+  and a literal `"*"` opens a list. `HPLCMS_ADMINS` is seeded with the single
+  `Service-Account` the dashboard claims under to toggle service mode. A real login /
+  password belongs at the dashboard layer (to be built separately), which then claims
+  on the device passing the authenticated user as `owner`.
+
+- **`allowed_actions`** stays identity-agnostic (state preconditions only, as before):
+  `servicing` / `requires_init` / `queue_full` drop the enqueue verbs; `workflow.start`
+  / `workflow.end` toggle on workflow state. `service.*` is deliberately excluded (it is
+  an operator control, not an agent skill); `details.service_mode` and
+  `details.servicing` are surfaced for the dashboard instead.
+
+- **Still open:** mirror `workflow.start` / `workflow.end` in the lab skill catalog;
+  the supervised rear→`D4B` hardware run before any real `run.submit` is permitted.
 
 ## Hard constraints (unchanged)
 

@@ -74,11 +74,18 @@ class ErrorInfo(BaseModel):
 class ClaimedBy(BaseModel):
     """v1.1: identity of the current claim holder. Surfaced under
     ``details.claimed_by`` so every reader sees who controls the device without
-    a side trip. ``null`` (absent) when no claim is active."""
+    a side trip. ``null`` (absent) when no claim is active.
+
+    ``role`` is the holder's lab role (``hplcms`` or ``hte``; see
+    ``control/roster.py``) — identity attribution, not a credential. ``workflow``
+    is True while the holder has taken the equipment-blocking workflow lock via
+    ``POST /control/workflow/start``."""
 
     session_id: str
     owner: str
     expires_at: datetime
+    role: str | None = None
+    workflow: bool = False
 
 
 class EquipmentStatus(BaseModel):

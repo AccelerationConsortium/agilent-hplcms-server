@@ -1,4 +1,23 @@
-"""Thread-safe Moses subprocess manager with status-tracked job queue."""
+"""Thread-safe Moses subprocess manager with status-tracked job queue.
+
+The sidecar's ``MosesRunner`` is the **sole** job queue (queue-ownership pivot,
+2026-06-23). OpenLab's native sequence queue is no longer used for our jobs —
+OpenLab (OLSS) is reserved for technician servicing / maintenance.
+
+This rests on a verified fact about Moses: ``moses.agilent`` ``start_run`` runs
+fully **synchronously** — it blocks through Running → run-duration → Idle before
+returning, and ``run_batch`` loops samples one at a time, exiting non-zero only
+if a sample failed. So **process exit is authoritative**:
+
+- subprocess alive  → batch running
+- exit code ``0``   → batch done
+- exit code ``!= 0``→ batch failed
+
+That makes job completion a simple ``process.poll()`` — no ``.sirslt`` polling,
+no OLSS-driven finalization, no "enqueued/waiting in OpenLab's queue" state. The
+only thing the runner still learns from OLSS is whether a *technician* is driving
+the instrument directly (servicing), so it can halt the queue.
+"""
 
 from __future__ import annotations
 
@@ -17,26 +36,25 @@ from ..config import Settings, load_settings
 
 logger = logging.getLogger(__name__)
 
-# OLSS instrument states that mean the instrument is actively acquiring.
-# When the runner is notified of these states it holds open any tracked job
-# (even if Moses has exited) and refuses to start the next pending job.
-_OLSS_ACTIVE_STATES: frozenset[str] = frozenset({"Run", "Running", "Busy", "Prerun", "PostRun"})
-
 
 @dataclass
 class JobEntry:
-    """Internal tracking entry for one queued/active/completed run."""
+    """Internal tracking entry for one queued/active/completed run.
+
+    Status lifecycle (process-exit authoritative):
+
+    - ``pending`` — queued, subprocess not yet launched.
+    - ``running`` — Moses subprocess is alive (acquiring synchronously).
+    - ``done``    — subprocess exited 0.
+    - ``failed``  — subprocess exited non-zero, or the job was aborted/cancelled.
+    """
 
     queue_id: str
     script_name: str
     job: dict[str, Any]          # Moses job spec written to disk
     request_dict: dict[str, Any]  # original RunRequest as dict (for API display)
     queued_at: datetime
-    # "dispatched" = Moses script started but OpenLab not yet confirmed.
-    # "enqueued"   = Moses exited cleanly; job submitted to OpenLab's queue.
-    # "acquiring"  = OLSS confirms instrument is actively Running this job.
-    # API maps "dispatched" → "pending"; "enqueued" passes through as-is.
-    status: Literal["pending", "dispatched", "enqueued", "acquiring", "done", "failed"] = "pending"
+    status: Literal["pending", "running", "done", "failed"] = "pending"
     started_at: datetime | None = None
     finished_at: datetime | None = None
     pid: int | None = None
@@ -74,11 +92,21 @@ class MosesRunner:
         self._active_id: str | None = None
         self._poller_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        # True while OLSS reports the instrument as running or paused.
-        # Updated by build_status() on each /status call; used to hold jobs
-        # open when Moses exits before OpenLab finishes, and to queue (not
-        # start) new submissions while the instrument is occupied externally.
-        self._olss_occupied: bool = False
+        # Servicing detection has two independent sources, both surfaced through
+        # is_servicing():
+        #   1. _service_mode — an explicit, persistent flag toggled by an admin
+        #      (Service-Account) via /control/service/start|end. Primary signal;
+        #      survives claim release / dashboard disconnect so a maintenance
+        #      window is never silently un-blocked.
+        #   2. auto-detect fallback — OLSS shows a real acquisition (a runQueue
+        #      currentRun) while we hold no active job, sustained over a debounce.
+        #      Catches "the technician forgot to flip the switch". Keyed on
+        #      currentRun (not bare state=="Busy") so data analysis / reprocessing
+        #      does NOT halt the queue. Updated by build_status() via
+        #      notify_olss_state() on every /status poll. Neither source drives
+        #      job completion — process exit does that.
+        self._service_mode: bool = False
+        self._olss_run_no_job_streak: int = 0
 
     # ------------------------------------------------------------------
     # Read-only queries
@@ -118,83 +146,61 @@ class MosesRunner:
         with self._lock:
             return self._active_id is not None and len(self._pending_ids) >= settings.queue_max_depth
 
+    def is_servicing(self, settings: Settings | None = None) -> bool:
+        """True iff the queue must be halted for technician servicing.
+
+        Two sources (see __init__): the explicit ``service_mode`` flag, OR the
+        auto-detect fallback — OLSS shows a real acquisition while the sidecar
+        holds no active job, sustained for ``servicing_debounce_polls``
+        consecutive ``/status`` observations. The debounce avoids a false
+        positive in the one-poll gap after our Moses process exits but before
+        OLSS clears its currentRun. While True the queue is halted and
+        submissions are refused 409 instrument_servicing (highest precedence).
+        """
+        settings = settings or load_settings()
+        with self._lock:
+            return self._is_servicing_locked(settings)
+
+    def _is_servicing_locked(self, settings: Settings) -> bool:
+        if self._service_mode:
+            return True
+        debounce = max(1, settings.servicing_debounce_polls)
+        return self._active_id is None and self._olss_run_no_job_streak >= debounce
+
+    def set_service_mode(self, on: bool) -> None:
+        """Set/clear the explicit, persistent service-mode flag (admin toggle)."""
+        with self._lock:
+            self._service_mode = bool(on)
+        logger.info("Service mode %s", "ENABLED" if on else "cleared")
+
+    def service_mode(self) -> bool:
+        """Current state of the explicit service-mode flag (for /status details)."""
+        with self._lock:
+            return self._service_mode
+
     def notify_olss_state(
-        self, olss_state: str | None, olss_sw_status: str | None
+        self,
+        olss_state: str | None,
+        olss_sw_status: str | None,
+        olss_current_run: str | None = None,
     ) -> None:
-        """Tell the runner whether OLSS reports the instrument as occupied.
+        """Update the servicing auto-detect fallback from the latest OLSS poll.
 
         Called by ``build_status()`` on every ``/status`` poll so the runner
-        stays current without importing any probe code.  ``_olss_occupied`` is
-        True while the instrument is actively running *or* in a paused sequence.
-        Used to hold a Moses job open after Moses exits early (the job stays
-        "acquiring" until OLSS confirms the run is done).  It does NOT gate new
-        job submissions — Moses submits directly to OpenLab's native queue and
-        the instrument handles ordering.
-
-        Also drives the ``"enqueued"`` ↔ ``"acquiring"`` transitions:
-
-        - idle → Running: job promoted from ``"enqueued"`` to ``"acquiring"``
-          (instrument confirmed started after we submitted to its queue).
-        - Running → idle: job finalized if result files confirm it ran
-          (``done``), otherwise demoted back to ``"enqueued"`` — a preceding
-          OpenLab job may have just finished while ours is still waiting.
-          Use ``/control/abort`` to manually clear a stuck job.
+        stays current without importing any probe code. ``run_active`` keys on
+        ``olss_current_run`` (a runQueue currentRun) — the signal that an actual
+        acquisition sequence is underway — NOT bare ``state=="Busy"``, so data
+        analysis / reprocessing does not halt the queue. Job completion is driven
+        by process exit in :meth:`poll`, never by OLSS.
         """
-        occupied = olss_state in _OLSS_ACTIVE_STATES or (
-            olss_sw_status == "Paused"
-            and olss_state not in (None, "NotConnected")
-        )
-        entry_to_finalize: JobEntry | None = None
+        run_active = olss_current_run is not None
         with self._lock:
-            was_occupied = self._olss_occupied
-            self._olss_occupied = occupied
-
-            if self._active_id is not None:
-                entry = self._jobs.get(self._active_id)
-                if entry is not None:
-                    if occupied and entry.status == "enqueued":
-                        # Instrument now reports Running; our submitted job is
-                        # being (or is about to be) acquired.
-                        entry.status = "acquiring"
-                    elif was_occupied and not occupied:
-                        # Running → idle: need sirslt check outside the lock.
-                        if entry.status in ("acquiring", "enqueued"):
-                            entry_to_finalize = entry
-
-        if entry_to_finalize is None:
-            return
-
-        # Filesystem check outside the lock — may be slow on network paths.
-        has_results = self._has_sirslt(entry_to_finalize)
-        now = datetime.now(timezone.utc)
-        with self._lock:
-            # Re-verify: the background poller may have finalised the job
-            # in the gap between the two lock sections (rare but possible).
-            if (
-                self._active_id == entry_to_finalize.queue_id
-                and entry_to_finalize.status in ("acquiring", "enqueued")
-            ):
-                if has_results:
-                    entry_to_finalize.status = "done"
-                    entry_to_finalize.finished_at = now
-                    self._active_id = None
-                    self._evict_history()
-                    logger.info(
-                        "Run %s finalised via OLSS idle transition: done (has_sirslt=True)",
-                        entry_to_finalize.queue_id,
-                    )
-                else:
-                    # No result files yet — a preceding job may have just
-                    # finished and ours is still waiting in OpenLab's queue.
-                    # Demote to "enqueued"; the next idle→Running→idle cycle
-                    # (when our run actually executes) will finalize it.
-                    # Use /control/abort to manually clear a stuck job.
-                    entry_to_finalize.status = "enqueued"
-                    logger.debug(
-                        "Run %s: OLSS went idle but no sirslt yet; "
-                        "demoted to enqueued (job may be waiting in OpenLab queue)",
-                        entry_to_finalize.queue_id,
-                    )
+            # Streak counts observations of "a real OLSS run while we hold no
+            # active job" — the signature of a technician acquiring directly.
+            if run_active and self._active_id is None:
+                self._olss_run_no_job_streak += 1
+            else:
+                self._olss_run_no_job_streak = 0
 
     def get_all_jobs(self) -> list[JobEntry]:
         """Snapshot of all tracked jobs sorted by queued_at (pending + active + history)."""
@@ -239,12 +245,14 @@ class MosesRunner:
     # ------------------------------------------------------------------
 
     def poll(self, settings: Settings | None = None) -> None:
-        """Check if the active process finished; if so, start the next pending run."""
+        """Finalize the active job if its process exited, then launch the next
+        pending job — unless a technician is servicing the instrument.
+
+        Process exit is authoritative: rc==0 → done, rc!=0 → failed. No
+        filesystem or OLSS check is needed.
+        """
         settings = settings or load_settings()
         next_entry: JobEntry | None = None
-        # Set when rc==0 and OLSS is idle — needs sirslt check outside the lock.
-        check_id: str | None = None
-        check_entry: JobEntry | None = None
 
         with self._lock:
             if self._active_id is not None:
@@ -253,81 +261,28 @@ class MosesRunner:
                 if rc is None:
                     return  # Moses still running
 
-                # Moses has exited (or process handle was already cleared).
-                # If OLSS says the instrument is still occupied, the job is
-                # submitted to OpenLab's native queue (or actively running).
-                # Only transition from "dispatched" → "enqueued" here; if the
-                # entry is already "enqueued" or "acquiring", leave it to
-                # notify_olss_state which drives those transitions.
-                if self._olss_occupied and entry.status not in ("done", "failed"):
-                    if rc != 0:
-                        logger.warning(
-                            "Run %s: Moses exited rc=%d while OLSS still occupied; "
-                            "holding job open (tracked via OLSS)",
-                            self._active_id, rc,
-                        )
-                    if entry.status == "dispatched":
-                        entry.status = "enqueued"
-                    entry.process = None  # release handle; completion via OLSS
-                    return
-
-                # Moses exited and OLSS is not occupied.
-                if rc != 0:
-                    # Definite failure — no filesystem check needed.
-                    entry.finished_at = datetime.now(timezone.utc)
+                entry.finished_at = datetime.now(timezone.utc)
+                entry.process = None
+                if rc == 0:
+                    entry.status = "done"
+                    logger.info("Run %s finished (exit 0)", self._active_id)
+                else:
                     entry.status = "failed"
                     entry.error_msg = f"Exit code {rc}"
-                    logger.info("Run %s finished (exit %s)", self._active_id, rc)
-                    self._active_id = None
-                    self._evict_history()
-                else:
-                    # rc == 0: Moses submitted the job cleanly.  We cannot
-                    # distinguish "run completed" from "job queued in OpenLab
-                    # behind other runs" without checking the result directory.
-                    # Release the process handle and defer the decision — the
-                    # filesystem check must happen outside the lock.
-                    entry.process = None
-                    check_id = self._active_id
-                    check_entry = entry
+                    logger.info("Run %s failed (exit %s)", self._active_id, rc)
+                self._active_id = None
+                self._evict_history()
 
-            if check_entry is None:
-                if self._active_id is not None or not self._pending_ids:
-                    return
+            # Launch the next pending job, unless a technician holds the
+            # instrument (servicing) — the queue is halted, not drained, so the
+            # job simply waits and starts once servicing clears.
+            if (
+                self._active_id is None
+                and self._pending_ids
+                and not self._is_servicing_locked(settings)
+            ):
                 next_id = self._pending_ids.popleft()
                 next_entry = self._jobs.get(next_id)
-
-        if check_entry is not None:
-            has_sirslt = self._has_sirslt(check_entry)
-            now = datetime.now(timezone.utc)
-            with self._lock:
-                if (
-                    self._active_id == check_id
-                    and check_entry.status not in ("done", "failed")
-                ):
-                    if has_sirslt:
-                        check_entry.status = "done"
-                        check_entry.finished_at = now
-                        self._active_id = None
-                        self._evict_history()
-                        logger.info("Run %s finished (exit 0, sirslt present)", check_id)
-                    else:
-                        # No result files yet — job may be waiting in OpenLab's
-                        # queue behind other runs.  Keep as "enqueued"; OLSS
-                        # idle→Running promotes it to "acquiring", and the next
-                        # Running→idle cycle finalises it when results appear.
-                        check_entry.status = "enqueued"
-                        logger.debug(
-                            "Run %s: Moses exited cleanly but no sirslt yet; "
-                            "holding as enqueued (job may be queued in OpenLab)",
-                            check_id,
-                        )
-
-            if has_sirslt:
-                with self._lock:
-                    if self._active_id is not None or not self._pending_ids:
-                        return
-                    next_id = self._pending_ids.popleft()
-                    next_entry = self._jobs.get(next_id)
 
         if next_entry is not None:
             try:
@@ -362,7 +317,10 @@ class MosesRunner:
     ) -> tuple[str, int]:
         """Add a run to the queue. Returns (queue_id, position).
 
-        Position 0 means started immediately (instrument was idle).
+        Position 0 means started immediately (instrument was idle and not being
+        serviced). Higher-precedence refusals (servicing 409, workflow 423) are
+        enforced by the router before this is called; the servicing guard here is
+        defense-in-depth so we never launch a job into a technician's session.
 
         Raises
         ------
@@ -405,7 +363,9 @@ class MosesRunner:
         with self._lock:
             self._jobs[queue_id] = entry
 
-            if self._active_id is None:
+            # Launch immediately only if idle AND not being serviced; otherwise
+            # queue it (respecting the depth cap).
+            if self._active_id is None and not self._is_servicing_locked(settings):
                 self._launch_locked(entry, settings)
                 return queue_id, 0
 
@@ -418,55 +378,6 @@ class MosesRunner:
             self._pending_ids.append(queue_id)
             return queue_id, len(self._pending_ids)
 
-    def check_acquiring(self, settings: Settings | None = None) -> bool:
-        """Return True if the active job's own output_dir has *.sirslt activity after job start.
-
-        Scoped to the specific job's output_dir so that pre-existing or concurrent
-        OpenLab jobs writing to other result directories cannot trigger a false positive.
-        """
-        with self._lock:
-            if self._active_id is None:
-                return False
-            entry = self._jobs.get(self._active_id)
-            if entry is None or entry.status != "dispatched":
-                return False
-            output_dir_str = entry.request_dict.get("output_dir", "")
-            started_at = entry.started_at
-
-        if not output_dir_str or not started_at:
-            return False
-
-        output_path = Path(output_dir_str)
-        if not output_path.exists():
-            return False
-
-        started_epoch = started_at.timestamp()
-        for sirslt in output_path.glob("**/*.sirslt"):
-            try:
-                if sirslt.stat().st_mtime >= started_epoch:
-                    return True
-            except OSError:
-                pass
-        return False
-
-    def maybe_promote_to_acquiring(self, settings: Settings | None = None) -> None:
-        """Promote dispatched → acquiring if the job's output_dir shows sirslt activity."""
-        if self.check_acquiring(settings):
-            self._promote_to_acquiring()
-
-    def _promote_to_acquiring(self) -> None:
-        with self._lock:
-            if self._active_id is None:
-                return
-            entry = self._jobs.get(self._active_id)
-            if entry and entry.status == "dispatched":
-                entry.status = "acquiring"
-
-    def update_active_from_signals(self, acquisition_active: bool) -> None:
-        """Promote the active job from dispatched → acquiring once OpenLab confirms."""
-        if acquisition_active:
-            self._promote_to_acquiring()
-
     def cancel_queued(self, queue_id: str) -> JobEntry:
         """Cancel a pending job.
 
@@ -475,7 +386,7 @@ class MosesRunner:
         KeyError
             Job not found.
         RuntimeError
-            Job is dispatched or acquiring; use /control/abort instead.
+            Job is currently running; use /control/abort instead.
         LookupError
             Job already completed (done or failed).
         """
@@ -483,7 +394,7 @@ class MosesRunner:
             entry = self._jobs.get(queue_id)
             if entry is None:
                 raise KeyError(queue_id)
-            if entry.status in ("dispatched", "enqueued", "acquiring"):
+            if entry.status == "running":
                 raise RuntimeError("Job is currently running; use /control/abort to stop it.")
             if entry.status in ("done", "failed"):
                 raise LookupError(f"Job already {entry.status}.")
@@ -575,7 +486,7 @@ class MosesRunner:
             if log_fh:
                 log_fh.close()  # subprocess holds its own handle; safe to close parent's copy
 
-        entry.status = "dispatched"
+        entry.status = "running"
         entry.pid = proc.pid
         entry.process = proc
         entry.started_at = datetime.now(timezone.utc)
@@ -595,26 +506,3 @@ class MosesRunner:
             completed.sort(key=lambda kv: kv[1].finished_at or kv[1].queued_at)
             for k, _ in completed[: len(completed) - self._HISTORY_LIMIT]:
                 del self._jobs[k]
-
-    def _has_sirslt(self, entry: JobEntry) -> bool:
-        """Return True if the job's output_dir has *.sirslt files written after job start.
-
-        Called outside the lock.  Returns True (assume success) when output_dir is
-        not configured or the path does not exist — we cannot verify without a
-        concrete results directory, so we default to done rather than failed.
-        """
-        output_dir_str = entry.request_dict.get("output_dir", "")
-        started_at = entry.started_at
-        if not output_dir_str or not started_at:
-            return True
-        output_path = Path(output_dir_str)
-        if not output_path.exists():
-            return False
-        started_epoch = started_at.timestamp()
-        for sirslt in output_path.glob("**/*.sirslt"):
-            try:
-                if sirslt.stat().st_mtime >= started_epoch:
-                    return True
-            except OSError:
-                pass
-        return False

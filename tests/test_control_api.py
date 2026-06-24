@@ -1,9 +1,17 @@
-"""Tests for the /control/* endpoints."""
+"""Tests for the /control/* endpoints.
+
+Queue-ownership model (2026-06-23): the sidecar's MosesRunner is the sole queue
+and Moses runs synchronously, so **process exit is authoritative** (rc==0 →
+done, rc!=0 → failed). There is no OpenLab-queue "enqueued"/"acquiring" state and
+no .sirslt finalization. OLSS is observed only to detect technician *servicing*.
+Submission precedence (highest first): servicing 409 > workflow 423 > queue >
+idle. Claims carry a roster-resolved role (hplcms | hte); workflow.start is
+hte-only.
+"""
 
 from __future__ import annotations
 
 import json
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from subprocess import Popen
@@ -14,6 +22,7 @@ from fastapi.testclient import TestClient
 
 from agilent_hplcms_server.api import create_app
 from agilent_hplcms_server.config import Settings
+from agilent_hplcms_server.control.roster import resolve_role
 from agilent_hplcms_server.control.runner import JobEntry, MosesRunner
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -36,10 +45,10 @@ def _make_mock_proc() -> MagicMock:
 
 def _fake_job_entry(
     run_id: str = "test-run-1",
-    status: str = "dispatched",
+    status: str = "running",
     request_dict: dict | None = None,
 ) -> JobEntry:
-    active = status in ("dispatched", "enqueued", "acquiring")
+    active = status == "running"
     return JobEntry(
         queue_id=run_id,
         script_name="examples/agent_agilent.py",
@@ -55,32 +64,38 @@ def _fake_job_entry(
 
 
 class FakeRunner(MosesRunner):
-    """MosesRunner that never touches the filesystem or spawns processes."""
+    """MosesRunner that never touches the filesystem or spawns processes.
+
+    ``servicing`` / ``queue_full`` are forced via overrides so the router's
+    precedence gates can be driven deterministically without real OLSS polling.
+    """
 
     def __init__(
         self,
         *,
         busy: bool = False,
         run_id: str = "test-run-1",
-        force_acquiring: bool = False,
         queue_full: bool = False,
+        servicing: bool = False,
     ) -> None:
         super().__init__()
         if busy or queue_full:
-            entry = _fake_job_entry(run_id, status="dispatched")
+            entry = _fake_job_entry(run_id, status="running")
             self._jobs[run_id] = entry
             self._active_id = run_id
         self.submitted: list[dict] = []
         self.aborted = False
         self._next_run_id = "queued-run-1"
-        self._force_acquiring = force_acquiring
         self._queue_full = queue_full
-
-    def check_acquiring(self, settings=None) -> bool:  # type: ignore[override]
-        return self._force_acquiring
+        self._servicing = servicing
 
     def is_queue_full(self, settings=None) -> bool:  # type: ignore[override]
         return self._queue_full
+
+    def is_servicing(self, settings=None) -> bool:  # type: ignore[override]
+        # Honour both the forced flag and the real persistent service-mode flag
+        # (set via /control/service/start through the inherited set_service_mode).
+        return self._servicing or self._service_mode
 
     def submit_to_queue(  # type: ignore[override]
         self,
@@ -101,16 +116,16 @@ class FakeRunner(MosesRunner):
         run_id = self._next_run_id
         self.submitted.append({"script_name": script_name, "job": job, "run_id": run_id})
 
-        if self._active_id is None and not self._olss_occupied:
-            entry = _fake_job_entry(run_id, status="dispatched", request_dict=request_dict)
+        # Launch immediately only when idle AND not being serviced.
+        if self._active_id is None and not self._servicing:
+            entry = _fake_job_entry(run_id, status="running", request_dict=request_dict)
             self._jobs[run_id] = entry
             self._active_id = run_id
             return run_id, 0
-        else:
-            entry = _fake_job_entry(run_id, status="pending", request_dict=request_dict)
-            self._jobs[run_id] = entry
-            self._pending_ids.append(run_id)
-            return run_id, len(self._pending_ids)
+        entry = _fake_job_entry(run_id, status="pending", request_dict=request_dict)
+        self._jobs[run_id] = entry
+        self._pending_ids.append(run_id)
+        return run_id, len(self._pending_ids)
 
     def enqueue(self, script_name: str, job: dict, settings=None) -> tuple[str, int]:  # type: ignore[override]
         return self.submit_to_queue(
@@ -147,15 +162,25 @@ class FakeRunner(MosesRunner):
 # Client factories
 # ---------------------------------------------------------------------------
 
-def _settings() -> Settings:
-    return Settings()
+def _settings(**overrides) -> Settings:
+    """Test settings whose default roster makes any owner an ``hte`` user (via
+    the ``"*"`` wildcard), so the bulk of the suite can claim with arbitrary
+    owner strings and still submit + run workflows. Role/service-enforcement
+    tests pass explicit group lists."""
+    base = dict(hplcms_users="", hte_users="*", hplcms_admins="")
+    base.update(overrides)
+    return Settings(**base)
 
 
-def _client(signals: dict, runner: MosesRunner | None = None) -> TestClient:
+def _client(
+    signals: dict,
+    runner: MosesRunner | None = None,
+    settings: Settings | None = None,
+) -> TestClient:
     def fake_reader(_: Settings) -> dict:
         return dict(signals)
 
-    app = create_app(settings=_settings(), reader=fake_reader, runner=runner)
+    app = create_app(settings=settings or _settings(), reader=fake_reader, runner=runner)
     return TestClient(app)
 
 
@@ -165,13 +190,14 @@ def _authed_client(
     *,
     owner: str = "test-operator",
     session_id: str = "test-session",
+    settings: Settings | None = None,
 ) -> TestClient:
     """A client that holds a valid claim, with ``X-Claim-Token`` pre-set as a
     default header on every request — mirrors how the aggregator drives a
     hard-enforcement (v1.1) device. Use for tests that hit mutating
     ``/control/*`` endpoints; read-only tests can use :func:`_client`.
     """
-    client = _client(signals, runner=runner)
+    client = _client(signals, runner=runner, settings=settings)
     r = client.post(
         "/control/claim",
         json={"owner": owner, "session_id": session_id, "ttl_s": 30.0},
@@ -251,19 +277,6 @@ def test_run_queued_when_busy():
     assert body["status"] == "queued"
     assert body["queue_position"] == 1
     assert body["pid"] is None
-
-
-def test_run_queued_when_olss_reports_external_acquisition():
-    runner = FakeRunner(busy=False)
-    client = _authed_client(_load("signals_olss_run.json"), runner=runner)
-    r = client.post("/control/run", json=VALID_RUN_BODY)
-    assert r.status_code == 202, r.text
-    body = r.json()
-    assert body["status"] == "queued"
-    assert body["queue_position"] == 1
-    assert body["pid"] is None
-    assert runner.get_active() is None
-    assert runner.queue_depth() == 1
 
 
 def test_run_409_when_requires_init():
@@ -349,17 +362,6 @@ def test_post_queue_queued_when_busy():
     assert body["position"] == 1
 
 
-def test_post_queue_queued_when_olss_reports_external_acquisition():
-    runner = FakeRunner(busy=False)
-    client = _authed_client(_load("signals_olss_run.json"), runner=runner)
-    r = client.post("/control/queue", json=VALID_RUN_BODY)
-    assert r.status_code == 202, r.text
-    body = r.json()
-    assert body["status"] == "queued"
-    assert body["position"] == 1
-    assert runner.get_active() is None
-
-
 def test_post_queue_409_requires_init():
     runner = FakeRunner(busy=False)
     client = _authed_client(_load("signals_requires_init.json"), runner=runner)
@@ -402,33 +404,21 @@ def test_queue_shows_pending_after_submit():
     r = client.get("/control/queue")
     body = r.json()
     assert body["pending_count"] == 1
-    # pid is None = genuinely queued (not yet dispatched); distinguishes from dispatched-but-not-acquiring
+    # pid is None = genuinely queued (not yet launched).
     not_started = [j for j in body["queue"] if j["pid"] is None]
     assert len(not_started) == 1
     assert len(not_started[0]["request"]["samples"]) == 1
 
 
-def test_queue_dispatched_shows_as_pending_before_acquisition():
-    """Dispatched job (script started, OpenLab not yet acquiring) shows as pending."""
+def test_queue_shows_active_job_as_running():
+    """The active job (Moses subprocess alive) shows status 'running'."""
     runner = FakeRunner(busy=True, run_id="active-123")
-    # signals_ready has acquisition_active=False
     client = _client(_load("signals_ready.json"), runner=runner)
     r = client.get("/control/queue")
     body = r.json()
     active_jobs = [j for j in body["queue"] if j["queue_id"] == "active-123"]
     assert len(active_jobs) == 1
-    assert active_jobs[0]["status"] == "pending"
-
-
-def test_queue_dispatched_becomes_acquiring_when_output_dir_active():
-    """Dispatched job transitions to acquiring when the job's own output_dir has sirslt activity."""
-    runner = FakeRunner(busy=True, run_id="active-123", force_acquiring=True)
-    client = _client(_load("signals_ready.json"), runner=runner)
-    r = client.get("/control/queue")
-    body = r.json()
-    active_jobs = [j for j in body["queue"] if j["queue_id"] == "active-123"]
-    assert len(active_jobs) == 1
-    assert active_jobs[0]["status"] == "acquiring"
+    assert active_jobs[0]["status"] == "running"
 
 
 def test_queue_instrument_offline():
@@ -593,43 +583,98 @@ def test_status_details_queue_length():
 
 
 # ---------------------------------------------------------------------------
-# MosesRunner OLSS lifecycle handling
+# MosesRunner lifecycle — process exit is authoritative (no OLSS finalization)
 # ---------------------------------------------------------------------------
 
-def test_runner_holds_active_job_while_olss_occupied_after_moses_exit():
+def test_poll_marks_done_on_clean_exit():
     runner = MosesRunner()
-    entry = _fake_job_entry("active-123", status="dispatched")
+    entry = _fake_job_entry("active-123", status="running")
     entry.process.poll.return_value = 0  # type: ignore[union-attr]
     runner._jobs[entry.queue_id] = entry
     runner._active_id = entry.queue_id
 
-    runner.notify_olss_state("Idle", "Paused")
-    runner.poll(settings=Settings())
-
-    # Moses exited while OLSS was occupied → job submitted to OpenLab queue
-    assert runner.get_active() is not None
-    assert entry.status == "enqueued"
-    assert entry.process is None
-
-    # OLSS reports Running → instrument picked up the job
-    runner.notify_olss_state("Run", "OK")
-    runner.poll(settings=Settings())
-
-    assert runner.get_active() is not None
-    assert entry.status == "acquiring"
-
-    # OLSS returns to idle. Entry has no output_dir → _has_sirslt returns True
-    # (cannot verify, assume done). notify_olss_state finalises before poll().
-    runner.notify_olss_state("Idle", "OK")
     runner.poll(settings=Settings())
 
     assert runner.get_active() is None
     assert entry.status == "done"
+    assert entry.process is None
+    assert entry.finished_at is not None
 
 
-# ---------------------------------------------------------------------------
-# Fix 1: abort() atomicity — job shows "failed" immediately after abort
-# ---------------------------------------------------------------------------
+def test_poll_marks_failed_on_nonzero_exit():
+    runner = MosesRunner()
+    entry = _fake_job_entry("active-123", status="running")
+    entry.process.poll.return_value = 3  # type: ignore[union-attr]
+    runner._jobs[entry.queue_id] = entry
+    runner._active_id = entry.queue_id
+
+    runner.poll(settings=Settings())
+
+    assert runner.get_active() is None
+    assert entry.status == "failed"
+    assert "Exit code 3" in (entry.error_msg or "")
+
+
+def test_poll_leaves_running_while_process_alive():
+    runner = MosesRunner()
+    entry = _fake_job_entry("active-123", status="running")
+    entry.process.poll.return_value = None  # type: ignore[union-attr]
+    runner._jobs[entry.queue_id] = entry
+    runner._active_id = entry.queue_id
+
+    runner.poll(settings=Settings())
+
+    assert runner.get_active() is not None
+    assert entry.status == "running"
+
+
+class _RecordingRunner(MosesRunner):
+    """Records _launch_locked calls instead of spawning a real subprocess."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.launched: list[str] = []
+
+    def _launch_locked(self, entry, settings) -> None:  # type: ignore[override]
+        entry.status = "running"
+        entry.started_at = datetime.now(timezone.utc)
+        entry.pid = 999
+        self._active_id = entry.queue_id
+        self.launched.append(entry.queue_id)
+
+
+def test_poll_launches_next_pending_after_done():
+    runner = _RecordingRunner()
+    active = _fake_job_entry("a", status="running")
+    active.process.poll.return_value = 0  # type: ignore[union-attr]
+    runner._jobs["a"] = active
+    runner._active_id = "a"
+    pending = _fake_job_entry("b", status="pending")
+    runner._jobs["b"] = pending
+    runner._pending_ids.append("b")
+
+    runner.poll(settings=Settings())
+
+    assert active.status == "done"
+    assert runner._active_id == "b"
+    assert "b" in runner.launched
+
+
+def test_abort_active_run_real_runner():
+    """MosesRunner.abort() marks the job failed inside the lock (no second lock race)."""
+    runner = MosesRunner()
+    entry = _fake_job_entry("active-123", status="running")
+    runner._jobs[entry.queue_id] = entry
+    runner._active_id = entry.queue_id
+
+    was_active, n_cleared = runner.abort(settings=Settings())
+
+    assert was_active is True
+    assert n_cleared == 0
+    assert entry.status == "failed"
+    assert entry.error_msg == "Aborted by operator"
+    assert runner.get_active() is None
+
 
 def test_abort_active_run_shows_failed_in_queue():
     """After POST /control/abort the job appears as failed in GET /control/queue."""
@@ -643,153 +688,89 @@ def test_abort_active_run_shows_failed_in_queue():
     assert body["active_run_id"] is None
 
 
-def test_abort_active_run_real_runner():
-    """MosesRunner.abort() marks the job failed inside the lock (no second lock race)."""
+# ---------------------------------------------------------------------------
+# Servicing detection (precedence #1): OLSS busy AND no active job, debounced.
+# ---------------------------------------------------------------------------
+
+def test_is_servicing_requires_debounce():
     runner = MosesRunner()
-    entry = _fake_job_entry("active-123", status="dispatched")
-    runner._jobs[entry.queue_id] = entry
-    runner._active_id = entry.queue_id
+    s = Settings(servicing_debounce_polls=2)
+    # One observation of a real OLSS run while idle → below the debounce.
+    runner.notify_olss_state("Busy", "OK", "Seq-Run-1")
+    assert runner.is_servicing(s) is False
+    # A second consecutive observation crosses it → servicing.
+    runner.notify_olss_state("Busy", "OK", "Seq-Run-1")
+    assert runner.is_servicing(s) is True
+    # currentRun clearing (OLSS idle) resets the streak.
+    runner.notify_olss_state("Idle", "OK", None)
+    assert runner.is_servicing(s) is False
 
-    was_active, n_cleared = runner.abort(settings=Settings())
 
-    assert was_active is True
-    assert n_cleared == 0
-    assert entry.status == "failed"
-    assert entry.error_msg == "Aborted by operator"
+def test_no_servicing_during_data_analysis():
+    """state=='Busy' with NO currentRun is data analysis/reprocessing, not an
+    acquisition — it must NOT halt the queue (keyed on currentRun, not Busy)."""
+    runner = MosesRunner()
+    s = Settings(servicing_debounce_polls=1)
+    runner.notify_olss_state("Busy", "OK", None)
+    runner.notify_olss_state("Busy", "OK", None)
+    assert runner.is_servicing(s) is False
+
+
+def test_not_servicing_while_our_job_active():
+    """A real OLSS run with an active sidecar job is OUR run, not a technician."""
+    runner = MosesRunner()
+    entry = _fake_job_entry("a", status="running")
+    runner._jobs["a"] = entry
+    runner._active_id = "a"
+    runner.notify_olss_state("Busy", "OK", "Seq-Run-1")
+    runner.notify_olss_state("Busy", "OK", "Seq-Run-1")
+    assert runner.is_servicing(Settings()) is False
+
+
+def test_service_mode_flag_forces_servicing():
+    """The explicit persistent flag halts the queue regardless of OLSS state."""
+    runner = MosesRunner()
+    assert runner.is_servicing(Settings()) is False
+    runner.set_service_mode(True)
+    assert runner.service_mode() is True
+    assert runner.is_servicing(Settings()) is True
+    runner.set_service_mode(False)
+    assert runner.service_mode() is False
+    assert runner.is_servicing(Settings()) is False
+
+
+def test_poll_halts_queue_during_servicing():
+    """A pending job is NOT launched while a technician is servicing."""
+    runner = _RecordingRunner()
+    s = Settings(servicing_debounce_polls=1)
+    runner.notify_olss_state("Busy", "OK", "Seq-Run-1")  # streak 1 ≥ 1 → servicing
+    pending = _fake_job_entry("p1", status="pending")
+    runner._jobs["p1"] = pending
+    runner._pending_ids.append("p1")
+
+    runner.poll(settings=s)
+
     assert runner.get_active() is None
+    assert pending.status == "pending"
+    assert runner.launched == []
 
 
-# ---------------------------------------------------------------------------
-# Fix 2: OLSS→idle sync — correct lifecycle when preceding job finishes first
-# ---------------------------------------------------------------------------
-
-def test_runner_keeps_enqueued_when_olss_idle_no_results():
-    """OLSS going idle with no sirslt → job demoted to enqueued (preceding job may have finished,
-    ours is still waiting in OpenLab's queue)."""
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        runner = MosesRunner()
-        entry = _fake_job_entry(
-            "active-123",
-            status="acquiring",
-            request_dict={
-                "script_name": "examples/agent_agilent.py",
-                "output_dir": tmp_dir,
-            },
-        )
-        entry.process = None  # Moses already exited
-        runner._jobs[entry.queue_id] = entry
-        runner._active_id = entry.queue_id
-        runner._olss_occupied = True  # instrument was Running
-
-        # OLSS returns to idle; output_dir exists but no sirslt files yet
-        runner.notify_olss_state("Idle", None)
-
-        # Job should be "enqueued" — it may still be waiting in OpenLab's queue
-        assert runner.get_active() is not None
-        assert entry.status == "enqueued"
+def test_run_409_instrument_servicing():
+    runner = FakeRunner(busy=False, servicing=True)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    r = client.post("/control/run", json=VALID_RUN_BODY)
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["error"] == "instrument_servicing"
+    assert r.headers.get("Retry-After") is None  # duration unpredictable
+    assert runner.submitted == []  # never enqueued
 
 
-def test_runner_marks_acquiring_job_done_on_olss_idle_with_results():
-    """OLSS going idle with sirslt present → job marked done (run completed normally)."""
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        tmp_path = Path(tmp_dir)
-        runner = MosesRunner()
-        entry = _fake_job_entry(
-            "active-123",
-            status="acquiring",
-            request_dict={
-                "script_name": "examples/agent_agilent.py",
-                "output_dir": tmp_dir,
-            },
-        )
-        entry.process = None
-        runner._jobs[entry.queue_id] = entry
-        runner._active_id = entry.queue_id
-        runner._olss_occupied = True
-
-        # Simulate sirslt file written by OpenLab
-        (tmp_path / "sample1.sirslt").touch()
-
-        runner.notify_olss_state("Idle", None)
-
-        assert runner.get_active() is None
-        assert entry.status == "done"
-
-
-def test_runner_no_false_failure_when_olss_never_occupied():
-    """No transition detection fires when OLSS was already idle before the job."""
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        runner = MosesRunner()
-        entry = _fake_job_entry(
-            "active-123",
-            status="acquiring",
-            request_dict={
-                "script_name": "examples/agent_agilent.py",
-                "output_dir": tmp_dir,
-            },
-        )
-        entry.process = None
-        runner._jobs[entry.queue_id] = entry
-        runner._active_id = entry.queue_id
-        # _olss_occupied stays False (default) — no occupied→idle transition
-
-        runner.notify_olss_state("Idle", None)
-
-        # No transition (was_occupied=False) → job untouched
-        assert runner.get_active() is not None
-        assert entry.status == "acquiring"
-
-
-def test_poll_keeps_enqueued_when_moses_exits_cleanly_no_sirslt():
-    """Moses exits rc=0, OLSS idle, no sirslt yet → job set to enqueued (queued in OpenLab)."""
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        runner = MosesRunner()
-        entry = _fake_job_entry(
-            "active-123",
-            status="dispatched",
-            request_dict={
-                "script_name": "examples/agent_agilent.py",
-                "output_dir": tmp_dir,
-            },
-        )
-        entry.process.poll.return_value = 0  # Moses exited cleanly
-        runner._jobs[entry.queue_id] = entry
-        runner._active_id = entry.queue_id
-        runner._olss_occupied = False  # OLSS idle at this moment
-
-        runner.poll(settings=Settings())
-
-        # No sirslt files → job may be queued in OpenLab; show as enqueued
-        assert runner.get_active() is not None
-        assert entry.status == "enqueued"
-        assert entry.process is None  # process handle released
-
-
-def test_poll_marks_done_when_moses_exits_cleanly_with_sirslt():
-    """Moses exits rc=0, OLSS idle, sirslt present → job immediately marked done."""
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        tmp_path = Path(tmp_dir)
-        runner = MosesRunner()
-        entry = _fake_job_entry(
-            "active-123",
-            status="dispatched",
-            request_dict={
-                "script_name": "examples/agent_agilent.py",
-                "output_dir": tmp_dir,
-            },
-        )
-        entry.process.poll.return_value = 0  # Moses exited cleanly
-        runner._jobs[entry.queue_id] = entry
-        runner._active_id = entry.queue_id
-        runner._olss_occupied = False
-
-        # Sirslt file already present when Moses exits
-        (tmp_path / "result.sirslt").touch()
-
-        runner.poll(settings=Settings())
-
-        assert runner.get_active() is None
-        assert entry.status == "done"
+def test_queue_not_accepting_during_servicing():
+    runner = FakeRunner(busy=False, servicing=True)
+    client = _client(_load("signals_ready.json"), runner=runner)
+    body = client.get("/control/queue").json()
+    assert body["accepting_jobs"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -930,6 +911,208 @@ def test_status_surfaces_claimed_by():
     assert cb["owner"] == "agent:screening"
     assert cb["session_id"] == "sess-9"
     assert cb["expires_at"]
+    assert cb["workflow"] is False
+
+
+# ---------------------------------------------------------------------------
+# Roster-driven roles (identity, NOT authentication)
+# ---------------------------------------------------------------------------
+
+def test_resolve_role_unit():
+    s = Settings(hplcms_users="alice, bob", hte_users="HTE-User", hplcms_admins="Service-Account")
+    assert resolve_role("alice", s) == "hplcms_user"
+    assert resolve_role("BOB", s) == "hplcms_user"          # case-insensitive
+    assert resolve_role("hte-user", s) == "hte"
+    assert resolve_role("service-account", s) == "hplcms_admin"
+    assert resolve_role("stranger", s) is None
+    # All lists empty → built-in defaults apply (roster always enforced).
+    d = Settings(hplcms_users="", hte_users="", hplcms_admins="")
+    assert resolve_role("Hplcms-User", d) == "hplcms_user"
+    assert resolve_role("HTE-User", d) == "hte"
+    assert resolve_role("Service-Account", d) == "hplcms_admin"
+    assert resolve_role("stranger", d) is None
+    # Explicit "*" wildcard = open (any owner), distinct from accidental empty.
+    w = Settings(hplcms_users="*", hte_users="", hplcms_admins="")
+    assert resolve_role("whoever", w) == "hplcms_user"
+
+
+def test_role_precedence_admin_over_hte_over_user():
+    both = Settings(hplcms_users="carol", hte_users="carol", hplcms_admins="carol")
+    assert resolve_role("carol", both) == "hplcms_admin"
+    hte_and_user = Settings(hplcms_users="dave", hte_users="dave", hplcms_admins="")
+    assert resolve_role("dave", hte_and_user) == "hte"
+
+
+def test_claim_403_for_unknown_user_when_roster_enabled():
+    settings = _settings(hplcms_users="Hplcms-User", hte_users="HTE-User")
+    client = _client(_load("signals_ready.json"), runner=FakeRunner(), settings=settings)
+    r = client.post(
+        "/control/claim", json={"owner": "stranger", "session_id": "s", "ttl_s": 30.0}
+    )
+    assert r.status_code == 403
+    detail = r.json()["detail"]
+    assert detail["error"] == "user_not_recognized"
+    assert detail["owner"] == "stranger"
+
+
+def test_claim_returns_resolved_role():
+    settings = _settings(
+        hplcms_users="Hplcms-User", hte_users="HTE-User", hplcms_admins="Service-Account"
+    )
+    cases = {"HTE-User": "hte", "Hplcms-User": "hplcms_user", "Service-Account": "hplcms_admin"}
+    for i, (owner, role) in enumerate(cases.items()):
+        c = _client(_load("signals_ready.json"), runner=FakeRunner(), settings=settings)
+        got = c.post(
+            "/control/claim", json={"owner": owner, "session_id": f"s{i}", "ttl_s": 30.0}
+        ).json()["role"]
+        assert got == role, f"{owner} → {got}, expected {role}"
+
+
+# ---------------------------------------------------------------------------
+# Workflow lock (precedence #2): equipment-blocking series, HTE-only.
+# ---------------------------------------------------------------------------
+
+def test_workflow_start_end_happy_path():
+    runner = FakeRunner(busy=False)
+    client = _authed_client(_load("signals_ready.json"), runner=runner, owner="HTE-User")
+    r = client.post("/control/workflow/start")
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "workflow_started"
+
+    body = client.get("/status").json()
+    assert body["details"]["workflow_active"] is True
+    assert body["details"]["claimed_by"]["workflow"] is True
+    assert "workflow.end" in body["allowed_actions"]
+    assert "workflow.start" not in body["allowed_actions"]
+
+    r2 = client.post("/control/workflow/end")
+    assert r2.status_code == 200
+    body2 = client.get("/status").json()
+    assert body2["details"].get("workflow_active") in (None, False)
+    assert "workflow.start" in body2["allowed_actions"]
+
+
+def test_workflow_start_403_for_hplcms_role():
+    runner = FakeRunner(busy=False)
+    settings = _settings(hplcms_users="alice", hte_users="HTE-User")
+    client = _authed_client(
+        _load("signals_ready.json"), runner=runner, owner="alice", settings=settings
+    )
+    r = client.post("/control/workflow/start")
+    assert r.status_code == 403
+    detail = r.json()["detail"]
+    assert detail["error"] == "role_forbidden"
+    assert detail["required_role"] == "hte"
+    assert detail["role"] == "hplcms_user"
+
+
+def test_workflow_start_423_without_token():
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_ready.json"), runner=runner)
+    r = client.post("/control/workflow/start")
+    assert r.status_code == 423
+
+
+def test_workflow_active_blocks_non_holder_submit():
+    """While an HTE workflow holds the lock, a tokenless submit is refused with
+    the specific workflow_active reason + Retry-After (precedence #2)."""
+    runner = FakeRunner(busy=False)
+    holder = _authed_client(_load("signals_ready.json"), runner=runner, owner="HTE-User")
+    assert holder.post("/control/workflow/start").status_code == 200
+
+    # A second client on the SAME app shares the claim holder but has no token.
+    intruder = TestClient(holder.app)
+    r = intruder.post("/control/run", json=VALID_RUN_BODY)
+    assert r.status_code == 423
+    detail = r.json()["detail"]
+    assert detail["error"] == "workflow_active"
+    assert r.headers.get("Retry-After") is not None
+    assert detail["claimed_by"]["owner"] == "HTE-User"
+
+
+def test_workflow_holder_can_still_submit():
+    runner = FakeRunner(busy=False)
+    client = _authed_client(_load("signals_ready.json"), runner=runner, owner="HTE-User")
+    assert client.post("/control/workflow/start").status_code == 200
+    # The holder keeps its token header → submits normally.
+    r = client.post("/control/run", json=VALID_RUN_BODY)
+    assert r.status_code == 202, r.text
+
+
+def test_workflow_end_idempotent_without_active_workflow():
+    runner = FakeRunner(busy=False)
+    client = _authed_client(_load("signals_ready.json"), runner=runner, owner="HTE-User")
+    # Ending when none active still returns 200.
+    assert client.post("/control/workflow/end").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Service mode (precedence #1): admin-only persistent toggle + auto-detect.
+# ---------------------------------------------------------------------------
+
+def _admin_settings(**overrides) -> Settings:
+    base = dict(hplcms_users="", hte_users="", hplcms_admins="Service-Account")
+    base.update(overrides)
+    return Settings(**base)
+
+
+def test_service_start_blocks_submissions_then_end_resumes():
+    runner = FakeRunner(busy=False)
+    client = _authed_client(
+        _load("signals_ready.json"), runner=runner,
+        owner="Service-Account", settings=_admin_settings(),
+    )
+    r = client.post("/control/service/start")
+    assert r.status_code == 200, r.text
+    assert r.json()["service_mode"] is True
+
+    body = client.get("/status").json()
+    assert body["details"]["service_mode"] is True
+    assert body["details"]["servicing"] is True
+    assert "run.submit" not in body["allowed_actions"]
+
+    # Submissions are refused while service mode is on (409 instrument_servicing).
+    r2 = client.post("/control/run", json=VALID_RUN_BODY)
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["error"] == "instrument_servicing"
+
+    r3 = client.post("/control/service/end")
+    assert r3.status_code == 200
+    assert r3.json()["service_mode"] is False
+    assert client.get("/status").json()["details"]["service_mode"] is False
+
+
+def test_service_toggle_403_for_non_admin():
+    runner = FakeRunner(busy=False)
+    # Default settings make the owner an 'hte' user, not an admin.
+    client = _authed_client(_load("signals_ready.json"), runner=runner, owner="HTE-User")
+    r = client.post("/control/service/start")
+    assert r.status_code == 403
+    detail = r.json()["detail"]
+    assert detail["error"] == "role_forbidden"
+    assert detail["required_role"] == "hplcms_admin"
+    # And service mode was not turned on.
+    assert runner.service_mode() is False
+
+
+def test_service_start_423_without_token():
+    client = _client(_load("signals_ready.json"), runner=FakeRunner())
+    assert client.post("/control/service/start").status_code == 423
+
+
+def test_service_mode_persists_across_claim_release():
+    """The flag is standalone: releasing the admin claim leaves service mode ON
+    (a dropped dashboard must not silently un-block a maintenance window)."""
+    runner = FakeRunner(busy=False)
+    admin = _authed_client(
+        _load("signals_ready.json"), runner=runner,
+        owner="Service-Account", settings=_admin_settings(),
+    )
+    assert admin.post("/control/service/start").status_code == 200
+    assert admin.post("/control/release").status_code == 204
+    # Claim gone, but the flag — and the 409 — remain.
+    assert runner.service_mode() is True
+    assert admin.get("/status").json()["details"]["service_mode"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -959,7 +1142,9 @@ def test_allowed_actions_ready_lists_all_verbs():
     runner = FakeRunner(busy=False)
     client = _client(_load("signals_ready.json"), runner=runner)
     actions = client.get("/status").json()["allowed_actions"]
-    assert actions == ["run.submit", "run.abort", "queue.cancel", "instrument.standby"]
+    assert actions == [
+        "run.submit", "run.abort", "queue.cancel", "instrument.standby", "workflow.start",
+    ]
 
 
 def test_allowed_actions_requires_init_drops_enqueue_verbs():
@@ -968,9 +1153,22 @@ def test_allowed_actions_requires_init_drops_enqueue_verbs():
     actions = client.get("/status").json()["allowed_actions"]
     assert "run.submit" not in actions
     assert "instrument.standby" not in actions
+    assert "workflow.start" not in actions
     # abort / cancel carry no enqueue precondition.
     assert "run.abort" in actions
     assert "queue.cancel" in actions
+
+
+def test_allowed_actions_servicing_drops_enqueue_verbs():
+    runner = FakeRunner(busy=False, servicing=True)
+    client = _client(_load("signals_ready.json"), runner=runner)
+    body = client.get("/status").json()
+    actions = body["allowed_actions"]
+    assert "run.submit" not in actions
+    assert "instrument.standby" not in actions
+    assert "workflow.start" not in actions
+    assert "run.abort" in actions and "queue.cancel" in actions
+    assert body["details"]["servicing"] is True
 
 
 def test_allowed_actions_unknown_state_is_empty():
@@ -1004,17 +1202,27 @@ def test_allowed_actions_helper_matches_refusal_property():
 
     for requires_init in (False, True):
         for queue_full in (False, True):
-            actions = allowed_actions(
-                service_operational=True,
-                requires_init=requires_init,
-                queue_full=queue_full,
-            )
-            can_enqueue = (not requires_init) and (not queue_full)
-            assert ("run.submit" in actions) is can_enqueue
-            assert ("instrument.standby" in actions) is can_enqueue
-            # Non-enqueue verbs are always offered while operational.
-            assert "run.abort" in actions
-            assert "queue.cancel" in actions
+            for servicing in (False, True):
+                for workflow_active in (False, True):
+                    actions = allowed_actions(
+                        service_operational=True,
+                        requires_init=requires_init,
+                        queue_full=queue_full,
+                        servicing=servicing,
+                        workflow_active=workflow_active,
+                    )
+                    can_enqueue = (
+                        (not requires_init) and (not queue_full) and (not servicing)
+                    )
+                    assert ("run.submit" in actions) is can_enqueue
+                    assert ("instrument.standby" in actions) is can_enqueue
+                    assert ("workflow.start" in actions) is (
+                        can_enqueue and not workflow_active
+                    )
+                    assert ("workflow.end" in actions) is workflow_active
+                    # Non-enqueue verbs are always offered while operational.
+                    assert "run.abort" in actions
+                    assert "queue.cancel" in actions
 
     # Not operational (probe_error) → nothing offered.
     assert allowed_actions(
