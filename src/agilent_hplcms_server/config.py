@@ -91,6 +91,21 @@ class Settings:
     hte_users: str = os.environ.get("HTE_USERS", "HTE-User")
     hplcms_admins: str = os.environ.get("HPLCMS_ADMINS", "Service-Account")
 
+    # Central roster projection (optional). When ROSTER_URL is set, the sidecar
+    # polls the central auth service's owner→role projection
+    # (ac-organic-lab `GET /equipment/{key}/roster`) and resolves claim owners
+    # against it — central is then authoritative. The static *_USERS lists above
+    # are the fallback used only until the first successful pull (so the device
+    # never bricks if central is unreachable at startup). Empty ROSTER_URL →
+    # static env roster only (fully standalone). See control/roster_sync.py.
+    roster_url: str = os.environ.get("ROSTER_URL", "")
+    roster_refresh_interval_s: int = _env_int("ROSTER_REFRESH_INTERVAL_S", 60)
+    roster_http_timeout_s: int = _env_int("ROSTER_HTTP_TIMEOUT_S", 5)
+    # Optional X-Api-Key sent with the roster pull. The roster endpoint is
+    # Tailnet-only by deployment, so this is normally unset; set it if the
+    # central service ever gates the device-plane endpoints.
+    roster_api_key: str = os.environ.get("ROSTER_API_KEY", "")
+
     # Autosampler tray → Agilent multisampler drawer-code mapping. A run
     # addresses samples by logical {tray, well}; the control layer composes the
     # "{drawer}-{well}" position string Moses consumes (see control/router.py).

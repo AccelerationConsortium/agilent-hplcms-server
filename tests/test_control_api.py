@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 from agilent_hplcms_server.api import create_app
 from agilent_hplcms_server.config import Settings
 from agilent_hplcms_server.control.roster import resolve_role
+from agilent_hplcms_server.control.roster_sync import RosterProvider
 from agilent_hplcms_server.control.runner import JobEntry, MosesRunner
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -966,6 +967,41 @@ def test_claim_returns_resolved_role():
             "/control/claim", json={"owner": owner, "session_id": f"s{i}", "ttl_s": 30.0}
         ).json()["role"]
         assert got == role, f"{owner} → {got}, expected {role}"
+
+
+def test_central_roster_is_authoritative_over_static_env():
+    """When a central roster has been pulled, it decides owner→role — overriding
+    the static env lists (here a permissive ``*``)."""
+    payload = {
+        "equipment_key": "agilent_uplc_ms",
+        "entries": [{"owner": "alice@utoronto.ca", "role": "hte"}],
+    }
+    provider = RosterProvider(fetcher=lambda u, t, k: payload)
+    # static would allow ANY owner (hte_users="*"); central must win once pulled.
+    settings = _settings(roster_url="http://auth/equipment/agilent_uplc_ms/roster", hte_users="*")
+    assert provider.refresh(settings) is True
+
+    def fake_reader(_: Settings) -> dict:
+        return dict(_load("signals_ready.json"))
+
+    app = create_app(
+        settings=settings, reader=fake_reader, runner=FakeRunner(), roster=provider
+    )
+    with TestClient(app) as client:
+        # alice is on the central projection → claim ok, role resolved from central.
+        ok = client.post(
+            "/control/claim",
+            json={"owner": "alice@utoronto.ca", "session_id": "s1", "ttl_s": 30.0},
+        )
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["role"] == "hte"
+        # stranger is NOT on central → 403, despite the permissive static "*".
+        bad = client.post(
+            "/control/claim",
+            json={"owner": "stranger", "session_id": "s2", "ttl_s": 30.0},
+        )
+        assert bad.status_code == 403
+        assert bad.json()["detail"]["error"] == "user_not_recognized"
 
 
 # ---------------------------------------------------------------------------
