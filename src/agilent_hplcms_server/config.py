@@ -80,9 +80,9 @@ class Settings:
     # Lab user roster → claim role (identity only, NOT authentication; the
     # network ACL / dashboard login is the real access boundary). Comma-separated
     # owner names per group. Capabilities by role:
-    #   hplcms_user  (HPLCMS_USERS)  → submit samples into the queue
-    #   hte          (HTE_USERS)     → submit + start equipment-blocking workflows
-    #   hplcms_admin (HPLCMS_ADMINS) → submit + toggle service mode
+    #   user        (HPLCMS_USERS)  → submit samples into the queue
+    #   automation  (HTE_USERS)     → submit + start equipment-blocking workflows
+    #   service     (HPLCMS_ADMINS) → submit + toggle service mode
     # The roster is ALWAYS enforced: when every list is empty the built-in
     # defaults below apply (so a fresh install always has a Service-Account and
     # never bricks). A literal "*" in a list matches any owner (explicit open

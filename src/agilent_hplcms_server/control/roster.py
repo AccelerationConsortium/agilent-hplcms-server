@@ -6,20 +6,22 @@ login is wanted, the dashboard/aggregator. This module only answers "given an
 ``owner`` string, which lab role is it?" so the device can attribute a claim and
 gate role-restricted actions.
 
-Three groups → roles, configured as comma-separated user lists in
-:class:`Settings`:
+Roles are named by the capability they unlock (the same vocabulary the central
+auth service projects). Three groups → roles, configured as comma-separated user
+lists in :class:`Settings`:
 
-* ``hplcms_user``  (``HPLCMS_USERS``)  — submit single-sample runs into the queue.
-* ``hte``          (``HTE_USERS``)     — submit **plus** start/end an
-  equipment-blocking workflow (``workflow.start`` / ``workflow.end``).
-* ``hplcms_admin`` (``HPLCMS_ADMINS``) — submit **plus** toggle service mode
+* ``user``        (``HPLCMS_USERS``)  — submit single-sample runs into the queue.
+* ``automation``  (``HTE_USERS``)     — submit **plus** start/end an
+  equipment-blocking workflow (``workflow.start`` / ``workflow.end``); held by an
+  automation/orchestration principal (e.g. the HTE platform).
+* ``service``     (``HPLCMS_ADMINS``) — submit **plus** toggle service mode
   (``service.start`` / ``service.end``). Seeded today with the single
-  ``Service-Account`` the dashboard claims under; generalizes to an admin group
+  ``Service-Account`` the dashboard claims under; generalizes to a service group
   later just by adding names.
 
 Capabilities are gated per role (see :func:`can_*`); ``run.submit`` is open to
 every recognized role. An owner is expected to be in exactly one group; if it
-appears in several, the higher-privilege role wins (admin > hte > hplcms_user).
+appears in several, the higher-privilege role wins (service > automation > user).
 
 The roster is ALWAYS enforced. When every list is empty the built-in defaults
 apply (so a fresh install always has a Service-Account and never bricks). A
@@ -33,7 +35,7 @@ from typing import Literal
 
 from ..config import Settings
 
-Role = Literal["hplcms_user", "hte", "hplcms_admin"]
+Role = Literal["user", "automation", "service"]
 
 # Built-in fallback roster used only when every group list is empty/unset.
 _DEFAULT_HPLCMS_USERS = {"hplcms-user"}
@@ -47,7 +49,7 @@ def _parse_users(raw: str) -> set[str]:
 
 
 def _groups(settings: Settings) -> tuple[set[str], set[str], set[str]]:
-    """Resolved (hplcms_user, hte, hplcms_admin) member sets, applying the
+    """Resolved (user, automation, service) member sets, applying the
     built-in defaults when nothing at all is configured."""
     users = _parse_users(settings.hplcms_users)
     hte = _parse_users(settings.hte_users)
@@ -65,16 +67,16 @@ def resolve_role(owner: str, settings: Settings) -> Role | None:
     """Map an ``owner`` to its lab role, or ``None`` if not on any list.
 
     Higher privilege wins when an owner is in multiple groups
-    (admin > hte > hplcms_user).
+    (service > automation > user).
     """
-    users, hte, admins = _groups(settings)
+    users, automation, service = _groups(settings)
     key = owner.strip().casefold()
-    if _in(key, admins):
-        return "hplcms_admin"
-    if _in(key, hte):
-        return "hte"
+    if _in(key, service):
+        return "service"
+    if _in(key, automation):
+        return "automation"
     if _in(key, users):
-        return "hplcms_user"
+        return "user"
     return None
 
 
@@ -84,13 +86,13 @@ def can_submit(role: Role | None) -> bool:
 
 
 def can_workflow(role: Role | None) -> bool:
-    """Only HTE platform users may take the equipment-blocking workflow lock."""
-    return role == "hte"
+    """Only an automation principal may take the equipment-blocking workflow lock."""
+    return role == "automation"
 
 
 def can_service(role: Role | None) -> bool:
-    """Only admins may toggle service mode (today: the Service-Account)."""
-    return role == "hplcms_admin"
+    """Only a service role may toggle service mode (today: the Service-Account)."""
+    return role == "service"
 
 
 __all__ = [

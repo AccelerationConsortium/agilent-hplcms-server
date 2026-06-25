@@ -711,12 +711,12 @@ def workflow_start(request: Request) -> WorkflowStartResponse:
             status_code=403,
             detail=RoleForbiddenError(
                 detail=(
-                    "Starting an equipment-blocking workflow requires an HTE "
-                    "platform user."
+                    "Starting an equipment-blocking workflow requires an "
+                    "automation principal (e.g. the HTE platform)."
                 ),
                 owner=held.owner if held else None,
                 role=held.role if held else None,
-                required_role="hte",
+                required_role="automation",
             ).model_dump(mode="json"),
         )
 
@@ -770,10 +770,10 @@ def _require_service_role(request: Request) -> None:
         raise HTTPException(
             status_code=403,
             detail=RoleForbiddenError(
-                detail="Toggling service mode requires an admin (service) account.",
+                detail="Toggling service mode requires a service-role account.",
                 owner=held.owner if held else None,
                 role=held.role if held else None,
-                required_role="hplcms_admin",
+                required_role="service",
             ).model_dump(mode="json"),
         )
 
