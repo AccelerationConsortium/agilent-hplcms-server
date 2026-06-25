@@ -5,7 +5,7 @@ and Moses runs synchronously, so **process exit is authoritative** (rc==0 →
 done, rc!=0 → failed). There is no OpenLab-queue "enqueued"/"acquiring" state and
 no .sirslt finalization. OLSS is observed only to detect technician *servicing*.
 Submission precedence (highest first): servicing 409 > workflow 423 > queue >
-idle. Claims carry a roster-resolved role (hplcms | hte); workflow.start is
+idle. Claims carry a roster-resolved role (user | automation | service); workflow.start is
 hte-only.
 """
 
@@ -921,27 +921,27 @@ def test_status_surfaces_claimed_by():
 
 def test_resolve_role_unit():
     s = Settings(hplcms_users="alice, bob", hte_users="HTE-User", hplcms_admins="Service-Account")
-    assert resolve_role("alice", s) == "hplcms_user"
-    assert resolve_role("BOB", s) == "hplcms_user"          # case-insensitive
-    assert resolve_role("hte-user", s) == "hte"
-    assert resolve_role("service-account", s) == "hplcms_admin"
+    assert resolve_role("alice", s) == "user"
+    assert resolve_role("BOB", s) == "user"          # case-insensitive
+    assert resolve_role("hte-user", s) == "automation"
+    assert resolve_role("service-account", s) == "service"
     assert resolve_role("stranger", s) is None
     # All lists empty → built-in defaults apply (roster always enforced).
     d = Settings(hplcms_users="", hte_users="", hplcms_admins="")
-    assert resolve_role("Hplcms-User", d) == "hplcms_user"
-    assert resolve_role("HTE-User", d) == "hte"
-    assert resolve_role("Service-Account", d) == "hplcms_admin"
+    assert resolve_role("Hplcms-User", d) == "user"
+    assert resolve_role("HTE-User", d) == "automation"
+    assert resolve_role("Service-Account", d) == "service"
     assert resolve_role("stranger", d) is None
     # Explicit "*" wildcard = open (any owner), distinct from accidental empty.
     w = Settings(hplcms_users="*", hte_users="", hplcms_admins="")
-    assert resolve_role("whoever", w) == "hplcms_user"
+    assert resolve_role("whoever", w) == "user"
 
 
-def test_role_precedence_admin_over_hte_over_user():
+def test_role_precedence_service_over_automation_over_user():
     both = Settings(hplcms_users="carol", hte_users="carol", hplcms_admins="carol")
-    assert resolve_role("carol", both) == "hplcms_admin"
+    assert resolve_role("carol", both) == "service"
     hte_and_user = Settings(hplcms_users="dave", hte_users="dave", hplcms_admins="")
-    assert resolve_role("dave", hte_and_user) == "hte"
+    assert resolve_role("dave", hte_and_user) == "automation"
 
 
 def test_claim_403_for_unknown_user_when_roster_enabled():
@@ -960,7 +960,7 @@ def test_claim_returns_resolved_role():
     settings = _settings(
         hplcms_users="Hplcms-User", hte_users="HTE-User", hplcms_admins="Service-Account"
     )
-    cases = {"HTE-User": "hte", "Hplcms-User": "hplcms_user", "Service-Account": "hplcms_admin"}
+    cases = {"HTE-User": "automation", "Hplcms-User": "user", "Service-Account": "service"}
     for i, (owner, role) in enumerate(cases.items()):
         c = _client(_load("signals_ready.json"), runner=FakeRunner(), settings=settings)
         got = c.post(
@@ -974,7 +974,7 @@ def test_central_roster_is_authoritative_over_static_env():
     the static env lists (here a permissive ``*``)."""
     payload = {
         "equipment_key": "agilent_uplc_ms",
-        "entries": [{"owner": "alice@utoronto.ca", "role": "hte"}],
+        "entries": [{"owner": "alice@utoronto.ca", "role": "automation"}],
     }
     provider = RosterProvider(fetcher=lambda u, t, k: payload)
     # static would allow ANY owner (hte_users="*"); central must win once pulled.
@@ -994,7 +994,7 @@ def test_central_roster_is_authoritative_over_static_env():
             json={"owner": "alice@utoronto.ca", "session_id": "s1", "ttl_s": 30.0},
         )
         assert ok.status_code == 200, ok.text
-        assert ok.json()["role"] == "hte"
+        assert ok.json()["role"] == "automation"
         # stranger is NOT on central → 403, despite the permissive static "*".
         bad = client.post(
             "/control/claim",
@@ -1038,8 +1038,8 @@ def test_workflow_start_403_for_hplcms_role():
     assert r.status_code == 403
     detail = r.json()["detail"]
     assert detail["error"] == "role_forbidden"
-    assert detail["required_role"] == "hte"
-    assert detail["role"] == "hplcms_user"
+    assert detail["required_role"] == "automation"
+    assert detail["role"] == "user"
 
 
 def test_workflow_start_423_without_token():
@@ -1120,13 +1120,13 @@ def test_service_start_blocks_submissions_then_end_resumes():
 
 def test_service_toggle_403_for_non_admin():
     runner = FakeRunner(busy=False)
-    # Default settings make the owner an 'hte' user, not an admin.
+    # Default settings make the owner an 'automation' user, not a service role.
     client = _authed_client(_load("signals_ready.json"), runner=runner, owner="HTE-User")
     r = client.post("/control/service/start")
     assert r.status_code == 403
     detail = r.json()["detail"]
     assert detail["error"] == "role_forbidden"
-    assert detail["required_role"] == "hplcms_admin"
+    assert detail["required_role"] == "service"
     # And service mode was not turned on.
     assert runner.service_mode() is False
 

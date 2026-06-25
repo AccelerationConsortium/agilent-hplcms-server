@@ -76,8 +76,8 @@ class ClaimedBy(BaseModel):
     ``details.claimed_by`` so every reader sees who controls the device without
     a side trip. ``null`` (absent) when no claim is active.
 
-    ``role`` is the holder's lab role (``hplcms`` or ``hte``; see
-    ``control/roster.py``) — identity attribution, not a credential. ``workflow``
+    ``role`` is the holder's lab role (``user`` / ``automation`` / ``service``;
+    see ``control/roster.py``) — identity attribution, not a credential. ``workflow``
     is True while the holder has taken the equipment-blocking workflow lock via
     ``POST /control/workflow/start``."""
 

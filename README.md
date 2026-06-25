@@ -146,9 +146,9 @@ Mutating `/control/*` calls require a valid `X-Claim-Token` (hard enforcement, `
 
 | group (env) | role | `run.submit` | `workflow.start/end` | `service.start/end` |
 |---|---|:--:|:--:|:--:|
-| `HPLCMS_USERS` | `hplcms_user` | ✓ | | |
-| `HTE_USERS` | `hte` | ✓ | ✓ | |
-| `HPLCMS_ADMINS` | `hplcms_admin` | ✓ | | ✓ |
+| `HPLCMS_USERS` | `user` | ✓ | | |
+| `HTE_USERS` | `automation` | ✓ | ✓ | |
+| `HPLCMS_ADMINS` | `service` | ✓ | | ✓ |
 
 An unknown owner is refused `403 user_not_recognized`; an under-privileged owner calling a gated action gets `403 role_forbidden`. The roster is **always enforced**: when every list is empty the built-in defaults (`Hplcms-User` / `HTE-User` / `Service-Account`) apply, so a fresh install always has a service account and never bricks. A literal `"*"` in a list matches any owner — an explicit open mode for dev, distinct from an accidental empty config. `HPLCMS_ADMINS` is seeded with the single `Service-Account` the dashboard claims under to toggle service mode; broadening it later is just adding names.
 
@@ -319,9 +319,9 @@ Writes to `C:\SDL_Tools\hplcms_sensor_data.json` every 30 seconds (override via 
 | `QUEUE_FULL_RETRY_AFTER_S` | `60` | Advisory `Retry-After` (s) returned with 412 `queue_full`. |
 | `WORKFLOW_ACTIVE_RETRY_AFTER_S` | `60` | Advisory `Retry-After` (s) returned with 423 `workflow_active`. |
 | `SERVICING_DEBOUNCE_POLLS` | `2` | Consecutive `/status` observations of a real OLSS run (no active job) before auto-detect declares servicing. |
-| `HPLCMS_USERS` | `Hplcms-User` | Roster: owners with role `hplcms_user` (submit samples). Comma-separated; `"*"` = any owner. |
-| `HTE_USERS` | `HTE-User` | Roster: owners with role `hte` (submit + `workflow.*`). |
-| `HPLCMS_ADMINS` | `Service-Account` | Roster: owners with role `hplcms_admin` (submit + `service.*`). |
+| `HPLCMS_USERS` | `Hplcms-User` | Roster: owners with role `user` (submit samples). Comma-separated; `"*"` = any owner. |
+| `HTE_USERS` | `HTE-User` | Roster: owners with role `automation` (submit + `workflow.*`). |
+| `HPLCMS_ADMINS` | `Service-Account` | Roster: owners with role `service` (submit + `service.*`). |
 | `ROSTER_URL` | _(empty)_ | Central roster projection URL (`…/equipment/{key}/roster`). Set → central is authoritative for owner→role; empty → static env roster only. |
 | `ROSTER_REFRESH_INTERVAL_S` | `60` | How often to re-pull the central roster. |
 | `ROSTER_HTTP_TIMEOUT_S` | `5` | Timeout for a single central-roster pull. |

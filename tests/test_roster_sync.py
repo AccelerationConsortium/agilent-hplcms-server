@@ -17,13 +17,13 @@ def test_parse_entries_maps_and_skips_unknown():
     payload = {
         "equipment_key": "agilent_uplc_ms",
         "entries": [
-            {"owner": "Alice@x.com", "role": "hte"},        # casefolded
-            {"owner": "bob@x.com", "role": "hplcms_user"},
+            {"owner": "Alice@x.com", "role": "automation"},        # casefolded
+            {"owner": "bob@x.com", "role": "user"},
             {"owner": "ghost", "role": "wizard"},           # unknown role → skipped
-            {"role": "hte"},                                # missing owner → skipped
+            {"role": "automation"},                                # missing owner → skipped
         ],
     }
-    assert parse_entries(payload) == {"alice@x.com": "hte", "bob@x.com": "hplcms_user"}
+    assert parse_entries(payload) == {"alice@x.com": "automation", "bob@x.com": "user"}
 
 
 def test_parse_entries_handles_empty_and_missing():
@@ -38,20 +38,20 @@ def test_static_fallback_when_no_central():
     # No roster_url and never pulled → resolve uses the static env roster.
     p = RosterProvider()
     s = _settings(hplcms_users="alice", hte_users="", hplcms_admins="")
-    assert p.resolve("alice", s) == "hplcms_user"
-    assert p.resolve("ALICE", s) == "hplcms_user"  # case-insensitive (static path)
+    assert p.resolve("alice", s) == "user"
+    assert p.resolve("ALICE", s) == "user"  # case-insensitive (static path)
     assert p.resolve("stranger", s) is None
     assert p.has_central_roster() is False
 
 
 def test_central_overrides_static_after_refresh():
-    payload = {"entries": [{"owner": "alice@x.com", "role": "hplcms_admin"}]}
+    payload = {"entries": [{"owner": "alice@x.com", "role": "service"}]}
     p = RosterProvider(fetcher=lambda u, t, k: payload)
     s = _settings(roster_url="http://auth/roster", hte_users="*")  # static would allow anyone
     assert p.refresh(s) is True
     assert p.has_central_roster() is True
-    assert p.resolve("alice@x.com", s) == "hplcms_admin"
-    assert p.resolve("Alice@x.com", s) == "hplcms_admin"  # case-insensitive
+    assert p.resolve("alice@x.com", s) == "service"
+    assert p.resolve("Alice@x.com", s) == "service"  # case-insensitive
     assert p.resolve("stranger", s) is None  # central authoritative, not on the list
 
 
@@ -70,15 +70,15 @@ def test_refresh_failure_keeps_last_good():
     def flaky(url, timeout, api_key):
         calls["n"] += 1
         if calls["n"] == 1:
-            return {"entries": [{"owner": "alice@x.com", "role": "hte"}]}
+            return {"entries": [{"owner": "alice@x.com", "role": "automation"}]}
         raise OSError("central down")
 
     p = RosterProvider(fetcher=flaky)
     s = _settings(roster_url="http://auth/roster")
     assert p.refresh(s) is True
-    assert p.resolve("alice@x.com", s) == "hte"
+    assert p.resolve("alice@x.com", s) == "automation"
     assert p.refresh(s) is False  # second pull fails...
-    assert p.resolve("alice@x.com", s) == "hte"  # ...last-good retained
+    assert p.resolve("alice@x.com", s) == "automation"  # ...last-good retained
     assert p.has_central_roster() is True
 
 

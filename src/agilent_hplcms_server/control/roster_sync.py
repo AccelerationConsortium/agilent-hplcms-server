@@ -32,7 +32,7 @@ from .roster import Role, resolve_role
 
 logger = logging.getLogger(__name__)
 
-_VALID_ROLES = frozenset({"hplcms_user", "hte", "hplcms_admin"})
+_VALID_ROLES = frozenset({"user", "automation", "service"})
 
 # (url, timeout_s, api_key) -> parsed JSON payload. Injectable for tests.
 RosterFetcher = Callable[[str, float, str], dict]
