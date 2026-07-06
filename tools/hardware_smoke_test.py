@@ -9,17 +9,31 @@ Run it against a *staging* instance first (the new build on port 8011, alongside
 the existing NSSM service on 8010), with the instrument idle and someone
 watching. Only promote the build to the NSSM service after this passes.
 
+Owners must be on the device roster (static env lists or the central
+ac-organic-lab roster). Validated owners for this instrument: an automation
+owner (e.g. hte-orchestrator@lab.local) for --owner and a service owner
+(e.g. yangcyril.cao@utoronto.ca) for --admin-owner.
+
 Usage (PowerShell, on the instrument PC):
 
     # read-only + claim + refusal checks (no hardware motion):
-    uv run python tools/hardware_smoke_test.py --base-url http://localhost:8011
+    uv run python tools/hardware_smoke_test.py --base-url http://localhost:8011 `
+        --owner hte-orchestrator@lab.local --admin-owner yangcyril.cao@utoronto.ca
 
     # include the single real run + standby (use the manual/rear tray):
-    uv run python tools/hardware_smoke_test.py --base-url http://localhost:8011 \
+    uv run python tools/hardware_smoke_test.py --base-url http://localhost:8011 `
+        --owner hte-orchestrator@lab.local --admin-owner yangcyril.cao@utoronto.ca `
         --run-hardware --tray rear --well A1 --output-dir C:/CDSProjects/Installation/Results/SmokeTest
 
 Exit code 0 = all attempted stages passed; non-zero = a check failed (the claim
 is always released on the way out).
+
+Gotcha: if Stage 4 aborts with an OpenLab "Hardware error" (pusher/needle hit
+the vessel top at e.g. D4B-A1), the physical labware does not match the plate
+type / container geometry configured for that drawer in OpenLab. Raise/seat the
+plate correctly (or fix the drawer's container type in OpenLab) and rerun. This
+is NOT a sidecar/roster/tray-mapping issue — plate geometry is not part of the
+run request.
 
 Stdlib only - no third-party deps, so it runs with any Python on the PC.
 """
