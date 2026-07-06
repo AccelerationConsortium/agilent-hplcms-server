@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.tmp_pytest/
 .coverage
 htmlcov/
 dist/
@@ -12,3 +13,5 @@ build/
 .vscode/
 .DS_Store
 uv.lock.bak
+sensor_probe_tmp.log
+*.log

@@ -1,0 +1,19 @@
+{
+  "openlab_acquisition_alive": true,
+  "openlab_instrument_service_alive": true,
+  "openlab_reverse_proxy_alive": true,
+  "moses_process_alive": false,
+  "moses_process_pid": null,
+  "last_run_dir": "C:\\CDSProjects\\Installation\\Results\\Han\\HH243\\HH243-00-00_A1_2026-05-02_13-40-37.sirslt",
+  "last_run_mtime_iso8601": "2026-05-02T17:41:00+00:00",
+  "last_run_mtime_epoch": 1.0e9,
+  "acquisition_active": false,
+  "olss_instrument_state": "Idle",
+  "olss_software_status": "Paused",
+  "olss_current_run": "Paused OpenLab sequence",
+  "olss_error": null,
+  "last_error": null,
+  "last_error_log_path": null,
+  "last_observation_at": "2026-05-07T11:42:35+00:00",
+  "probe_error": null
+}

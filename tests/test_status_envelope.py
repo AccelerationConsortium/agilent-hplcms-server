@@ -1,4 +1,4 @@
-"""Tests for the STATUS_SPEC v1.0 endpoints exposed by the sidecar."""
+"""Tests for the STATUS_SPEC v1.1 endpoints exposed by the sidecar."""
 
 from __future__ import annotations
 
@@ -72,6 +72,8 @@ def test_openapi_present():
     [
         ("signals_ready.json", "ready"),
         ("signals_busy.json", "busy"),
+        ("signals_olss_run.json", "busy"),
+        ("signals_olss_paused.json", "busy"),
         ("signals_requires_init.json", "requires_init"),
         ("signals_error.json", "error"),
         ("signals_unknown.json", "unknown"),
@@ -114,6 +116,31 @@ def test_error_passes_through_last_error():
     assert body["details"]["last_error_log_path"].endswith("InstrumentService.log")
 
 
+def test_olss_run_marks_status_busy_without_filesystem_acquisition():
+    client, _ = _client_with_signals(_load("signals_olss_run.json"))
+    body = client.get("/status").json()
+
+    assert body["equipment_status"] == "busy"
+    assert body["message"] == "OpenLab acquisition active (instrument state: Running)"
+    assert body["details"]["olss_current_run"] == "Direct OpenLab sequence"
+    assert body["components"]["hplc"]["state"] == "busy"
+    assert body["components"]["ms"]["state"] == "busy"
+
+
+def test_olss_paused_maps_to_busy_with_required_action():
+    """v1.1: a paused OpenLab sequence is reported as busy (paused is not a
+    legal EquipmentState) but still surfaces the resume action; the precise
+    OLSS status survives in details + the component state."""
+    client, _ = _client_with_signals(_load("signals_olss_paused.json"))
+    body = client.get("/status").json()
+
+    assert body["equipment_status"] == "busy"
+    assert body["required_actions"] == ["resume_paused_sequence"]
+    assert body["details"]["olss_software_status"] == "Paused"
+    assert body["components"]["hplc"]["state"] == "paused"
+    assert body["components"]["ms"]["state"] == "paused"
+
+
 def test_status_is_side_effect_free():
     """Calling /status N times must call the probe N times and never mutate state."""
     client, calls = _client_with_signals(_load("signals_ready.json"))
@@ -139,3 +166,34 @@ def test_details_carries_instrument_label_and_paths():
     assert body["details"]["openlab_log_dir"]
     assert body["details"]["cds_results_dir"]
     assert body["details"]["probe_version"]
+
+
+def test_metrics_are_wrapped_with_units_and_omit_unknowns():
+    signals = _load("signals_ready.json")
+    signals.update(
+        {
+            "olss_instrument_state": "Idle",
+            "vacuum_level_mbar": 5.2e-6,
+            "source_temperature_c": 120.0,
+            "turbopump_ready": True,
+        }
+    )
+    client, _ = _client_with_signals(signals)
+
+    metrics = client.get("/status").json()["metrics"]
+
+    assert metrics["vacuum_level_mbar"] == {"value": 5.2e-6, "unit": "mbar", "timestamp": None}
+    assert metrics["source_temperature_c"]["unit"] == "\u00b0C"
+    assert metrics["turbopump_ready"] == {"value": True, "unit": None, "timestamp": None}
+    assert metrics["ms_communication_ok"]["value"] is True
+    assert "solvent_a_volume_ml" not in metrics
+
+
+def test_communication_metrics_are_unknown_without_olss_state():
+    client, _ = _client_with_signals(_load("signals_ready.json"))
+
+    metrics = client.get("/status").json()["metrics"]
+
+    assert "ms_communication_ok" not in metrics
+    assert "pump_communication_ok" not in metrics
+    assert "autosampler_communication_ok" not in metrics
