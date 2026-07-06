@@ -193,7 +193,8 @@ class MosesRunner:
         analysis / reprocessing does not halt the queue. Job completion is driven
         by process exit in :meth:`poll`, never by OLSS.
         """
-        run_active = olss_current_run is not None
+        current_run = (olss_current_run or "").strip().casefold()
+        run_active = bool(current_run) and current_run != "no active run"
         with self._lock:
             # Streak counts observations of "a real OLSS run while we hold no
             # active job" — the signature of a technician acquiring directly.

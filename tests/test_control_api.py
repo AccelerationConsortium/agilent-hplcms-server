@@ -717,6 +717,15 @@ def test_no_servicing_during_data_analysis():
     assert runner.is_servicing(s) is False
 
 
+def test_no_servicing_when_olss_reports_no_active_run_label():
+    """Some OLSS responses label the empty currentRun as 'no active run'."""
+    runner = MosesRunner()
+    s = Settings(servicing_debounce_polls=1)
+    runner.notify_olss_state("Sleep", "OK", "no active run")
+    runner.notify_olss_state("Sleep", "OK", "no active run")
+    assert runner.is_servicing(s) is False
+
+
 def test_not_servicing_while_our_job_active():
     """A real OLSS run with an active sidecar job is OUR run, not a technician."""
     runner = MosesRunner()

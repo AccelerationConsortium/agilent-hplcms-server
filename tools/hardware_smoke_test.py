@@ -161,15 +161,15 @@ def stage_claim(base: str, owner: str, session_id: str) -> dict:
 def stage_workflow(base: str) -> None:
     """Exercise the equipment-blocking workflow lock (no hardware motion).
 
-    Requires the claim owner to be an HTE platform user (role 'hte'); an
-    'hplcms' owner would get 403 role_forbidden here.
+    Requires the claim owner to be an HTE platform user (role 'automation'); a
+    plain user owner would get 403 role_forbidden here.
     """
     _section("Stage 3b - workflow lock (precedence #2, no hardware)")
 
     code, body = _request("POST", f"{base}/control/workflow/start")
     started = code == 200 and isinstance(body, dict) and body.get("status") == "workflow_started"
     if not _check("POST /control/workflow/start -> 200 workflow_started", started, str(body)[:200]):
-        # If the owner lacks the hte role, skip the rest cleanly.
+        # If the owner lacks the automation role, skip the rest cleanly.
         return
 
     code, st = _request("GET", f"{base}/status")
@@ -218,8 +218,8 @@ def stage_service(base: str, admin_owner: str, session_id: str) -> None:
         return
     assert isinstance(body, dict)
     _TOKEN = body["claim_token"]
-    if not _check(f"admin claim resolved role 'hplcms_admin' (is {admin_owner!r} in HPLCMS_ADMINS?)",
-                  body.get("role") == "hplcms_admin", f"role={body.get('role')}"):
+    if not _check(f"admin claim resolved role 'service' (is {admin_owner!r} a service owner?)",
+                  body.get("role") == "service", f"role={body.get('role')}"):
         _request("POST", f"{base}/control/release")
         _TOKEN = None
         return
