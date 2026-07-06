@@ -62,12 +62,12 @@ Mutating endpoints (marked 🔒) require a valid `X-Claim-Token` header — acqu
 
 ### Sample submission & trays
 
-A run carries a `plate_format` (`96-well` / `384-well`) and a list of samples addressed by **tray + well**; the sidecar composes the Agilent autosampler position (`{drawer}-{well}`, e.g. `D4B-A1`) for Moses and rejects off-plate wells with `422`.
+A run carries an optional `plate_format` and a list of samples addressed by **tray + well**; the sidecar composes the Agilent autosampler position (`{drawer}-{well}`, e.g. `D4B-A1`) for Moses and rejects off-plate wells with `422`.
 
 ```jsonc
 {
   "output_dir": "C:/CDSProjects/Installation/Results/Batch",
-  "plate_format": "96-well",
+  "plate_format": "54-vial",        // optional; asserted against configured labware
   "submitter": "manual",            // or "robot"
   "gradient": { /* ... */ },
   "samples": [
@@ -79,6 +79,29 @@ A run carries a `plate_format` (`96-well` / `384-well`) and a list of samples ad
 **Tray reservation.** The **front** tray is reserved for robotic sample submission (`RESERVED_ROBOT_TRAY`, default `front`); manual runs use the rear tray. A run with `submitter != "robot"` that targets the reserved tray is refused with **412 `reserved_for_robot`**; a `submitter: "robot"` run is allowed in. Set `RESERVED_ROBOT_TRAY=""` to disable the reservation.
 
 > The logical tray → Agilent drawer-code mapping is config: `TRAY_FRONT_DRAWER` (default `D1F`, the confirmed robot tray) and `TRAY_REAR_DRAWER` (default `D4B`, matches the existing example — confirm against this instrument's multisampler before deploying).
+
+### Labware matching (real plate geometry)
+
+The built-in `plate_format` check only knows the canonical `96-well` / `384-well` / `54-vial` formats. The autosampler on this instrument holds a **54-vial plate (6 rows × 9 cols)**, so a well like `G1` is valid for a 96-well plate but *off* the real plate — a needle-crash risk. Point `LABWARE_CONFIG_PATH` at a JSON file declaring the plate loaded in each tray, and the sidecar validates every submission against that **actual geometry** (authoritative), refusing mismatches with **422 `plate_mismatch`**:
+
+- an off-plate `well` for the configured plate,
+- a declared `plate_format` that disagrees with the loaded plate type, or
+- a tray with no configured labware.
+
+Generate the config from the instrument's real OpenLab Sample Container configuration — `tools/capture_autosampler_config.py` decodes the geometry OpenLab writes into every result folder's `.scml` snapshot:
+
+```powershell
+# inspect the plate-type catalog (rows×cols, well heights) OpenLab knows about:
+uv run python tools/capture_autosampler_config.py
+
+# write a ready labware config, assigning a captured plate type to each tray:
+uv run python tools/capture_autosampler_config.py `
+    --assign rear="*54VialPlate*" front="*54VialPlate*" `
+    --out C:/SDL_Tools/labware_config.json
+setx LABWARE_CONFIG_PATH C:\SDL_Tools\labware_config.json   # then restart the sidecar
+```
+
+The drawer→plate assignment is an explicit human choice (safety-critical); the tool fills in the exact geometry. Leave `LABWARE_CONFIG_PATH` unset to fall back to the built-in `plate_format` check.
 
 ## Loopback verification
 
@@ -326,6 +349,10 @@ Writes to `C:\SDL_Tools\hplcms_sensor_data.json` every 30 seconds (override via 
 | `ROSTER_REFRESH_INTERVAL_S` | `60` | How often to re-pull the central roster. |
 | `ROSTER_HTTP_TIMEOUT_S` | `5` | Timeout for a single central-roster pull. |
 | `ROSTER_API_KEY` | _(empty)_ | Optional `X-Api-Key` sent with the roster pull (endpoint is Tailnet-only by default). |
+| `TRAY_FRONT_DRAWER` | `D1F` | Agilent drawer code for the logical **front** tray (the robot-reserved tray). |
+| `TRAY_REAR_DRAWER` | `D4B` | Agilent drawer code for the logical **rear** tray (the manual tray). |
+| `RESERVED_ROBOT_TRAY` | `front` | Tray reserved for `submitter="robot"` runs; others get 412 `reserved_for_robot`. `""` disables. |
+| `LABWARE_CONFIG_PATH` | _(empty)_ | JSON mapping each tray to the plate actually loaded in it; enables labware-aware validation (422 `plate_mismatch`). Generate with `tools/capture_autosampler_config.py`. Empty → built-in `plate_format` check only. |
 
 ### Sensor daemon
 

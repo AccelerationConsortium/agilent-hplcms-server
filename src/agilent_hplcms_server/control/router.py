@@ -6,6 +6,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, Response
 
 from ..config import Settings, load_settings
 from .claims import ClaimConflict, ClaimHolder
+from .labware import load_labware
 from .models import (
     AbortResponse,
     CancelResponse,
@@ -15,6 +16,7 @@ from .models import (
     EquipmentBusyError,
     HeartbeatResponse,
     InstrumentServicingError,
+    PlateMismatchError,
     QueueFullError,
     QueueResponse,
     QueueStatusResponse,
@@ -219,6 +221,65 @@ def _check_reserved_tray(body: RunRequest, settings: Settings) -> None:
         )
 
 
+def _check_labware(body: RunRequest, settings: Settings) -> None:
+    """Validate each sample against the plate ACTUALLY configured in its tray.
+
+    Authoritative, labware-aware geometry check (defence in depth beyond the
+    model's built-in ``plate_format`` check): with a labware config loaded it
+    rejects an unconfigured tray, a declared ``plate_format`` that does not match
+    the loaded plate type, and a ``well`` that is off the configured plate — the
+    last of which catches off-plate wells on non-canonical labware (e.g. a 6x9
+    54-vial plate) that the 96/384 built-in check cannot express. Raised before
+    enqueue so the job never reaches Moses. 422 (malformed request for the
+    physical plate); like other pre-enqueue validation it does not populate
+    ``last_error``. No labware configured -> no-op.
+    """
+    labware = load_labware(settings.labware_config_path)
+    if not labware.trays:
+        return
+    for s in body.samples:
+        plate = labware.for_tray(s.tray)
+        if plate is None:
+            raise HTTPException(
+                status_code=422,
+                detail=PlateMismatchError(
+                    detail=(
+                        f"Tray {s.tray!r} has no configured labware; submission refused."
+                    ),
+                    tray=s.tray,
+                    declared=body.plate_format,
+                    configured=None,
+                ).model_dump(mode="json"),
+            )
+        if body.plate_format is not None and body.plate_format != plate.plate_type:
+            raise HTTPException(
+                status_code=422,
+                detail=PlateMismatchError(
+                    detail=(
+                        f"Declared plate_format {body.plate_format!r} does not match the "
+                        f"{plate.plate_type!r} plate configured in the {s.tray!r} tray."
+                    ),
+                    tray=s.tray,
+                    declared=body.plate_format,
+                    configured=plate.plate_type,
+                ).model_dump(mode="json"),
+            )
+        if not plate.contains(s.well):
+            raise HTTPException(
+                status_code=422,
+                detail=PlateMismatchError(
+                    detail=(
+                        f"Well {s.well!r} is off the {plate.plate_type!r} plate "
+                        f"({plate.rows} rows x {plate.cols} cols) configured in the "
+                        f"{s.tray!r} tray."
+                    ),
+                    tray=s.tray,
+                    declared=body.plate_format,
+                    configured=plate.plate_type,
+                ).model_dump(mode="json"),
+            )
+
+
 def _do_enqueue(
     script_name: str,
     job: dict,
@@ -289,7 +350,8 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     - HTTP 409 ``instrument_servicing`` if a technician is driving OpenLab CDS.
     - HTTP 412 ``queue_full`` if the queue is at max depth (with ``Retry-After``).
     - HTTP 412 ``reserved_for_robot`` if a non-robot run targets the reserved tray.
-    - HTTP 422 if any parameter is out of hardware range or a ``well`` is off-plate.
+    - HTTP 422 if any parameter is out of hardware range, a ``well`` is off-plate,
+      or the sample does not match the tray's configured labware (``plate_mismatch``).
     - HTTP 423 if the ``X-Claim-Token`` is missing or stale (``workflow_active`` if
       a workflow holds the lock).
     """
@@ -303,6 +365,7 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     _check_requires_init(signals)
     _check_servicing(request, signals)
     _check_reserved_tray(body, settings)
+    _check_labware(body, settings)
 
     job = _compose_moses_job(body, settings)
     run_id, position = _do_enqueue(
@@ -360,6 +423,7 @@ def post_to_queue(body: RunRequest, request: Request) -> QueueResponse:
     _check_requires_init(signals)
     _check_servicing(request, signals)
     _check_reserved_tray(body, settings)
+    _check_labware(body, settings)
 
     job = _compose_moses_job(body, settings)
     queue_id, position = _do_enqueue(

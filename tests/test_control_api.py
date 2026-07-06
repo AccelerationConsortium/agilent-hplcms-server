@@ -339,6 +339,101 @@ def test_run_422_sample_name_with_spaces():
 
 
 # ---------------------------------------------------------------------------
+# Labware matching (config-driven plate geometry, control/labware.py)
+# ---------------------------------------------------------------------------
+
+def _labware_settings(tmp_path, trays: dict, **overrides) -> Settings:
+    """Write a labware config file and return settings pointing at it."""
+    from agilent_hplcms_server.control.labware import load_labware
+
+    path = tmp_path / "labware.json"
+    path.write_text(json.dumps({"trays": trays}), encoding="utf-8")
+    load_labware.cache_clear()  # avoid a stale cache from another test's file
+    return _settings(labware_config_path=str(path), **overrides)
+
+
+# The rear tray physically holds a 6x9 54-vial plate on this instrument.
+_REAR_54VIAL = {"rear": {"plate_type": "54-vial", "rows": 6, "cols": 9, "num_locations": 54}}
+
+
+def test_run_accepts_well_on_configured_plate(tmp_path):
+    runner = FakeRunner(busy=False)
+    settings = _labware_settings(tmp_path, _REAR_54VIAL)
+    client = _authed_client(_load("signals_ready.json"), runner=runner, settings=settings)
+    # F9 is the last well of a 6x9 plate — valid here.
+    body = {**VALID_RUN_BODY, "samples": [
+        {"sample_name": "s1", "tray": "rear", "well": "F9", "injection_volume": 2.0}
+    ]}
+    r = client.post("/control/run", json=body)
+    assert r.status_code == 202, r.text
+
+
+def test_run_rejects_well_off_configured_54vial_plate(tmp_path):
+    """G1 passes the built-in 96-well check but is off a 6x9 54-vial plate."""
+    runner = FakeRunner(busy=False)
+    settings = _labware_settings(tmp_path, _REAR_54VIAL)
+    client = _authed_client(_load("signals_ready.json"), runner=runner, settings=settings)
+    body = {**VALID_RUN_BODY, "samples": [
+        {"sample_name": "s1", "tray": "rear", "well": "G1", "injection_volume": 2.0}
+    ]}
+    r = client.post("/control/run", json=body)
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "plate_mismatch"
+    assert detail["configured"] == "54-vial"
+    assert detail["tray"] == "rear"
+
+
+def test_run_rejects_declared_plate_format_mismatch(tmp_path):
+    runner = FakeRunner(busy=False)
+    settings = _labware_settings(tmp_path, _REAR_54VIAL)
+    client = _authed_client(_load("signals_ready.json"), runner=runner, settings=settings)
+    body = {**VALID_RUN_BODY, "plate_format": "96-well", "samples": [
+        {"sample_name": "s1", "tray": "rear", "well": "A1", "injection_volume": 2.0}
+    ]}
+    r = client.post("/control/run", json=body)
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "plate_mismatch"
+    assert detail["declared"] == "96-well"
+    assert detail["configured"] == "54-vial"
+
+
+def test_run_rejects_unconfigured_tray(tmp_path):
+    """Rear submission when only the front tray has configured labware."""
+    runner = FakeRunner(busy=False)
+    trays = {"front": {"plate_type": "96-well", "rows": 8, "cols": 12}}
+    settings = _labware_settings(tmp_path, trays)
+    client = _authed_client(_load("signals_ready.json"), runner=runner, settings=settings)
+    r = client.post("/control/run", json=VALID_RUN_BODY)  # targets rear
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["error"] == "plate_mismatch"
+
+
+def test_run_matching_declared_plate_format_accepted(tmp_path):
+    runner = FakeRunner(busy=False)
+    settings = _labware_settings(tmp_path, _REAR_54VIAL)
+    client = _authed_client(_load("signals_ready.json"), runner=runner, settings=settings)
+    body = {**VALID_RUN_BODY, "plate_format": "54-vial", "samples": [
+        {"sample_name": "s1", "tray": "rear", "well": "A1", "injection_volume": 2.0}
+    ]}
+    r = client.post("/control/run", json=body)
+    assert r.status_code == 202, r.text
+
+
+def test_run_no_labware_config_uses_legacy_check():
+    """With no labware config, the built-in 96-well check still applies."""
+    runner = FakeRunner(busy=False)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)  # no labware
+    # G1 is valid for the default 96-well built-in geometry -> accepted.
+    body = {**VALID_RUN_BODY, "samples": [
+        {"sample_name": "s1", "tray": "rear", "well": "G1", "injection_volume": 2.0}
+    ]}
+    r = client.post("/control/run", json=body)
+    assert r.status_code == 202, r.text
+
+
+# ---------------------------------------------------------------------------
 # POST /control/queue
 # ---------------------------------------------------------------------------
 

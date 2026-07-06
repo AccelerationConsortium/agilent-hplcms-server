@@ -11,13 +11,26 @@ from pydantic import BaseModel, Field, model_validator
 from ..models import ClaimedBy
 
 
-# Autosampler tray + plate geometry. Kept byte-for-byte in sync with the lab
-# skill catalog (ac-organic-lab: lab_skills/skill_catalog/hplc.py) so the SDK
-# and this device validate sample addresses identically. The device is the
-# authoritative validator; the catalog mirrors these definitions.
+# Autosampler tray + plate geometry. The canonical formats mirror the lab skill
+# catalog (ac-organic-lab: lab_skills/skill_catalog/hplc.py) so the SDK and this
+# device validate sample addresses consistently; the device is the authoritative
+# validator. NOTE: the catalog still hardcodes 96/384 only — extend it to add
+# "54-vial" and make plate_format optional so SDK clients can submit against the
+# real labware here (see the labware layer below).
+#
+# ``_BUILTIN_PLATE_GEOMETRY`` covers the canonical formats a client may declare
+# via ``plate_format``. The *actual* container loaded in each tray can be
+# declared per deployment (control/labware.py, LABWARE_CONFIG_PATH); when it is,
+# the router validates against that real geometry (defence in depth), which is
+# how off-plate wells on non-canonical labware (e.g. a 6x9 54-vial plate) are
+# caught. A plate_format not listed here is treated as a custom type whose
+# geometry is validated only at the router against the configured labware.
 TrayName = Literal["front", "rear"]
-PlateFormat = Literal["96-well", "384-well"]
-_PLATE_GEOMETRY: dict[str, tuple[int, int]] = {"96-well": (8, 12), "384-well": (16, 24)}
+_BUILTIN_PLATE_GEOMETRY: dict[str, tuple[int, int]] = {
+    "96-well": (8, 12),
+    "384-well": (16, 24),
+    "54-vial": (6, 9),
+}
 _WELL_RE = re.compile(r"^([A-Za-z])(\d{1,2})$")
 
 
@@ -66,8 +79,15 @@ class RunRequest(BaseModel):
     standby_after: bool = True
     gradient: GradientConfig
     samples: list[SampleConfig] = Field(min_length=1, description="At least one sample required.")
-    plate_format: PlateFormat = Field(
-        default="96-well", description="Plate format for all samples in this run."
+    plate_format: str | None = Field(
+        default=None,
+        description=(
+            "Declared plate type for all samples in this run, asserted against the "
+            "tray's configured labware (LABWARE_CONFIG_PATH). None trusts the device's "
+            "configured labware; when no labware is configured, None assumes '96-well' "
+            "for the built-in well-range check. Canonical types: '96-well', '384-well', "
+            "'54-vial'."
+        ),
     )
     submitter: Literal["manual", "robot"] = Field(
         default="manual",
@@ -83,8 +103,14 @@ class RunRequest(BaseModel):
 
         Mirrors the lab skill catalog's geometry check so a request rejected by
         the SDK and one rejected by the device fail for the identical reason.
+        A ``plate_format`` outside the built-in set is a custom type: geometry is
+        validated at the router against the configured labware, so skip here.
         """
-        rows, cols = _PLATE_GEOMETRY[self.plate_format]
+        fmt = self.plate_format or "96-well"
+        geometry = _BUILTIN_PLATE_GEOMETRY.get(fmt)
+        if geometry is None:
+            return self
+        rows, cols = geometry
         for s in self.samples:
             m = _WELL_RE.match(s.well)
             if m is None:
@@ -93,7 +119,7 @@ class RunRequest(BaseModel):
             col = int(m.group(2))
             if not (0 <= row_idx < rows) or not (1 <= col <= cols):
                 raise ValueError(
-                    f"Well {s.well!r} is out of range for a {self.plate_format} plate."
+                    f"Well {s.well!r} is out of range for a {fmt} plate."
                 )
         return self
 
@@ -216,6 +242,26 @@ class ReservedForRobotError(BaseModel):
     error: Literal["reserved_for_robot"] = "reserved_for_robot"
     detail: str
     reserved_tray: str
+
+
+class PlateMismatchError(BaseModel):
+    """Body for HTTP 422 when a submitted sample does not match the plate
+    actually configured in its autosampler tray (see control/labware.py):
+
+    - the tray has no configured labware,
+    - the declared ``plate_format`` disagrees with the loaded plate type, or
+    - the ``well`` is off the configured plate's row/column geometry.
+
+    This is the authoritative, labware-aware geometry check that catches
+    off-plate wells on non-canonical labware (e.g. a 6x9 54-vial plate), which
+    the built-in ``plate_format`` check in RunRequest cannot express.
+    """
+
+    error: Literal["plate_mismatch"] = "plate_mismatch"
+    detail: str
+    tray: str
+    declared: str | None = None
+    configured: str | None = None
 
 
 class InstrumentServicingError(BaseModel):
