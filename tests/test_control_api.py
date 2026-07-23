@@ -226,8 +226,8 @@ VALID_RUN_BODY = {
         "gradient_table": [[0.0, 0.05], [1.0, 0.05], [7.0, 1.0], [9.8, 1.0], [9.9, 0.05]],
     },
     "samples": [
-        # Rear tray is the manual/open tray; front is reserved for the robot.
-        {"sample_name": "cpd_01", "tray": "rear", "well": "A1", "injection_volume": 2.0}
+        # D4B is an unreserved manual drawer; D1F is reserved for the robot.
+        {"sample_name": "cpd_01", "sample_position": "D4B-A1", "injection_volume": 2.0}
     ],
 }
 
@@ -294,7 +294,7 @@ def test_run_422_injection_volume_too_large():
     runner = FakeRunner(busy=False)
     client = _client(_load("signals_ready.json"), runner=runner)
     bad = {**VALID_RUN_BODY, "samples": [
-        {"sample_name": "s1", "tray": "rear", "well": "A1", "injection_volume": 999.0}
+        {"sample_name": "s1", "sample_position": "D4B-A1", "injection_volume": 999.0}
     ]}
     r = client.post("/control/run", json=bad)
     assert r.status_code == 422
@@ -332,7 +332,7 @@ def test_run_422_sample_name_with_spaces():
     runner = FakeRunner(busy=False)
     client = _client(_load("signals_ready.json"), runner=runner)
     bad = {**VALID_RUN_BODY, "samples": [
-        {"sample_name": "has spaces", "tray": "rear", "well": "A1", "injection_volume": 2.0}
+        {"sample_name": "has spaces", "sample_position": "D4B-A1", "injection_volume": 2.0}
     ]}
     r = client.post("/control/run", json=bad)
     assert r.status_code == 422
@@ -342,27 +342,27 @@ def test_run_422_sample_name_with_spaces():
 # Labware matching (config-driven plate geometry, control/labware.py)
 # ---------------------------------------------------------------------------
 
-def _labware_settings(tmp_path, trays: dict, **overrides) -> Settings:
+def _labware_settings(tmp_path, drawers: dict, **overrides) -> Settings:
     """Write a labware config file and return settings pointing at it."""
     from agilent_hplcms_server.control.labware import load_labware
 
     path = tmp_path / "labware.json"
-    path.write_text(json.dumps({"trays": trays}), encoding="utf-8")
+    path.write_text(json.dumps({"drawers": drawers}), encoding="utf-8")
     load_labware.cache_clear()  # avoid a stale cache from another test's file
     return _settings(labware_config_path=str(path), **overrides)
 
 
-# The rear tray physically holds a 6x9 54-vial plate on this instrument.
-_REAR_54VIAL = {"rear": {"plate_type": "54-vial", "rows": 6, "cols": 9, "num_locations": 54}}
+# The D4B drawer physically holds a 6x9 54-vial plate on this instrument.
+_D4B_54VIAL = {"D4B": {"plate_type": "54-vial", "rows": 6, "cols": 9, "num_locations": 54}}
 
 
 def test_run_accepts_well_on_configured_plate(tmp_path):
     runner = FakeRunner(busy=False)
-    settings = _labware_settings(tmp_path, _REAR_54VIAL)
+    settings = _labware_settings(tmp_path, _D4B_54VIAL)
     client = _authed_client(_load("signals_ready.json"), runner=runner, settings=settings)
     # F9 is the last well of a 6x9 plate — valid here.
     body = {**VALID_RUN_BODY, "samples": [
-        {"sample_name": "s1", "tray": "rear", "well": "F9", "injection_volume": 2.0}
+        {"sample_name": "s1", "sample_position": "D4B-F9", "injection_volume": 2.0}
     ]}
     r = client.post("/control/run", json=body)
     assert r.status_code == 202, r.text
@@ -371,25 +371,25 @@ def test_run_accepts_well_on_configured_plate(tmp_path):
 def test_run_rejects_well_off_configured_54vial_plate(tmp_path):
     """G1 passes the built-in 96-well check but is off a 6x9 54-vial plate."""
     runner = FakeRunner(busy=False)
-    settings = _labware_settings(tmp_path, _REAR_54VIAL)
+    settings = _labware_settings(tmp_path, _D4B_54VIAL)
     client = _authed_client(_load("signals_ready.json"), runner=runner, settings=settings)
     body = {**VALID_RUN_BODY, "samples": [
-        {"sample_name": "s1", "tray": "rear", "well": "G1", "injection_volume": 2.0}
+        {"sample_name": "s1", "sample_position": "D4B-G1", "injection_volume": 2.0}
     ]}
     r = client.post("/control/run", json=body)
     assert r.status_code == 422, r.text
     detail = r.json()["detail"]
     assert detail["error"] == "plate_mismatch"
     assert detail["configured"] == "54-vial"
-    assert detail["tray"] == "rear"
+    assert detail["drawer"] == "D4B"
 
 
 def test_run_rejects_declared_plate_format_mismatch(tmp_path):
     runner = FakeRunner(busy=False)
-    settings = _labware_settings(tmp_path, _REAR_54VIAL)
+    settings = _labware_settings(tmp_path, _D4B_54VIAL)
     client = _authed_client(_load("signals_ready.json"), runner=runner, settings=settings)
     body = {**VALID_RUN_BODY, "plate_format": "96-well", "samples": [
-        {"sample_name": "s1", "tray": "rear", "well": "A1", "injection_volume": 2.0}
+        {"sample_name": "s1", "sample_position": "D4B-A1", "injection_volume": 2.0}
     ]}
     r = client.post("/control/run", json=body)
     assert r.status_code == 422, r.text
@@ -399,23 +399,23 @@ def test_run_rejects_declared_plate_format_mismatch(tmp_path):
     assert detail["configured"] == "54-vial"
 
 
-def test_run_rejects_unconfigured_tray(tmp_path):
-    """Rear submission when only the front tray has configured labware."""
+def test_run_rejects_unconfigured_drawer(tmp_path):
+    """D4B submission when only the D1F drawer has configured labware."""
     runner = FakeRunner(busy=False)
-    trays = {"front": {"plate_type": "96-well", "rows": 8, "cols": 12}}
-    settings = _labware_settings(tmp_path, trays)
+    drawers = {"D1F": {"plate_type": "96-well", "rows": 8, "cols": 12}}
+    settings = _labware_settings(tmp_path, drawers)
     client = _authed_client(_load("signals_ready.json"), runner=runner, settings=settings)
-    r = client.post("/control/run", json=VALID_RUN_BODY)  # targets rear
+    r = client.post("/control/run", json=VALID_RUN_BODY)  # targets D4B
     assert r.status_code == 422, r.text
     assert r.json()["detail"]["error"] == "plate_mismatch"
 
 
 def test_run_matching_declared_plate_format_accepted(tmp_path):
     runner = FakeRunner(busy=False)
-    settings = _labware_settings(tmp_path, _REAR_54VIAL)
+    settings = _labware_settings(tmp_path, _D4B_54VIAL)
     client = _authed_client(_load("signals_ready.json"), runner=runner, settings=settings)
     body = {**VALID_RUN_BODY, "plate_format": "54-vial", "samples": [
-        {"sample_name": "s1", "tray": "rear", "well": "A1", "injection_volume": 2.0}
+        {"sample_name": "s1", "sample_position": "D4B-A1", "injection_volume": 2.0}
     ]}
     r = client.post("/control/run", json=body)
     assert r.status_code == 202, r.text
@@ -427,7 +427,7 @@ def test_run_no_labware_config_uses_legacy_check():
     client = _authed_client(_load("signals_ready.json"), runner=runner)  # no labware
     # G1 is valid for the default 96-well built-in geometry -> accepted.
     body = {**VALID_RUN_BODY, "samples": [
-        {"sample_name": "s1", "tray": "rear", "well": "G1", "injection_volume": 2.0}
+        {"sample_name": "s1", "sample_position": "D4B-G1", "injection_volume": 2.0}
     ]}
     r = client.post("/control/run", json=body)
     assert r.status_code == 202, r.text
@@ -1371,28 +1371,38 @@ def test_allowed_actions_helper_matches_refusal_property():
 
 
 # ---------------------------------------------------------------------------
-# tray + well → sample_position composition, plate geometry, robot reservation
+# sample_position pass-through, plate geometry, robot reservation
 # ---------------------------------------------------------------------------
 
-def test_run_composes_sample_position_from_tray_well():
-    """The device composes {drawer}-{well} from logical {tray, well}; the
-    sidecar-only fields plate_format/submitter are not forwarded to Moses."""
+def test_run_forwards_sample_position_verbatim():
+    """The device forwards sample_position to Moses unchanged; the sidecar-only
+    fields plate_format/submitter are not forwarded."""
     runner = FakeRunner(busy=False)
     client = _authed_client(_load("signals_ready.json"), runner=runner)
     body = {**VALID_RUN_BODY, "samples": [
-        {"sample_name": "cpd_01", "tray": "front", "well": "A1", "injection_volume": 2.0},
-        {"sample_name": "cpd_02", "tray": "rear", "well": "H12", "injection_volume": 1.0},
-    ], "submitter": "robot"}  # robot so the front (reserved) sample is allowed
+        {"sample_name": "cpd_01", "sample_position": "D1F-A1", "injection_volume": 2.0},
+        {"sample_name": "cpd_02", "sample_position": "D4B-H12", "injection_volume": 1.0},
+    ], "submitter": "robot"}  # robot so the D1F (reserved) sample is allowed
     r = client.post("/control/run", json=body)
     assert r.status_code == 202, r.text
     job = runner.submitted[0]["job"]
-    # Defaults: front → D1F, rear → D4B (config.Settings).
     assert job["samples"][0]["sample_position"] == "D1F-A1"
     assert job["samples"][1]["sample_position"] == "D4B-H12"
-    assert "tray" not in job["samples"][0]
-    assert "well" not in job["samples"][0]
+    assert set(job["samples"][0]) == {"sample_name", "sample_position", "injection_volume"}
     assert "plate_format" not in job
     assert "submitter" not in job
+
+
+def test_run_422_malformed_sample_position():
+    """A sample_position that isn't D#X-Y1 is rejected at model validation (422)."""
+    runner = FakeRunner(busy=False)
+    client = _client(_load("signals_ready.json"), runner=runner)
+    for pos in ("A1", "D5B-A1", "front-A1", "D1X-A1", "D1B_A1", ""):
+        bad = {**VALID_RUN_BODY, "samples": [
+            {"sample_name": "x", "sample_position": pos, "injection_volume": 2.0}
+        ]}
+        r = client.post("/control/run", json=bad)
+        assert r.status_code == 422, f"{pos!r} should be rejected, got {r.status_code}"
 
 
 def test_run_422_well_off_plate_for_format():
@@ -1401,7 +1411,7 @@ def test_run_422_well_off_plate_for_format():
     client = _client(_load("signals_ready.json"), runner=runner)
     for well in ("A13", "I1"):
         bad = {**VALID_RUN_BODY, "samples": [
-            {"sample_name": "x", "tray": "front", "well": well, "injection_volume": 2.0}
+            {"sample_name": "x", "sample_position": f"D1F-{well}", "injection_volume": 2.0}
         ]}
         r = client.post("/control/run", json=bad)
         assert r.status_code == 422, f"{well!r} should be off a 96-well plate, got {r.status_code}"
@@ -1412,34 +1422,34 @@ def test_run_384_well_plate_accepts_high_wells():
     runner = FakeRunner(busy=False)
     client = _authed_client(_load("signals_ready.json"), runner=runner)
     body = {**VALID_RUN_BODY, "plate_format": "384-well", "submitter": "robot", "samples": [
-        {"sample_name": "x", "tray": "rear", "well": "P24", "injection_volume": 2.0}
+        {"sample_name": "x", "sample_position": "D4B-P24", "injection_volume": 2.0}
     ]}
     r = client.post("/control/run", json=body)
     assert r.status_code == 202, r.text
     assert runner.submitted[0]["job"]["samples"][0]["sample_position"] == "D4B-P24"
 
 
-def test_run_412_reserved_tray_for_manual_submitter():
-    """A manual run targeting the robot-reserved tray (default 'front') is refused 412."""
+def test_run_412_reserved_drawer_for_manual_submitter():
+    """A manual run targeting the robot-reserved drawer (default 'D1F') is refused 412."""
     runner = FakeRunner(busy=False)
     client = _authed_client(_load("signals_ready.json"), runner=runner)
     body = {**VALID_RUN_BODY, "samples": [
-        {"sample_name": "x", "tray": "front", "well": "A1", "injection_volume": 2.0}
+        {"sample_name": "x", "sample_position": "D1F-A1", "injection_volume": 2.0}
     ]}  # submitter defaults to "manual"
     r = client.post("/control/run", json=body)
     assert r.status_code == 412, r.text
     detail = r.json()["detail"]
     assert detail["error"] == "reserved_for_robot"
-    assert detail["reserved_tray"] == "front"
+    assert detail["reserved_drawer"] == "D1F"
     assert runner.submitted == []  # never enqueued
 
 
-def test_run_robot_submitter_allowed_on_reserved_tray():
+def test_run_robot_submitter_allowed_on_reserved_drawer():
     """submitter='robot' bypasses the reservation."""
     runner = FakeRunner(busy=False)
     client = _authed_client(_load("signals_ready.json"), runner=runner)
     body = {**VALID_RUN_BODY, "submitter": "robot", "samples": [
-        {"sample_name": "x", "tray": "front", "well": "A1", "injection_volume": 2.0}
+        {"sample_name": "x", "sample_position": "D1F-A1", "injection_volume": 2.0}
     ]}
     r = client.post("/control/run", json=body)
     assert r.status_code == 202, r.text

@@ -47,7 +47,7 @@ Mutating endpoints (marked 🔒) require a valid `X-Claim-Token` header — acqu
 | `POST /control/heartbeat` | Refresh the claim TTL (header `X-Claim-Token`). 204 on success; 401 if the token is unknown/expired. |
 | `POST /control/release` | Release the claim (header `X-Claim-Token`). Idempotent — always 204. |
 | `POST /control/startup` | Read-only readiness check — reports whether OpenLab processes are running. Never starts OpenLab. |
-| 🔒 `POST /control/run` | Submit a run. Starts immediately if idle; queues behind the active run if busy. Returns `status: "accepted"` or `"queued"`. 409 `instrument_servicing` when a technician holds the instrument; 412 `queue_full` (with `Retry-After`) when the queue is at depth; 412 `reserved_for_robot` when a manual run targets the robot-reserved tray; 423 `workflow_active` when a workflow holds the lock. |
+| 🔒 `POST /control/run` | Submit a run. Starts immediately if idle; queues behind the active run if busy. Returns `status: "accepted"` or `"queued"`. 409 `instrument_servicing` when a technician holds the instrument; 412 `queue_full` (with `Retry-After`) when the queue is at depth; 412 `reserved_for_robot` when a manual run targets the robot-reserved drawer; 423 `workflow_active` when a workflow holds the lock. |
 | 🔒 `POST /control/queue` | Submit a run and get back a `queue_id` for tracking. Same semantics as `/control/run` with a richer response. |
 | `GET /control/queue` | View all jobs (pending, running, recent done/failed) plus `instrument_online` and `accepting_jobs` signals. |
 | 🔒 `DELETE /control/queue/{queue_id}` | Cancel a pending job. 409 if it is currently running (use abort instead), 404 if already done. |
@@ -60,9 +60,9 @@ Mutating endpoints (marked 🔒) require a valid `X-Claim-Token` header — acqu
 
 `GET /status.allowed_actions` reports which of `run.submit` · `run.abort` · `queue.cancel` · `instrument.standby` · `workflow.start` · `workflow.end` the device will currently honour, mirroring the control-side *state* precondition refusals (enqueue verbs drop out when the queue is full, OpenLab is down, or a technician is servicing; `workflow.start`/`workflow.end` toggle on workflow state). `service.*` is an operator/dashboard control rather than an agent skill, so it is reported via `details.service_mode` instead of `allowed_actions`.
 
-### Sample submission & trays
+### Sample submission & positions
 
-A run carries an optional `plate_format` and a list of samples addressed by **tray + well**; the sidecar composes the Agilent autosampler position (`{drawer}-{well}`, e.g. `D4B-A1`) for Moses and rejects off-plate wells with `422`.
+A run carries an optional `plate_format` and a list of samples, each addressed by a single **`sample_position`** string `"D#X-Y1"` — the Agilent multisampler slot: drawer `D1`–`D4`, `F`(front)/`B`(back), then the well (e.g. `"D1B-A1"`). The sidecar forwards `sample_position` to Moses **verbatim** (it is exactly what the instrument consumes) and rejects off-plate wells with `422`.
 
 ```jsonc
 {
@@ -71,22 +71,22 @@ A run carries an optional `plate_format` and a list of samples addressed by **tr
   "submitter": "manual",            // or "robot"
   "gradient": { /* ... */ },
   "samples": [
-    {"sample_name": "cpd_01", "tray": "rear", "well": "A1", "injection_volume": 2.0}
+    {"sample_name": "cpd_01", "sample_position": "D4B-A1", "injection_volume": 2.0}
   ]
 }
 ```
 
-**Tray reservation.** The **front** tray is reserved for robotic sample submission (`RESERVED_ROBOT_TRAY`, default `front`); manual runs use the rear tray. A run with `submitter != "robot"` that targets the reserved tray is refused with **412 `reserved_for_robot`**; a `submitter: "robot"` run is allowed in. Set `RESERVED_ROBOT_TRAY=""` to disable the reservation.
+**Drawer reservation.** One drawer is reserved for robotic sample submission (`RESERVED_ROBOT_DRAWER`, default `D1F`). A run with `submitter != "robot"` whose `sample_position` targets the reserved drawer is refused with **412 `reserved_for_robot`**; a `submitter: "robot"` run is allowed in. Set `RESERVED_ROBOT_DRAWER=""` to disable the reservation.
 
-> The logical tray → Agilent drawer-code mapping is config: `TRAY_FRONT_DRAWER` (default `D1F`, the confirmed robot tray) and `TRAY_REAR_DRAWER` (default `D4B`, matches the existing example — confirm against this instrument's multisampler before deploying).
+> The drawer is part of the `sample_position` address, so no tray→drawer mapping config is needed. Valid drawers are `D1F`/`D1B`/…/`D4F`/`D4B`.
 
 ### Labware matching (real plate geometry)
 
-The built-in `plate_format` check only knows the canonical `96-well` / `384-well` / `54-vial` formats. The autosampler on this instrument holds a **54-vial plate (6 rows × 9 cols)**, so a well like `G1` is valid for a 96-well plate but *off* the real plate — a needle-crash risk. Point `LABWARE_CONFIG_PATH` at a JSON file declaring the plate loaded in each tray, and the sidecar validates every submission against that **actual geometry** (authoritative), refusing mismatches with **422 `plate_mismatch`**:
+The built-in `plate_format` check only knows the canonical `96-well` / `384-well` / `54-vial` formats. The autosampler on this instrument holds a **54-vial plate (6 rows × 9 cols)**, so a well like `G1` is valid for a 96-well plate but *off* the real plate — a needle-crash risk. Point `LABWARE_CONFIG_PATH` at a JSON file declaring the plate loaded in each drawer, and the sidecar validates every submission against that **actual geometry** (authoritative), refusing mismatches with **422 `plate_mismatch`**:
 
 - an off-plate `well` for the configured plate,
 - a declared `plate_format` that disagrees with the loaded plate type, or
-- a tray with no configured labware.
+- a drawer with no configured labware.
 
 Generate the config from the instrument's real OpenLab Sample Container configuration — `tools/capture_autosampler_config.py` decodes the geometry OpenLab writes into every result folder's `.scml` snapshot:
 
@@ -94,9 +94,9 @@ Generate the config from the instrument's real OpenLab Sample Container configur
 # inspect the plate-type catalog (rows×cols, well heights) OpenLab knows about:
 uv run python tools/capture_autosampler_config.py
 
-# write a ready labware config, assigning a captured plate type to each tray:
+# write a ready labware config, assigning a captured plate type to each drawer:
 uv run python tools/capture_autosampler_config.py `
-    --assign rear="*54VialPlate*" front="*54VialPlate*" `
+    --assign D4B="*54VialPlate*" D1F="*54VialPlate*" `
     --out C:/SDL_Tools/labware_config.json
 setx LABWARE_CONFIG_PATH C:\SDL_Tools\labware_config.json   # then restart the sidecar
 ```
@@ -349,10 +349,8 @@ Writes to `C:\SDL_Tools\hplcms_sensor_data.json` every 30 seconds (override via 
 | `ROSTER_REFRESH_INTERVAL_S` | `60` | How often to re-pull the central roster. |
 | `ROSTER_HTTP_TIMEOUT_S` | `5` | Timeout for a single central-roster pull. |
 | `ROSTER_API_KEY` | _(empty)_ | Optional `X-Api-Key` sent with the roster pull (endpoint is Tailnet-only by default). |
-| `TRAY_FRONT_DRAWER` | `D1F` | Agilent drawer code for the logical **front** tray (the robot-reserved tray). |
-| `TRAY_REAR_DRAWER` | `D4B` | Agilent drawer code for the logical **rear** tray (the manual tray). |
-| `RESERVED_ROBOT_TRAY` | `front` | Tray reserved for `submitter="robot"` runs; others get 412 `reserved_for_robot`. `""` disables. |
-| `LABWARE_CONFIG_PATH` | _(empty)_ | JSON mapping each tray to the plate actually loaded in it; enables labware-aware validation (422 `plate_mismatch`). Generate with `tools/capture_autosampler_config.py`. Empty → built-in `plate_format` check only. |
+| `RESERVED_ROBOT_DRAWER` | `D1F` | Drawer reserved for `submitter="robot"` runs; a manual run whose `sample_position` targets it gets 412 `reserved_for_robot`. `""` disables. |
+| `LABWARE_CONFIG_PATH` | _(empty)_ | JSON mapping each drawer code (`D1F`/`D4B`/…) to the plate actually loaded in it; enables labware-aware validation (422 `plate_mismatch`). Generate with `tools/capture_autosampler_config.py`. Empty → built-in `plate_format` check only. |
 
 ### Sensor daemon
 
@@ -390,7 +388,7 @@ job = {
     "plate_format": "96-well",
     "submitter": "manual",
     "samples": [
-        {"sample_name": "cpd_01", "tray": "rear", "well": "A1", "injection_volume": 2.0}
+        {"sample_name": "cpd_01", "sample_position": "D4B-A1", "injection_volume": 2.0}
     ]
 }
 r = httpx.post(f"{BASE}/control/queue", json=job, timeout=10)

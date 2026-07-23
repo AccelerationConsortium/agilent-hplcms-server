@@ -171,24 +171,20 @@ def _check_requires_init(signals: dict) -> None:
         )
 
 
-def _compose_moses_job(body: RunRequest, settings: Settings) -> dict:
+def _compose_moses_job(body: RunRequest) -> dict:
     """Build the Moses job dict from a RunRequest.
 
-    Each sample's logical ``{tray, well}`` is composed into the Agilent
-    multisampler ``{drawer}-{well}`` address Moses consumes, using the
-    tray→drawer mapping in settings (e.g. tray "rear" + well "A1" → "D4B-A1").
-    ``plate_format`` and ``submitter`` are sidecar-side concerns (well-geometry
-    validation and the robot-tray reservation) and are not forwarded to Moses.
+    Each sample's ``sample_position`` (e.g. "D1B-A1") is already the full Agilent
+    multisampler address and is forwarded to Moses **verbatim** — Moses feeds it
+    straight to the instrument as the vial/SampleLocation. ``plate_format`` and
+    ``submitter`` are sidecar-side concerns (well-geometry validation and the
+    robot-drawer reservation) and are not forwarded to Moses.
     """
-    tray_to_drawer = {
-        "front": settings.tray_front_drawer,
-        "rear": settings.tray_rear_drawer,
-    }
     job = body.model_dump(exclude={"script_name", "samples", "plate_format", "submitter"})
     job["samples"] = [
         {
             "sample_name": s.sample_name,
-            "sample_position": f"{tray_to_drawer[s.tray]}-{s.well}",
+            "sample_position": s.sample_position,
             "injection_volume": s.injection_volume,
         }
         for s in body.samples
@@ -196,57 +192,57 @@ def _compose_moses_job(body: RunRequest, settings: Settings) -> dict:
     return job
 
 
-def _check_reserved_tray(body: RunRequest, settings: Settings) -> None:
-    """Refuse a non-robot run that targets the robot-reserved tray (412).
+def _check_reserved_drawer(body: RunRequest, settings: Settings) -> None:
+    """Refuse a non-robot run that targets the robot-reserved drawer (412).
 
     The reservation is a soft interlock so an agent and the robot don't fight
-    over the same tray; ``submitter="robot"`` bypasses it, and an empty
-    ``RESERVED_ROBOT_TRAY`` disables it. Raised before enqueue so the job never
+    over the same drawer; ``submitter="robot"`` bypasses it, and an empty
+    ``RESERVED_ROBOT_DRAWER`` disables it. Raised before enqueue so the job never
     reaches Moses. Like queue_full this is a precondition refusal — 412, no
     ``last_error`` (§6.3).
     """
-    reserved = settings.reserved_robot_tray
+    reserved = settings.reserved_robot_drawer
     if not reserved or body.submitter == "robot":
         return
-    if any(s.tray == reserved for s in body.samples):
+    if any(s.drawer == reserved for s in body.samples):
         raise HTTPException(
             status_code=412,
             detail=ReservedForRobotError(
                 detail=(
-                    f"Tray {reserved!r} is reserved for robotic submission; "
+                    f"Drawer {reserved!r} is reserved for robotic submission; "
                     "set submitter='robot' to target it."
                 ),
-                reserved_tray=reserved,
+                reserved_drawer=reserved,
             ).model_dump(mode="json"),
         )
 
 
 def _check_labware(body: RunRequest, settings: Settings) -> None:
-    """Validate each sample against the plate ACTUALLY configured in its tray.
+    """Validate each sample against the plate ACTUALLY configured in its drawer.
 
     Authoritative, labware-aware geometry check (defence in depth beyond the
     model's built-in ``plate_format`` check): with a labware config loaded it
-    rejects an unconfigured tray, a declared ``plate_format`` that does not match
-    the loaded plate type, and a ``well`` that is off the configured plate — the
-    last of which catches off-plate wells on non-canonical labware (e.g. a 6x9
-    54-vial plate) that the 96/384 built-in check cannot express. Raised before
-    enqueue so the job never reaches Moses. 422 (malformed request for the
-    physical plate); like other pre-enqueue validation it does not populate
-    ``last_error``. No labware configured -> no-op.
+    rejects an unconfigured drawer, a declared ``plate_format`` that does not
+    match the loaded plate type, and a ``well`` that is off the configured
+    plate — the last of which catches off-plate wells on non-canonical labware
+    (e.g. a 6x9 54-vial plate) that the 96/384 built-in check cannot express.
+    Raised before enqueue so the job never reaches Moses. 422 (malformed request
+    for the physical plate); like other pre-enqueue validation it does not
+    populate ``last_error``. No labware configured -> no-op.
     """
     labware = load_labware(settings.labware_config_path)
-    if not labware.trays:
+    if not labware.drawers:
         return
     for s in body.samples:
-        plate = labware.for_tray(s.tray)
+        plate = labware.for_drawer(s.drawer)
         if plate is None:
             raise HTTPException(
                 status_code=422,
                 detail=PlateMismatchError(
                     detail=(
-                        f"Tray {s.tray!r} has no configured labware; submission refused."
+                        f"Drawer {s.drawer!r} has no configured labware; submission refused."
                     ),
-                    tray=s.tray,
+                    drawer=s.drawer,
                     declared=body.plate_format,
                     configured=None,
                 ).model_dump(mode="json"),
@@ -257,9 +253,9 @@ def _check_labware(body: RunRequest, settings: Settings) -> None:
                 detail=PlateMismatchError(
                     detail=(
                         f"Declared plate_format {body.plate_format!r} does not match the "
-                        f"{plate.plate_type!r} plate configured in the {s.tray!r} tray."
+                        f"{plate.plate_type!r} plate configured in the {s.drawer!r} drawer."
                     ),
-                    tray=s.tray,
+                    drawer=s.drawer,
                     declared=body.plate_format,
                     configured=plate.plate_type,
                 ).model_dump(mode="json"),
@@ -271,9 +267,9 @@ def _check_labware(body: RunRequest, settings: Settings) -> None:
                     detail=(
                         f"Well {s.well!r} is off the {plate.plate_type!r} plate "
                         f"({plate.rows} rows x {plate.cols} cols) configured in the "
-                        f"{s.tray!r} tray."
+                        f"{s.drawer!r} drawer."
                     ),
-                    tray=s.tray,
+                    drawer=s.drawer,
                     declared=body.plate_format,
                     configured=plate.plate_type,
                 ).model_dump(mode="json"),
@@ -364,10 +360,10 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     runner.poll(settings=settings)
     _check_requires_init(signals)
     _check_servicing(request, signals)
-    _check_reserved_tray(body, settings)
+    _check_reserved_drawer(body, settings)
     _check_labware(body, settings)
 
-    job = _compose_moses_job(body, settings)
+    job = _compose_moses_job(body)
     run_id, position = _do_enqueue(
         script_name=body.script_name,
         job=job,
@@ -422,10 +418,10 @@ def post_to_queue(body: RunRequest, request: Request) -> QueueResponse:
     runner.poll(settings=settings)
     _check_requires_init(signals)
     _check_servicing(request, signals)
-    _check_reserved_tray(body, settings)
+    _check_reserved_drawer(body, settings)
     _check_labware(body, settings)
 
-    job = _compose_moses_job(body, settings)
+    job = _compose_moses_job(body)
     queue_id, position = _do_enqueue(
         script_name=body.script_name,
         job=job,

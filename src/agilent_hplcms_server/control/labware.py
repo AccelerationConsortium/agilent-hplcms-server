@@ -1,23 +1,26 @@
 """Autosampler labware configuration (which plate/vial container is loaded in
-each logical tray) so the sidecar can validate a submitted sample against the
-*actual* plate geometry instead of a hardcoded 96-/384-well assumption.
+each drawer) so the sidecar can validate a submitted sample against the *actual*
+plate geometry instead of a hardcoded 96-/384-well assumption.
 
 Why this exists
 ---------------
-A run addresses samples by ``{tray, well}``. The built-in geometry check in
-``control/models.py`` only knows the canonical 96-/384-well formats, so a well
-that is valid for a 96-well plate (e.g. ``G1``) is accepted even when the tray
-physically holds a 54-vial plate (6 rows x 9 cols) — sending the needle to a
-position that does not exist. This module lets the deployment declare the plate
-type per tray; submissions are then validated against that real geometry and a
-declared ``plate_format`` that disagrees with the loaded labware is refused.
+A run addresses samples by a single ``sample_position`` "D#X-Y1" (drawer + well,
+e.g. "D1B-A1"); the router parses the drawer and well back out. The built-in
+geometry check in ``control/models.py`` only knows the canonical 96-/384-well
+formats, so a well that is valid for a 96-well plate (e.g. ``G1``) is accepted
+even when the drawer physically holds a 54-vial plate (6 rows x 9 cols) —
+sending the needle to a position that does not exist. This module lets the
+deployment declare the plate type per drawer; submissions are then validated
+against that real geometry and a declared ``plate_format`` that disagrees with
+the loaded labware is refused.
 
 Source of truth
 ---------------
-A JSON file (``LABWARE_CONFIG_PATH``) mapping each tray to a plate type. It can
-be generated from the instrument's real OpenLab Sample Container configuration
-with ``tools/capture_autosampler_config.py``, which decodes the geometry OpenLab
-writes into every result folder's ``.scml`` snapshot.
+A JSON file (``LABWARE_CONFIG_PATH``) mapping each drawer code (D1F, D4B, ...) to
+a plate type. It can be generated from the instrument's real OpenLab Sample
+Container configuration with ``tools/capture_autosampler_config.py``, which
+decodes the geometry OpenLab writes into every result folder's ``.scml``
+snapshot.
 
 Empty / unset path -> no labware config -> the sidecar falls back to the
 built-in ``plate_format`` geometry check (legacy behaviour, never bricks).
@@ -70,19 +73,22 @@ class PlateType(BaseModel):
 
 
 class LabwareConfig(BaseModel):
-    """Logical tray name ('front'/'rear') -> the plate type loaded in it."""
+    """Drawer code ('D1F'/'D4B'/...) -> the plate type loaded in that drawer."""
 
-    trays: dict[str, PlateType] = Field(default_factory=dict)
+    drawers: dict[str, PlateType] = Field(default_factory=dict)
 
-    def for_tray(self, tray: str) -> PlateType | None:
-        return self.trays.get(tray)
+    def for_drawer(self, drawer: str) -> PlateType | None:
+        return self.drawers.get(drawer)
 
 
 def _coerce(raw: dict) -> dict:
-    """Accept either ``{"trays": {...}}`` or a flat ``{"front": {...}}`` file."""
-    if "trays" in raw:
+    """Accept ``{"drawers": {...}}``, legacy ``{"trays": {...}}``, or a flat
+    ``{"D1F": {...}}`` file."""
+    if "drawers" in raw:
         return raw
-    return {"trays": raw}
+    if "trays" in raw:
+        return {"drawers": raw["trays"]}
+    return {"drawers": raw}
 
 
 @lru_cache(maxsize=8)

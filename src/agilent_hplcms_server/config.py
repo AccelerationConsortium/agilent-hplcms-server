@@ -106,27 +106,27 @@ class Settings:
     # central service ever gates the device-plane endpoints.
     roster_api_key: str = os.environ.get("ROSTER_API_KEY", "")
 
-    # Autosampler tray → Agilent multisampler drawer-code mapping. A run
-    # addresses samples by logical {tray, well}; the control layer composes the
-    # "{drawer}-{well}" position string Moses consumes (see control/router.py).
-    # The front drawer (D1F) is the robot's reserved tray — confirmed against the
-    # instrument. The rear drawer (D4B) matches the code in the existing example
-    # job; confirm it against this instrument's multisampler before deploying.
-    tray_front_drawer: str = os.environ.get("TRAY_FRONT_DRAWER", "D1F")
-    tray_rear_drawer: str = os.environ.get("TRAY_REAR_DRAWER", "D4B")
-    # Tray reserved for robotic sample submission (the front tray, D1F). A run
-    # with submitter != "robot" that targets it is refused with HTTP 412
-    # reserved_for_robot. Set to "" to disable the reservation entirely.
-    reserved_robot_tray: str = os.environ.get("RESERVED_ROBOT_TRAY", "front")
+    # Autosampler addressing. A run addresses each sample by a single
+    # ``sample_position`` string "D#X-Y1" (drawer D1-D4 F/B + well, e.g.
+    # "D1B-A1"); the control layer forwards it to Moses verbatim (see
+    # control/router.py). No tray→drawer mapping is needed — the drawer is part
+    # of the address.
+    #
+    # Drawer reserved for robotic sample submission (default D1F, a front
+    # drawer). A run with submitter != "robot" whose sample_position targets this
+    # drawer is refused with HTTP 412 reserved_for_robot. Set to "" to disable
+    # the reservation entirely.
+    reserved_robot_drawer: str = os.environ.get("RESERVED_ROBOT_DRAWER", "D1F")
 
-    # Autosampler labware config: a JSON file mapping each logical tray to the
-    # plate/vial container actually loaded in it, so submissions are validated
-    # against the REAL plate geometry (not the built-in 96/384 assumption) and a
-    # declared plate_format that disagrees with the loaded labware is refused
-    # (HTTP 422 plate_mismatch). Generate/refresh it from the instrument's real
-    # OpenLab Sample Container config with tools/capture_autosampler_config.py.
-    # Empty -> no labware enforcement (falls back to the plate_format geometry
-    # check in control/models.py). See control/labware.py.
+    # Autosampler labware config: a JSON file mapping each drawer code (D1F,
+    # D4B, ...) to the plate/vial container actually loaded in it, so submissions
+    # are validated against the REAL plate geometry (not the built-in 96/384
+    # assumption) and a declared plate_format that disagrees with the loaded
+    # labware is refused (HTTP 422 plate_mismatch). Generate/refresh it from the
+    # instrument's real OpenLab Sample Container config with
+    # tools/capture_autosampler_config.py. Empty -> no labware enforcement (falls
+    # back to the plate_format geometry check in control/models.py). See
+    # control/labware.py.
     labware_config_path: str = os.environ.get("LABWARE_CONFIG_PATH", "")
 
     # OpenLab Sharing Services REST API (instrument state probe)

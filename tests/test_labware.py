@@ -58,33 +58,45 @@ def test_load_labware_empty_path_is_empty():
     load_labware.cache_clear()
     cfg = load_labware("")
     assert isinstance(cfg, LabwareConfig)
-    assert cfg.trays == {}
+    assert cfg.drawers == {}
 
 
 def test_load_labware_missing_file_is_empty(tmp_path):
     load_labware.cache_clear()
     cfg = load_labware(str(tmp_path / "nope.json"))
-    assert cfg.trays == {}
+    assert cfg.drawers == {}
 
 
 def test_load_labware_nested_and_flat_forms(tmp_path):
     load_labware.cache_clear()
     nested = tmp_path / "nested.json"
     nested.write_text(json.dumps(
-        {"trays": {"rear": {"plate_type": "54-vial", "rows": 6, "cols": 9}}}
+        {"drawers": {"D4B": {"plate_type": "54-vial", "rows": 6, "cols": 9}}}
     ), encoding="utf-8")
     flat = tmp_path / "flat.json"
     flat.write_text(json.dumps(
-        {"rear": {"plate_type": "54-vial", "rows": 6, "cols": 9}}
+        {"D4B": {"plate_type": "54-vial", "rows": 6, "cols": 9}}
     ), encoding="utf-8")
 
     load_labware.cache_clear()
     a = load_labware(str(nested))
     load_labware.cache_clear()
     b = load_labware(str(flat))
-    assert a.for_tray("rear").rows == 6
-    assert b.for_tray("rear").cols == 9
-    assert a.for_tray("front") is None
+    assert a.for_drawer("D4B").rows == 6
+    assert b.for_drawer("D4B").cols == 9
+    assert a.for_drawer("D1F") is None
+
+
+def test_load_labware_legacy_trays_key(tmp_path):
+    """Back-compat: a pre-existing config keyed by the old 'trays' top-level key
+    still loads (values are now drawer codes)."""
+    load_labware.cache_clear()
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps(
+        {"trays": {"D4B": {"plate_type": "54-vial", "rows": 6, "cols": 9}}}
+    ), encoding="utf-8")
+    cfg = load_labware(str(legacy))
+    assert cfg.for_drawer("D4B").rows == 6
 
 
 # ---------------------------------------------------------------------------
@@ -158,12 +170,12 @@ def test_capture_collect_and_build_config(tmp_path):
     assert z_dim == 45.0
     assert len(scanned) == 1
 
-    config = mod._build_config(catalog, {"rear": "*54VialPlate*"}, z_dim)
-    rear = config["trays"]["rear"]
-    assert rear["rows"] == 6 and rear["cols"] == 9
-    assert rear["z_dimension_mm"] == 45.0
+    config = mod._build_config(catalog, {"D4B": "*54VialPlate*"}, z_dim)
+    d4b = config["drawers"]["D4B"]
+    assert d4b["rows"] == 6 and d4b["cols"] == 9
+    assert d4b["z_dimension_mm"] == 45.0
 
     # The emitted config must load cleanly into the sidecar's schema.
     cfg = LabwareConfig.model_validate(config)
-    assert cfg.for_tray("rear").contains("F9")
-    assert not cfg.for_tray("rear").contains("G1")
+    assert cfg.for_drawer("D4B").contains("F9")
+    assert not cfg.for_drawer("D4B").contains("G1")

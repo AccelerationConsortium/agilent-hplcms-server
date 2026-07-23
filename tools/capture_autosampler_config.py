@@ -12,13 +12,15 @@ This tool scans the newest ``.scml`` files under the results tree, decodes those
 blobs, and prints the plate-type catalog with exact geometry. With ``--assign``
 it emits a labware config JSON (control/labware.py schema, LABWARE_CONFIG_PATH)
 so the sidecar validates submissions against the plate ACTUALLY loaded in each
-tray instead of the built-in 96/384 assumption.
+drawer instead of the built-in 96/384 assumption.
 
-Why you still assign trays by hand: a single snapshot reliably yields the plate
-CATALOG + geometry, but the authoritative drawer->plate binding is a
+Why you still assign drawers by hand: a single snapshot reliably yields the
+plate CATALOG + geometry, but the authoritative drawer->plate binding is a
 safety-critical decision. Once labware is standardized per drawer you declare it
-once (``--assign front=<PlateName> rear=<PlateName>``); the tool fills in the
-precise geometry captured from OpenLab.
+once (``--assign D1F=<PlateName> D4B=<PlateName>``); the tool fills in the
+precise geometry captured from OpenLab. Drawer codes are D1F/D1B/.../D4F/D4B
+(D + drawer number 1-4 + F=front / B=back), matching the sample_position address
+the sidecar validates.
 
 Usage (PowerShell, on the instrument PC):
 
@@ -27,7 +29,7 @@ Usage (PowerShell, on the instrument PC):
 
     # write a ready labware config for the sidecar:
     uv run python tools/capture_autosampler_config.py `
-        --assign rear="*54VialPlate*" front="*54VialPlate*" `
+        --assign D4B="*54VialPlate*" D1F="*54VialPlate*" `
         --out C:/SDL_Tools/labware_config.json
 
 Then point the sidecar at it:  setx LABWARE_CONFIG_PATH C:\SDL_Tools\labware_config.json
@@ -46,15 +48,11 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# Logical tray -> Agilent drawer code. Mirrors the sidecar defaults
-# (config.Settings.tray_front_drawer / tray_rear_drawer); override with the same
-# env vars if your deployment remaps them.
 import os
 
-TRAY_DRAWERS = {
-    "front": os.environ.get("TRAY_FRONT_DRAWER", "D1F"),
-    "rear": os.environ.get("TRAY_REAR_DRAWER", "D4B"),
-}
+# Valid Agilent multisampler drawer codes: D<1-4><F|B>. These are the drawer
+# halves of the sample_position "D#X-Y1" address the sidecar validates.
+KNOWN_DRAWERS = {f"D{n}{s}" for n in range(1, 5) for s in ("F", "B")}
 
 DEFAULT_RESULTS_ROOT = os.environ.get(
     "CDS_RESULTS_DIR", r"C:\CDSProjects\Installation\Results"
@@ -161,8 +159,8 @@ def collect(root: Path, limit: int) -> tuple[dict[str, dict], float | None, list
 
 
 def _build_config(catalog: dict[str, dict], assign: dict[str, str], z_dim: float | None) -> dict:
-    trays: dict[str, dict] = {}
-    for tray, plate_name in assign.items():
+    drawers: dict[str, dict] = {}
+    for drawer, plate_name in assign.items():
         if plate_name not in catalog:
             raise SystemExit(
                 f"error: plate {plate_name!r} not found in captured catalog "
@@ -171,22 +169,22 @@ def _build_config(catalog: dict[str, dict], assign: dict[str, str], z_dim: float
         entry = dict(catalog[plate_name])
         if z_dim is not None:
             entry["z_dimension_mm"] = z_dim
-        trays[tray] = entry
-    return {"trays": trays}
+        drawers[drawer] = entry
+    return {"drawers": drawers}
 
 
 def _parse_assign(pairs: list[str]) -> dict[str, str]:
     out: dict[str, str] = {}
     for pair in pairs:
         if "=" not in pair:
-            raise SystemExit(f"error: --assign expects tray=PlateName, got {pair!r}.")
-        tray, plate = pair.split("=", 1)
-        tray = tray.strip()
-        if tray not in TRAY_DRAWERS:
+            raise SystemExit(f"error: --assign expects DRAWER=PlateName, got {pair!r}.")
+        drawer, plate = pair.split("=", 1)
+        drawer = drawer.strip().upper()
+        if drawer not in KNOWN_DRAWERS:
             raise SystemExit(
-                f"error: unknown tray {tray!r} (known: {', '.join(TRAY_DRAWERS)})."
+                f"error: unknown drawer {drawer!r} (known: {', '.join(sorted(KNOWN_DRAWERS))})."
             )
-        out[tray] = plate.strip()
+        out[drawer] = plate.strip()
     return out
 
 
@@ -196,8 +194,8 @@ def main() -> int:
                     help=f"Root of the OpenLab results tree (default: {DEFAULT_RESULTS_ROOT}).")
     ap.add_argument("--limit", type=int, default=40,
                     help="Number of newest .scml files to scan (default: 40).")
-    ap.add_argument("--assign", nargs="*", default=[], metavar="TRAY=PLATE",
-                    help="Assign a captured plate type to a tray, e.g. rear='*54VialPlate*'.")
+    ap.add_argument("--assign", nargs="*", default=[], metavar="DRAWER=PLATE",
+                    help="Assign a captured plate type to a drawer, e.g. D4B='*54VialPlate*'.")
     ap.add_argument("--out", default=None,
                     help="Write the labware config JSON here (default: stdout).")
     args = ap.parse_args()
@@ -222,7 +220,7 @@ def main() -> int:
             f"WellDepth={info['well_depth_mm']}",
             file=sys.stderr,
         )
-    print(f"# Tray->drawer mapping: {TRAY_DRAWERS}", file=sys.stderr)
+    print(f"# Known drawer codes: {', '.join(sorted(KNOWN_DRAWERS))}", file=sys.stderr)
 
     if not args.assign:
         print("# (no --assign given; printing captured catalog only)", file=sys.stderr)

@@ -20,10 +20,10 @@ Usage (PowerShell, on the instrument PC):
     uv run python tools/hardware_smoke_test.py --base-url http://localhost:8011 `
         --owner hte-orchestrator@lab.local --admin-owner yangcyril.cao@utoronto.ca
 
-    # include the single real run + standby (use the manual/rear tray):
+    # include the single real run + standby (use an unreserved drawer):
     uv run python tools/hardware_smoke_test.py --base-url http://localhost:8011 `
         --owner hte-orchestrator@lab.local --admin-owner yangcyril.cao@utoronto.ca `
-        --run-hardware --tray rear --well A1 --output-dir C:/CDSProjects/Installation/Results/SmokeTest
+        --run-hardware --sample-position D4B-A1 --output-dir C:/CDSProjects/Installation/Results/SmokeTest
 
 Exit code 0 = all attempted stages passed; non-zero = a check failed (the claim
 is always released on the way out).
@@ -202,7 +202,7 @@ def stage_workflow(base: str) -> None:
 
 
 def _min_run_body() -> dict:
-    """A minimal valid run body (rear/unreserved tray) for refusal checks."""
+    """A minimal valid run body (unreserved drawer) for refusal checks."""
     return {
         "output_dir": "C:/CDSProjects/Installation/Results/SmokeTest",
         "submitter": "manual", "plate_format": "96-well",
@@ -211,7 +211,7 @@ def _min_run_body() -> dict:
             "run_time": 2.0, "flow_rate": 0.3, "equilibration_time": 0.0,
             "gradient_table": [[0.0, 0.05], [2.0, 0.05]],
         },
-        "samples": [{"sample_name": "x", "tray": "rear", "well": "A1", "injection_volume": 1.0}],
+        "samples": [{"sample_name": "x", "sample_position": "D4B-A1", "injection_volume": 1.0}],
     }
 
 
@@ -259,7 +259,7 @@ def stage_service(base: str, admin_owner: str, session_id: str) -> None:
     _TOKEN = None
 
 
-def stage_refusals(base: str, reserved_tray: str) -> None:
+def stage_refusals(base: str, reserved_drawer: str) -> None:
     """Submit bodies that MUST be refused *before* any hardware action."""
     _section("Stage 3 - precondition refusals (refused before hardware)")
 
@@ -269,26 +269,26 @@ def stage_refusals(base: str, reserved_tray: str) -> None:
         "gradient_table": [[0.0, 0.05], [2.0, 0.05]],
     }
 
-    # Off-plate well -> 422 (geometry).
+    # Off-plate well -> 422 (geometry). A13 is off a 96-well plate (12 cols).
     off_plate = {
         "output_dir": "C:/CDSProjects/Installation/Results/SmokeTest",
         "gradient": base_grad, "plate_format": "96-well",
-        "samples": [{"sample_name": "x", "tray": "front", "well": "A13", "injection_volume": 1.0}],
+        "samples": [{"sample_name": "x", "sample_position": "D4B-A13", "injection_volume": 1.0}],
     }
     code, _ = _request("POST", f"{base}/control/run", off_plate)
     _check("off-plate well A13 on 96-well -> 422", code == 422, f"got {code}")
 
-    # Manual run targeting the robot-reserved tray -> 412 reserved_for_robot.
+    # Manual run targeting the robot-reserved drawer -> 412 reserved_for_robot.
     reserved = {
         "output_dir": "C:/CDSProjects/Installation/Results/SmokeTest",
         "gradient": base_grad, "submitter": "manual",
-        "samples": [{"sample_name": "x", "tray": reserved_tray, "well": "A1", "injection_volume": 1.0}],
+        "samples": [{"sample_name": "x", "sample_position": f"{reserved_drawer}-A1", "injection_volume": 1.0}],
     }
     code, body = _request("POST", f"{base}/control/run", reserved)
     detail = body.get("detail") if isinstance(body, dict) else {}
     err = detail.get("error") if isinstance(detail, dict) else None
     _check(
-        f"manual run on reserved tray {reserved_tray!r} -> 412 reserved_for_robot",
+        f"manual run on reserved drawer {reserved_drawer!r} -> 412 reserved_for_robot",
         code == 412 and err == "reserved_for_robot",
         f"got {code} / {err}",
     )
@@ -300,10 +300,10 @@ def _heartbeat(base: str) -> None:
         print(f"      WARNING: heartbeat returned {code} (claim may be lost)")
 
 
-def stage_hardware_run(base: str, tray: str, well: str, output_dir: str, hb_interval: float) -> None:
+def stage_hardware_run(base: str, sample_position: str, output_dir: str, hb_interval: float) -> None:
     """GATED: submit ONE real run, watch it through, then standby."""
     _section("Stage 4 - ONE real run + standby (HARDWARE MOVES)")
-    print(f"      tray={tray} well={well} output_dir={output_dir}")
+    print(f"      sample_position={sample_position} output_dir={output_dir}")
 
     run_body = {
         "output_dir": output_dir,
@@ -316,7 +316,7 @@ def stage_hardware_run(base: str, tray: str, well: str, output_dir: str, hb_inte
             "run_time": 2.0, "flow_rate": 0.3, "equilibration_time": 0.0,
             "gradient_table": [[0.0, 0.05], [2.0, 0.05]],
         },
-        "samples": [{"sample_name": "smoke_blank", "tray": tray, "well": well, "injection_volume": 1.0}],
+        "samples": [{"sample_name": "smoke_blank", "sample_position": sample_position, "injection_volume": 1.0}],
     }
     code, body = _request("POST", f"{base}/control/queue", run_body)
     if not _check("POST /control/queue (real run) -> 202", code == 202, str(body)[:250]):
@@ -383,12 +383,12 @@ def main() -> int:
     p.add_argument("--admin-owner", default="Service-Account",
                    help="Admin account for the service-mode stage (must be in HPLCMS_ADMINS).")
     p.add_argument("--session-id", default=f"smoke-{uuid.uuid4().hex[:8]}")
-    p.add_argument("--reserved-tray", default="front",
-                   help="Must match the device's RESERVED_ROBOT_TRAY (default front = robot tray)")
+    p.add_argument("--reserved-drawer", default="D1F",
+                   help="Must match the device's RESERVED_ROBOT_DRAWER (default D1F = robot drawer)")
     p.add_argument("--run-hardware", action="store_true",
                    help="ENABLE the real run + standby stage (moves hardware)")
-    p.add_argument("--tray", default="rear", help="Tray for the real run (use the UNreserved manual tray)")
-    p.add_argument("--well", default="A1", help="Well for the real run, e.g. A1")
+    p.add_argument("--sample-position", default="D4B-A1",
+                   help="Slot for the real run, 'D#X-Y1' (use an UNreserved drawer), e.g. D4B-A1")
     p.add_argument("--output-dir", default="C:/CDSProjects/Installation/Results/SmokeTest")
     args = p.parse_args()
 
@@ -396,7 +396,7 @@ def main() -> int:
     print(f"Smoke test against {base}  (session_id={args.session_id})")
     if args.run_hardware:
         print("\n*** --run-hardware ENABLED: a real injection + 2-min run will execute. ***")
-        print("*** Front=D1F is the confirmed robot tray; confirm TRAY_REAR_DRAWER (D4B),  ***")
+        print("*** D1F is the confirmed robot drawer; confirm the --sample-position drawer,***")
         print("*** the instrument is idle, and someone is watching it.                     ***")
         if input("Type 'yes' to proceed: ").strip().lower() != "yes":
             print("Aborted by user; running read-only stages only.")
@@ -410,10 +410,10 @@ def main() -> int:
             print("\nClaim failed - cannot run mutating stages. Stopping.")
             return 1
         hb_interval = float(grant.get("heartbeat_interval_s", 15.0))
-        stage_refusals(base, args.reserved_tray)
+        stage_refusals(base, args.reserved_drawer)
         stage_workflow(base)
         if args.run_hardware:
-            stage_hardware_run(base, args.tray, args.well, args.output_dir, hb_interval)
+            stage_hardware_run(base, args.sample_position, args.output_dir, hb_interval)
         else:
             print("\n(Skipping Stage 4 hardware run - pass --run-hardware to enable.)")
         # /control/abort is a no-op when idle but would kill an active run, so only

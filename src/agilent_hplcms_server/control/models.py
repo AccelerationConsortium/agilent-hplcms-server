@@ -11,21 +11,23 @@ from pydantic import BaseModel, Field, model_validator
 from ..models import ClaimedBy
 
 
-# Autosampler tray + plate geometry. The canonical formats mirror the lab skill
-# catalog (ac-organic-lab: lab_skills/skill_catalog/hplc.py) so the SDK and this
-# device validate sample addresses consistently; the device is the authoritative
-# validator. NOTE: the catalog still hardcodes 96/384 only — extend it to add
-# "54-vial" and make plate_format optional so SDK clients can submit against the
-# real labware here (see the labware layer below).
-#
+# Autosampler addressing. A sample is a single position string "D#X-Y1":
+#   D<drawer 1-4><F|B>-<well>, e.g. "D1B-A1" (drawer D1 back, well A1).
+# The Agilent multisampler exposes up to eight drawers (D1F/D1B/.../D4F/D4B).
+# The WHOLE string is what Moses feeds the instrument as the vial/SampleLocation,
+# so the control layer forwards ``sample_position`` verbatim (see
+# control/router.py). The drawer and well are parsed back out only for the
+# sidecar's safety checks — the robot-drawer reservation and the labware
+# plate-geometry validation (control/labware.py).
+_POSITION_RE = re.compile(r"^(D[1-4][FB])-([A-Za-z]\d{1,2})$")
+
 # ``_BUILTIN_PLATE_GEOMETRY`` covers the canonical formats a client may declare
-# via ``plate_format``. The *actual* container loaded in each tray can be
-# declared per deployment (control/labware.py, LABWARE_CONFIG_PATH); when it is,
-# the router validates against that real geometry (defence in depth), which is
-# how off-plate wells on non-canonical labware (e.g. a 6x9 54-vial plate) are
-# caught. A plate_format not listed here is treated as a custom type whose
-# geometry is validated only at the router against the configured labware.
-TrayName = Literal["front", "rear"]
+# via ``plate_format`` for the built-in well-range check. The *actual* container
+# loaded in each drawer can be declared per deployment (control/labware.py,
+# LABWARE_CONFIG_PATH); when it is, the router validates against that real
+# geometry (defence in depth), which is how off-plate wells on non-canonical
+# labware (e.g. a 6x9 54-vial plate) are caught. A plate_format not listed here
+# is a custom type whose geometry is validated only at the router.
 _BUILTIN_PLATE_GEOMETRY: dict[str, tuple[int, int]] = {
     "96-well": (8, 12),
     "384-well": (16, 24),
@@ -53,13 +55,25 @@ class SampleConfig(BaseModel):
         pattern=r"^[A-Za-z0-9_\-]+$",
         description="Alphanumeric identifier (no spaces)",
     )
-    tray: TrayName = Field(description="Autosampler tray holding this sample (front or rear).")
-    well: str = Field(
-        min_length=2,
-        max_length=4,
-        description='Plate well, e.g. "A1" or "H12". Validated against the run\'s plate_format.',
+    sample_position: str = Field(
+        min_length=1,
+        pattern=r"^D[1-4][FB]-[A-Za-z]\d{1,2}$",
+        description=(
+            'Autosampler slot "D#X-Y1": drawer (D1-D4, F=front/B=back) + well, '
+            'e.g. "D1B-A1". Forwarded verbatim to the instrument.'
+        ),
     )
     injection_volume: float = Field(gt=0, le=20.0, description="Injection volume in µL (max 20)")
+
+    @property
+    def drawer(self) -> str:
+        """Drawer code (e.g. 'D1B') parsed from ``sample_position``."""
+        return self.sample_position.split("-", 1)[0]
+
+    @property
+    def well(self) -> str:
+        """Well tag (e.g. 'A1') parsed from ``sample_position``."""
+        return self.sample_position.split("-", 1)[1]
 
 
 class RunRequest(BaseModel):
@@ -83,7 +97,7 @@ class RunRequest(BaseModel):
         default=None,
         description=(
             "Declared plate type for all samples in this run, asserted against the "
-            "tray's configured labware (LABWARE_CONFIG_PATH). None trusts the device's "
+            "drawer's configured labware (LABWARE_CONFIG_PATH). None trusts the device's "
             "configured labware; when no labware is configured, None assumes '96-well' "
             "for the built-in well-range check. Canonical types: '96-well', '384-well', "
             "'54-vial'."
@@ -92,8 +106,9 @@ class RunRequest(BaseModel):
     submitter: Literal["manual", "robot"] = Field(
         default="manual",
         description=(
-            "Runs targeting a tray reserved for robotic submission (RESERVED_ROBOT_TRAY) "
-            "are refused with HTTP 412 reserved_for_robot unless submitter='robot'."
+            "Runs whose sample_position targets the drawer reserved for robotic "
+            "submission (RESERVED_ROBOT_DRAWER) are refused with HTTP 412 "
+            "reserved_for_robot unless submitter='robot'."
         ),
     )
 
@@ -231,24 +246,24 @@ class QueueFullError(BaseModel):
 
 
 class ReservedForRobotError(BaseModel):
-    """Body for HTTP 412 when a non-robot run targets the robot-reserved tray.
+    """Body for HTTP 412 when a non-robot run targets the robot-reserved drawer.
 
-    412 (precondition): the request is well-formed but the tray reservation
+    412 (precondition): the request is well-formed but the drawer reservation
     forbids it right now; it would succeed with ``submitter="robot"`` or against
-    an unreserved tray. Like other 412 refusals it MUST NOT populate
+    an unreserved drawer. Like other 412 refusals it MUST NOT populate
     ``last_error`` (§6.3).
     """
 
     error: Literal["reserved_for_robot"] = "reserved_for_robot"
     detail: str
-    reserved_tray: str
+    reserved_drawer: str
 
 
 class PlateMismatchError(BaseModel):
     """Body for HTTP 422 when a submitted sample does not match the plate
-    actually configured in its autosampler tray (see control/labware.py):
+    actually configured in its autosampler drawer (see control/labware.py):
 
-    - the tray has no configured labware,
+    - the drawer has no configured labware,
     - the declared ``plate_format`` disagrees with the loaded plate type, or
     - the ``well`` is off the configured plate's row/column geometry.
 
@@ -259,7 +274,7 @@ class PlateMismatchError(BaseModel):
 
     error: Literal["plate_mismatch"] = "plate_mismatch"
     detail: str
-    tray: str
+    drawer: str
     declared: str | None = None
     configured: str | None = None
 

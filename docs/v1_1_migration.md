@@ -65,32 +65,39 @@ v1.1 control device in the lab. This spans **two repos**:
   operator/dashboard controls, not agent skills — keep them out of the catalog.)
 - **`ROADMAP.md`**: move `agilent_uplc_ms` from "read-only sidecar" to v1.1 control.
 
-## Addendum: sample-submission contract (tray + well)
+## Addendum: sample-submission contract (`sample_position`)
 
 Shipped alongside the v1.1 control surface so a run submitted via the lab skill
 catalog validates identically on the device.
 
-- **Logical addressing.** A `RunRequest` carries a `plate_format`
-  (`96-well` / `384-well`) and samples addressed by `{tray, well}`
-  (`tray ∈ {front, rear}`, `well` like `A1`/`H12`) — *not* a raw Agilent
-  position string. `control/router.py:_compose_moses_job` composes the
-  `{drawer}-{well}` address Moses consumes from the tray→drawer config
-  (`TRAY_FRONT_DRAWER` / `TRAY_REAR_DRAWER`); `plate_format` / `submitter` are
-  device-side only and not forwarded to Moses.
-- **Geometry validation (422).** Wells are checked against `plate_format`
-  geometry (`96 → 8×12`, `384 → 16×24`); off-plate wells are rejected with 422.
-- **Robot-tray reservation (412).** The **front** tray (`RESERVED_ROBOT_TRAY`,
-  default `front`) is reserved for robotic submission; manual runs use the rear
-  tray. A run with `submitter != "robot"` targeting the reserved tray is refused
-  with **412 `reserved_for_robot`** (a precondition refusal — no `last_error`).
-  `submitter="robot"` bypasses it; `""` disables the reservation.
+> **Change (2026-07):** samples are now addressed by a single `sample_position`
+> string, replacing the earlier `{tray, well}` pair. The Agilent multisampler
+> exposes eight drawers, not two trays, so a `front`/`rear` abstraction could not
+> express the real addresses. The env vars `TRAY_FRONT_DRAWER` /
+> `TRAY_REAR_DRAWER` are gone, and `RESERVED_ROBOT_TRAY` (value `front`) becomes
+> `RESERVED_ROBOT_DRAWER` (value `D1F`). Error-body fields renamed:
+> `reserved_for_robot.reserved_tray → reserved_drawer`, `plate_mismatch.tray →
+> drawer`. Labware config is now keyed by drawer code (a legacy `{"trays": …}`
+> top-level key still loads).
+
+- **Addressing.** A `RunRequest` carries a `plate_format`
+  (`96-well` / `384-well` / `54-vial`) and samples addressed by a single
+  `sample_position` string `"D#X-Y1"` — drawer (`D1`–`D4`, `F`ront/`B`ack) plus
+  well, e.g. `"D1B-A1"`. This *is* the raw Agilent multisampler address:
+  `control/router.py:_compose_moses_job` forwards it to Moses **verbatim**.
+  `plate_format` / `submitter` are device-side only and not forwarded.
+- **Geometry validation (422).** The well parsed from `sample_position` is
+  checked against `plate_format` geometry (`96 → 8×12`, `384 → 16×24`); off-plate
+  wells are rejected with 422.
+- **Robot-drawer reservation (412).** One drawer (`RESERVED_ROBOT_DRAWER`,
+  default `D1F`) is reserved for robotic submission. A run with
+  `submitter != "robot"` whose `sample_position` targets the reserved drawer is
+  refused with **412 `reserved_for_robot`** (a precondition refusal — no
+  `last_error`). `submitter="robot"` bypasses it; `""` disables the reservation.
 - **Cross-repo alignment.** The `SampleConfig` / `RunRequest` field set, plate
-  geometry, and well regex are kept in sync with the lab skill catalog
-  (`ac-organic-lab: lab_skills/skill_catalog/hplc.py`). The device is the
+  geometry, and the `sample_position` regex are kept in sync with the lab skill
+  catalog (`ac-organic-lab: lab_skills/skill_catalog/hplc.py`). The device is the
   authoritative validator; the catalog mirrors these definitions.
-- Drawer codes: `TRAY_FRONT_DRAWER=D1F` is the confirmed robot tray;
-  `TRAY_REAR_DRAWER=D4B` matches the existing example job — confirm it against
-  this instrument's multisampler before deploying.
 
 ## Addendum: queue-ownership pivot, servicing, and roles
 
