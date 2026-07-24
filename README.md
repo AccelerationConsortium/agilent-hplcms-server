@@ -139,7 +139,7 @@ DELETE /control/queue/{queue_id}  → cancel a pending job (409 if running, 404 
 
 - `position: 0` means the run started immediately (instrument was idle).
 - `position: 1+` means the run is waiting; position is 1-based in the FIFO.
-- `queue` contains all jobs in any status (pending, running, done, failed) up to the last 50 completed.
+- `queue` contains all jobs in any status (pending, running, done, failed) up to the last 50 completed. Each entry carries `error_message` — the failure reason on a `failed` job, or the standby-park warning on a `done`-after-standby-failure job (see *Post-run standby reconciliation* below).
 - `instrument_online` — all three OpenLab core processes are up.
 - `accepting_jobs` — instrument is online and the queue is not full.
 - `GET /status` → `details.queue_length` gives the current pending count.
@@ -151,6 +151,8 @@ A background daemon thread polls every 5 seconds and automatically starts the ne
 ### Queue ownership and submission precedence
 
 This server's `MosesRunner` is the **sole** job queue. OpenLab's native sequence queue is not used for our jobs — OpenLab (OLSS) is reserved for technician servicing/maintenance. Because `moses.agilent` `start_run` runs **synchronously** (it blocks through Running → run → Idle before returning), job state is driven entirely by the subprocess: alive → `running`, exit `0` → `done`, non-zero → `failed`. No `.sirslt` polling or OpenLab-queue tracking is involved.
+
+**Post-run standby reconciliation.** `run_batch` runs the samples *and then* a low-flow standby-park step, and raises (→ non-zero exit) if **either** fails — so a non-zero exit alone cannot tell a lost acquisition from "every sample completed, only the standby park failed". When a run carried real samples, all samples completed, and *only* the standby step failed (per the Moses stdout log), the acquisition data is valid and OpenLab has recorded it, so the job is finalized **`done`** with the standby problem surfaced in `error_message` — not `failed` (which would wrongly trigger a re-run). A genuine sample failure, or a standby-only job (`POST /control/standby`, no samples), still finalizes `failed`. Every non-`done` outcome carries a human-readable `error_message` (the reason from the log, or `Exit code N`), so a failure is never a bare "Failed".
 
 Submissions are gated by precedence (highest wins):
 

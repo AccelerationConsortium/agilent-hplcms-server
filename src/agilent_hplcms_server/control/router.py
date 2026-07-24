@@ -156,6 +156,7 @@ def _entry_to_queued_run(entry: JobEntry) -> QueuedRun:
         started_at=entry.started_at,
         finished_at=entry.finished_at,
         pid=entry.pid,
+        error_message=entry.error_msg,
     )
 
 

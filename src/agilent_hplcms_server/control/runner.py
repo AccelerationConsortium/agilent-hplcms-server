@@ -17,12 +17,25 @@ That makes job completion a simple ``process.poll()`` — no ``.sirslt`` polling
 no OLSS-driven finalization, no "enqueued/waiting in OpenLab's queue" state. The
 only thing the runner still learns from OLSS is whether a *technician* is driving
 the instrument directly (servicing), so it can halt the queue.
+
+**One reconciliation on the exit code** (see :meth:`_classify_nonzero_exit`):
+``run_batch`` in ``examples/agent_agilent.py`` runs the samples *and then* a
+post-run standby-park step, and raises (→ non-zero exit) if **either** fails. So
+a non-zero exit alone cannot tell "an acquisition was lost" from "every
+acquisition completed and only the standby park failed". In the latter case the
+run's scientific output is valid and OpenLab has recorded it, so marking the job
+``failed`` would wrongly trigger a re-run. The runner therefore reads the Moses
+stdout log it already captures to distinguish the two, finalizing a
+standby-only failure as ``done`` (with the standby problem surfaced as a
+warning in ``error_msg``). A genuine sample failure — or a standby-*only* job,
+which has no acquisition to preserve — still finalizes as ``failed``.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import threading
 import uuid
@@ -268,9 +281,18 @@ class MosesRunner:
                     entry.status = "done"
                     logger.info("Run %s finished (exit 0)", self._active_id)
                 else:
-                    entry.status = "failed"
-                    entry.error_msg = f"Exit code {rc}"
-                    logger.info("Run %s failed (exit %s)", self._active_id, rc)
+                    status, reason = self._classify_nonzero_exit(entry, rc)
+                    entry.status = status
+                    entry.error_msg = reason
+                    if status == "done":
+                        logger.warning(
+                            "Run %s completed with standby-park warning: %s",
+                            self._active_id, reason,
+                        )
+                    else:
+                        logger.info(
+                            "Run %s failed (exit %s): %s", self._active_id, rc, reason
+                        )
                 self._active_id = None
                 self._evict_history()
 
@@ -460,6 +482,74 @@ class MosesRunner:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    # Markers emitted by run_batch() in examples/agent_agilent.py:
+    #   - a failed *sample* acquisition logs   "Run i/n failed (name): <exc>"
+    #   - a failed post-run standby park logs   "Standby run failed: <exc>"
+    #     and adds a "Standby failed: <exc>" line to the RuntimeError it raises.
+    # Both kinds of failure make the batch raise (non-zero exit), so the exit
+    # code alone cannot tell them apart — the log can.
+    _SAMPLE_FAIL_RE = re.compile(r"Run \d+/\d+ failed", re.IGNORECASE)
+    _STANDBY_FAIL_RE = re.compile(r"Standby (?:run )?failed", re.IGNORECASE)
+    _LOG_TAIL_BYTES = 16384
+
+    def _classify_nonzero_exit(self, entry: JobEntry, rc: int) -> tuple[str, str]:
+        """Resolve a non-zero Moses exit against what actually ran.
+
+        Returns ``(status, reason)`` where ``status`` is ``"done"`` or
+        ``"failed"`` and ``reason`` is a human-readable message (always
+        non-empty, so a failed/warned job is never a bare "Failed").
+
+        Process exit stays authoritative for sample acquisitions. The single
+        reconciliation: if the job carried real samples, every sample completed,
+        and *only* the post-run standby park failed, the acquisition data is
+        valid → ``done`` with the standby failure recorded as a warning. Any
+        sample failure, an unparseable/absent log, or a standby-only job (no
+        acquisition to preserve) → ``failed``.
+        """
+        log_text = self._read_log_tail(entry.log_path)
+        reason = self._extract_failure_reason(log_text) or f"Exit code {rc}"
+
+        has_samples = bool(entry.job.get("samples"))
+        sample_failed = bool(self._SAMPLE_FAIL_RE.search(log_text))
+        standby_failed = bool(self._STANDBY_FAIL_RE.search(log_text))
+
+        if has_samples and standby_failed and not sample_failed:
+            return "done", (
+                "Acquisition completed; post-run standby park failed — the "
+                f"instrument may not be in standby. Detail: {reason}"
+            )
+        return "failed", reason
+
+    def _read_log_tail(self, log_path: Path | None) -> str:
+        """Return the tail of the Moses stdout log, or "" if unavailable."""
+        if not log_path:
+            return ""
+        try:
+            data = Path(log_path).read_bytes()
+        except OSError:
+            return ""
+        return data[-self._LOG_TAIL_BYTES:].decode("utf-8", errors="replace")
+
+    def _extract_failure_reason(self, log_text: str) -> str | None:
+        """Pull the per-failure lines run_batch reports into a single message.
+
+        The same failure text appears both as a live ``logger.error`` line and
+        again inside the final ``RuntimeError`` body; normalizing each to the
+        substring from the marker onward lets identical reasons de-duplicate.
+        """
+        if not log_text:
+            return None
+        reasons: dict[str, None] = {}
+        for line in log_text.splitlines():
+            for rx in (self._SAMPLE_FAIL_RE, self._STANDBY_FAIL_RE):
+                m = rx.search(line)
+                if m:
+                    reasons.setdefault(line[m.start():].strip(), None)
+                    break
+        if not reasons:
+            return None
+        return "; ".join(reasons)[:500]
 
     def _launch_entry(self, entry: JobEntry, settings: Settings) -> None:
         """Launch entry without holding the lock."""

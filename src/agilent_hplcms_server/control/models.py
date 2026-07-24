@@ -164,6 +164,11 @@ class QueuedRun(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     pid: int | None = None
+    # Human-readable reason a job finished as it did. Always set when
+    # ``status == "failed"`` (so a failure is never a bare "Failed"), and also
+    # carries the standby-park warning on a job finalized ``done`` after only its
+    # post-run standby step failed (see MosesRunner._classify_nonzero_exit).
+    error_message: str | None = None
 
 
 class QueueResponse(BaseModel):

@@ -711,6 +711,104 @@ def test_poll_marks_failed_on_nonzero_exit():
     assert "Exit code 3" in (entry.error_msg or "")
 
 
+def _write_log(tmp_path: Path, text: str) -> Path:
+    log_path = tmp_path / "job.log"
+    log_path.write_text(text, encoding="utf-8")
+    return log_path
+
+
+# run_batch raises when only the post-run standby park fails, even though every
+# sample acquisition completed and OpenLab recorded the data. The runner must
+# reconcile that to `done` (data is valid) instead of a bare `failed`.
+_STANDBY_ONLY_LOG = (
+    "2026-07-23 12:07:26  INFO      agent — Starting run: cpd_01 | position: D4B-A1\n"
+    "2026-07-23 12:09:50  INFO      agent — Saved result: .../cpd_01.npz\n"
+    "2026-07-23 12:10:04  ERROR     agent — Standby run failed: pump comm timeout\n"
+    "Traceback (most recent call last):\n"
+    "RuntimeError: 1 run(s) failed during batch:\n"
+    "Standby failed: pump comm timeout\n"
+)
+
+_SAMPLE_FAIL_LOG = (
+    "2026-07-23 12:07:26  INFO      agent — Starting run: cpd_01 | position: D4B-A1\n"
+    "2026-07-23 12:08:10  ERROR     agent — Run 1/2 failed (cpd_01): injection error\n"
+    "Traceback (most recent call last):\n"
+    "RuntimeError: 1 run(s) failed during batch:\n"
+    "Run 1/2 failed (cpd_01): injection error\n"
+)
+
+
+def test_poll_standby_park_failure_finalizes_done_with_warning(tmp_path):
+    """A run whose samples all completed but whose post-run standby park failed
+    is finalized `done` (acquisition valid) with the standby problem surfaced in
+    error_msg — not marked `failed` (which would wrongly trigger a re-run)."""
+    runner = MosesRunner()
+    entry = _fake_job_entry("run-standby", status="running")
+    entry.job = {"samples": [{"sample_name": "cpd_01", "sample_position": "D4B-A1"}]}
+    entry.log_path = _write_log(tmp_path, _STANDBY_ONLY_LOG)
+    entry.process.poll.return_value = 1  # type: ignore[union-attr]
+    runner._jobs[entry.queue_id] = entry
+    runner._active_id = entry.queue_id
+
+    runner.poll(settings=Settings())
+
+    assert entry.status == "done"
+    assert "standby park failed" in (entry.error_msg or "").lower()
+    assert "pump comm timeout" in (entry.error_msg or "")
+
+
+def test_poll_sample_failure_still_fails_with_reason(tmp_path):
+    """A genuine sample-acquisition failure stays `failed`, and the reason from
+    the Moses log is captured in error_msg (not a bare 'Exit code N')."""
+    runner = MosesRunner()
+    entry = _fake_job_entry("run-sample-fail", status="running")
+    entry.job = {"samples": [{"sample_name": "cpd_01", "sample_position": "D4B-A1"}]}
+    entry.log_path = _write_log(tmp_path, _SAMPLE_FAIL_LOG)
+    entry.process.poll.return_value = 1  # type: ignore[union-attr]
+    runner._jobs[entry.queue_id] = entry
+    runner._active_id = entry.queue_id
+
+    runner.poll(settings=Settings())
+
+    assert entry.status == "failed"
+    assert "Run 1/2 failed (cpd_01): injection error" in (entry.error_msg or "")
+
+
+def test_poll_standby_only_job_failure_stays_failed(tmp_path):
+    """A standby-only job (POST /control/standby, no samples) that fails has no
+    acquisition to preserve, so it stays `failed`."""
+    runner = MosesRunner()
+    entry = _fake_job_entry("run-standby-only", status="running")
+    entry.job = {"samples": []}
+    entry.log_path = _write_log(tmp_path, _STANDBY_ONLY_LOG)
+    entry.process.poll.return_value = 1  # type: ignore[union-attr]
+    runner._jobs[entry.queue_id] = entry
+    runner._active_id = entry.queue_id
+
+    runner.poll(settings=Settings())
+
+    assert entry.status == "failed"
+    assert "pump comm timeout" in (entry.error_msg or "")
+
+
+def test_queue_status_surfaces_error_message(tmp_path):
+    """GET /control/queue exposes error_message so a failed job shows its reason
+    instead of a bare 'failed'."""
+    runner = MosesRunner()
+    entry = _fake_job_entry("run-visible", status="running")
+    entry.job = {"samples": [{"sample_name": "cpd_01", "sample_position": "D4B-A1"}]}
+    entry.log_path = _write_log(tmp_path, _SAMPLE_FAIL_LOG)
+    entry.process.poll.return_value = 1  # type: ignore[union-attr]
+    runner._jobs[entry.queue_id] = entry
+    runner._active_id = entry.queue_id
+
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    body = client.get("/control/queue").json()
+    job = {j["queue_id"]: j for j in body["queue"]}["run-visible"]
+    assert job["status"] == "failed"
+    assert "injection error" in (job["error_message"] or "")
+
+
 def test_poll_leaves_running_while_process_alive():
     runner = MosesRunner()
     entry = _fake_job_entry("active-123", status="running")
