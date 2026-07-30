@@ -16,8 +16,10 @@ from agilent_hplcms_server.models import PROTOCOL_VERSION
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def _settings() -> Settings:
-    return Settings()
+def _settings(**overrides) -> Settings:
+    base = dict(consumable_ack_file="")  # in-memory ack store — never touch real file
+    base.update(overrides)
+    return Settings(**base)
 
 
 def _load(name: str) -> dict:

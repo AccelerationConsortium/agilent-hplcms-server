@@ -168,7 +168,10 @@ def _settings(**overrides) -> Settings:
     the ``"*"`` wildcard), so the bulk of the suite can claim with arbitrary
     owner strings and still submit + run workflows. Role/service-enforcement
     tests pass explicit group lists."""
-    base = dict(hplcms_users="", hte_users="*", hplcms_admins="")
+    base = dict(
+        hplcms_users="", hte_users="*", hplcms_admins="",
+        consumable_ack_file="",  # in-memory ack store — never touch the real file
+    )
     base.update(overrides)
     return Settings(**base)
 
@@ -1433,34 +1436,109 @@ def test_allowed_actions_mirror_412_when_queue_full():
     assert client.post("/control/standby").status_code == 412
 
 
+# A fresh STAT? ERROR flag on an LC module, with OLSS not in an active state, so
+# the module state reconciles to "error" (not forced "busy" by an acquisition).
+_MODULE_FAULT_SIGNALS = {
+    "module_column_thermostat_state": "error",
+    "module_column_thermostat_stat_flags": ["ERROR"],
+    "module_column_thermostat_stat_age_s": 12,
+    "module_multisampler_state": "error",
+    "module_multisampler_stat_flags": ["ERROR"],
+    "module_multisampler_stat_age_s": 12,
+}
+
+
+def test_subsystem_fault_degrades_status_and_drops_enqueue_verbs():
+    """§2.2: a device MUST NOT report `ready` while an LC module reports error.
+    Two errored modules → top-level `degraded`, enqueue verbs dropped, abort /
+    cancel retained."""
+    runner = FakeRunner(busy=False)
+    signals = {**_load("signals_ready.json"), **_MODULE_FAULT_SIGNALS}
+    client = _client(signals, runner=runner)
+    body = client.get("/status").json()
+
+    assert body["equipment_status"] == "degraded"
+    assert body["components"]["column_thermostat"]["state"] == "error"
+    assert body["components"]["multisampler"]["state"] == "error"
+    assert set(body["details"]["subsystem_fault_modules"]) == {
+        "column_thermostat", "multisampler",
+    }
+    assert "check_column_thermostat" in body["required_actions"]
+    assert "check_multisampler" in body["required_actions"]
+
+    actions = body["allowed_actions"]
+    assert "run.submit" not in actions
+    assert "instrument.standby" not in actions
+    assert "workflow.start" not in actions
+    assert "run.abort" in actions and "queue.cancel" in actions
+
+
+def test_subsystem_fault_refuses_submit_409():
+    """§6.2 invariant, end-to-end: a module fault drops run.submit from
+    allowed_actions AND POSTing it 409s subsystem_fault (fail-closed)."""
+    signals = {**_load("signals_ready.json"), **_MODULE_FAULT_SIGNALS}
+    client = _authed_client(signals)
+
+    r = client.post("/control/run", json=VALID_RUN_BODY)
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["error"] == "subsystem_fault"
+    assert "multisampler" in detail["faulted_modules"]
+
+    # standby and the queue endpoint share the gate.
+    assert client.post("/control/standby").status_code == 409
+    assert client.post("/control/queue", json=VALID_RUN_BODY).status_code == 409
+
+
+def test_subsystem_fault_does_not_override_busy():
+    """A fault mid-acquisition leaves the top-level `busy` (not `degraded`), but
+    still gates enqueue verbs so nothing new launches into faulted hardware."""
+    runner = FakeRunner(busy=False)
+    signals = {
+        **_load("signals_ready.json"),
+        **_MODULE_FAULT_SIGNALS,
+        "acquisition_active": True,
+    }
+    client = _client(signals, runner=runner)
+    body = client.get("/status").json()
+
+    assert body["equipment_status"] == "busy"
+    assert "run.submit" not in body["allowed_actions"]
+
+
 def test_allowed_actions_helper_matches_refusal_property():
     """Unit-level §6.2 property: ``verb in allowed_actions`` iff an enqueue POST
     would NOT refuse, across every combination of the gating conditions."""
     from agilent_hplcms_server.control.actions import allowed_actions
 
-    for requires_init in (False, True):
-        for queue_full in (False, True):
-            for servicing in (False, True):
-                for workflow_active in (False, True):
-                    actions = allowed_actions(
-                        service_operational=True,
-                        requires_init=requires_init,
-                        queue_full=queue_full,
-                        servicing=servicing,
-                        workflow_active=workflow_active,
-                    )
-                    can_enqueue = (
-                        (not requires_init) and (not queue_full) and (not servicing)
-                    )
-                    assert ("run.submit" in actions) is can_enqueue
-                    assert ("instrument.standby" in actions) is can_enqueue
-                    assert ("workflow.start" in actions) is (
-                        can_enqueue and not workflow_active
-                    )
-                    assert ("workflow.end" in actions) is workflow_active
-                    # Non-enqueue verbs are always offered while operational.
-                    assert "run.abort" in actions
-                    assert "queue.cancel" in actions
+    import itertools
+
+    for requires_init, queue_full, servicing, workflow_active, subsystem_fault in (
+        itertools.product((False, True), repeat=5)
+    ):
+        actions = allowed_actions(
+            service_operational=True,
+            requires_init=requires_init,
+            queue_full=queue_full,
+            servicing=servicing,
+            workflow_active=workflow_active,
+            subsystem_fault=subsystem_fault,
+        )
+        can_enqueue = (
+            (not requires_init)
+            and (not queue_full)
+            and (not servicing)
+            and (not subsystem_fault)
+        )
+        assert ("run.submit" in actions) is can_enqueue
+        assert ("instrument.standby" in actions) is can_enqueue
+        assert ("workflow.start" in actions) is (
+            can_enqueue and not workflow_active
+        )
+        assert ("workflow.end" in actions) is workflow_active
+        # Non-enqueue verbs are always offered while operational.
+        assert "run.abort" in actions
+        assert "queue.cancel" in actions
 
     # Not operational (probe_error) → nothing offered.
     assert allowed_actions(
@@ -1551,3 +1629,76 @@ def test_run_robot_submitter_allowed_on_reserved_drawer():
     ]}
     r = client.post("/control/run", json=body)
     assert r.status_code == 202, r.text
+
+
+# ---------------------------------------------------------------------------
+# Consumable acknowledgments (waste emptied / solvent refilled)
+# ---------------------------------------------------------------------------
+
+
+def test_waste_reset_suppresses_empty_waste_bottle():
+    signals = {
+        **_load("signals_ready.json"),
+        "waste_volume_ml": 1908.0, "waste_capacity_ml": 2000.0,
+        "waste_near_capacity": True,
+    }
+    client = _authed_client(signals)
+    body = client.get("/status").json()
+    assert "empty_waste_bottle" in body["required_actions"]
+    assert body["details"].get("waste_near_capacity") is True
+
+    r = client.post("/control/consumables/waste/reset")
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["consumable"] == "waste"
+    assert j["raw_at_ack_ml"] == 1908.0
+    assert j["warning_suppressed"] is True
+
+    body2 = client.get("/status").json()
+    assert "empty_waste_bottle" not in body2["required_actions"]
+    assert "waste_near_capacity" not in body2["details"]
+    assert body2["details"]["waste_reset_at"]
+
+
+def test_waste_warning_rearms_after_more_waste():
+    signals = {
+        **_load("signals_ready.json"),
+        "waste_volume_ml": 1500.0, "waste_capacity_ml": 3000.0,
+        "waste_near_capacity": True,
+    }
+    client = _authed_client(signals)
+    client.post("/control/consumables/waste/reset")  # ack at 1500
+    assert "empty_waste_bottle" not in client.get("/status").json()["required_actions"]
+
+    # New waste accrues past ack + rearm delta (200) → warning re-arms.
+    signals["waste_volume_ml"] = 1750.0
+    assert "empty_waste_bottle" in client.get("/status").json()["required_actions"]
+
+
+def test_solvent_reset_suppresses_low_warning():
+    signals = {
+        **_load("signals_ready.json"),
+        "solvent_a1_volume_ml": 80.0, "solvent_a1_low": True,
+    }
+    client = _authed_client(signals)
+    assert "refill_solvent_a1" in client.get("/status").json()["required_actions"]
+
+    r = client.post("/control/consumables/solvent/a1/reset")
+    assert r.status_code == 200, r.text
+    assert r.json()["consumable"] == "a1"
+
+    body = client.get("/status").json()
+    assert "refill_solvent_a1" not in body["required_actions"]
+    assert "solvent_a1_low" not in body["details"]
+    assert body["details"]["solvent_a1_reset_at"]
+
+
+def test_solvent_reset_unknown_slot_404():
+    client = _authed_client(_load("signals_ready.json"))
+    assert client.post("/control/consumables/solvent/z9/reset").status_code == 404
+
+
+def test_consumable_reset_requires_claim():
+    client = _client(_load("signals_ready.json"))  # no X-Claim-Token
+    assert client.post("/control/consumables/waste/reset").status_code == 423
+    assert client.post("/control/consumables/solvent/a1/reset").status_code == 423

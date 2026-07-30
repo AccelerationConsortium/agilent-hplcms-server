@@ -151,6 +151,22 @@ class Settings:
         r"C:\ProgramData\Agilent\LogFiles\LC Drivers",
     )
 
+    # Consumable (waste/solvent) operator acknowledgments. OpenLab's bottle-fill
+    # numbers are accumulating estimates the sidecar can only read; an operator
+    # who physically empties waste / refills a solvent records the fact here so
+    # the near-capacity / low warning is suppressed until it is genuinely due
+    # again. Persisted so a service restart doesn't resurrect a cleared warning.
+    # See control/consumables.py.
+    consumable_ack_file: str = os.environ.get(
+        "CONSUMABLE_ACK_FILE",
+        r"C:\SDL_Tools\hplcms_consumable_acks.json",
+    )
+    # How far the raw OpenLab estimate must move back toward the warning side of
+    # the limit, relative to the value at acknowledgment, before the warning
+    # re-arms (mL). Waste must climb this much above the acked level (new waste);
+    # a solvent must fall this much below it (consumed again).
+    consumable_rearm_delta_ml: int = _env_int("CONSUMABLE_REARM_DELTA_ML", 200)
+
 
 def load_settings() -> Settings:
     return Settings()

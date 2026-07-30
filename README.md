@@ -57,8 +57,12 @@ Mutating endpoints (marked 🔒) require a valid `X-Claim-Token` header — acqu
 | 🔒 `POST /control/workflow/end` | Release the workflow lock (the claim is retained). Idempotent. |
 | 🔒 `POST /control/service/start` | Enable service mode — halt the queue and refuse submissions while a technician uses OpenLab CDS. Persistent until cleared. **Admin (service) account only** (else 403). |
 | 🔒 `POST /control/service/end` | Clear service mode and resume the queue. Idempotent. Admin-only. |
+| 🔒 `POST /control/consumables/waste/reset` | Acknowledge the waste bottle was physically emptied. Suppresses `waste_near_capacity` / `empty_waste_bottle` until OpenLab's (read-only, accumulating) estimate shows it is due again. Any claim holder. |
+| 🔒 `POST /control/consumables/solvent/{slot}/reset` | Acknowledge a solvent bottle (`a1`/`a2`/`b1`/`b2`) was refilled. Suppresses that slot's `solvent_<slot>_low` / `refill_solvent_<slot>` until the estimate depletes again. 404 for an unknown slot. |
 
-`GET /status.allowed_actions` reports which of `run.submit` · `run.abort` · `queue.cancel` · `instrument.standby` · `workflow.start` · `workflow.end` the device will currently honour, mirroring the control-side *state* precondition refusals (enqueue verbs drop out when the queue is full, OpenLab is down, or a technician is servicing; `workflow.start`/`workflow.end` toggle on workflow state). `service.*` is an operator/dashboard control rather than an agent skill, so it is reported via `details.service_mode` instead of `allowed_actions`.
+An enqueue verb (`POST /control/run` · `/control/queue` · `/control/standby` · `/control/workflow/start`) is also refused **409 `subsystem_fault`** when an LC module (pump / DAD / column thermostat / multisampler) reports a hardware `error` — fail-closed, so a run never launches into faulted hardware. Resolve the fault in OpenLab CDS / at the instrument; the module's STAT? refreshes on the next OpenLab poll and the gate clears.
+
+`GET /status.allowed_actions` reports which of `run.submit` · `run.abort` · `queue.cancel` · `instrument.standby` · `workflow.start` · `workflow.end` the device will currently honour, mirroring the control-side *state* precondition refusals (enqueue verbs drop out when the queue is full, OpenLab is down, a technician is servicing, or an LC module reports a hardware fault; `workflow.start`/`workflow.end` toggle on workflow state). `service.*` is an operator/dashboard control rather than an agent skill, so it is reported via `details.service_mode` instead of `allowed_actions`.
 
 ### Sample submission & positions
 
@@ -124,7 +128,7 @@ curl http://sdl2-pc-06-uplc.tail6a1dd7.ts.net:8010/status
 Per [`INTERLOCKS.md`](https://github.com/AccelerationConsortium/ac-organic-lab/blob/main/docs/INTERLOCKS.md):
 
 - **Layer 1 — Hardware limits:** Pydantic field validators on all numeric parameters (e.g. injection volume ≤ 20 µL, run time ≤ 120 min, flow rate ≤ 2 mL/min). Violations → HTTP 422.
-- **Layer 2 — Device state machine:** HTTP 409 `requires_init` if any OpenLab core process is missing; HTTP 409 `instrument_servicing` if a technician holds the instrument; HTTP 412 `queue_full` (with `Retry-After`) if the queue is at max depth (default 20); HTTP 423 `workflow_active` if a workflow holds the lock.
+- **Layer 2 — Device state machine:** HTTP 409 `requires_init` if any OpenLab core process is missing; HTTP 409 `instrument_servicing` if a technician holds the instrument; HTTP 409 `subsystem_fault` if an LC module reports a hardware error (fail-closed); HTTP 412 `queue_full` (with `Retry-After`) if the queue is at max depth (default 20); HTTP 423 `workflow_active` if a workflow holds the lock.
 - Moses is **never imported** — only called as a subprocess from the `moses_v4_yoyo` conda env. The sidecar stays in its own venv with no vendor dependencies.
 - A **script allowlist** (`MOSES_ALLOWED_SCRIPTS`) prevents arbitrary script execution.
 
@@ -240,6 +244,19 @@ Agilent UI slot labels: A1 → `a1`, A2 → `a2`, B1 → `b1`, B2 → `b2`.  Slo
 
 Low-level bottles appear in `required_actions` as `refill_solvent_a1`, `refill_solvent_b1`, etc.
 
+#### Emptying / refilling — consumable acknowledgments
+
+`waste_volume_ml` and the `solvent_*_volume_ml` values are OpenLab's own **accumulating estimates**, which the sidecar can only read — it never writes OpenLab config. OpenLab does not necessarily reset these on a physical empty/refill, so the `waste_near_capacity` / `solvent_*_low` warnings would otherwise latch on forever, training operators to ignore them.
+
+After physically emptying the waste bottle (or refilling a solvent), acknowledge it so the warning clears:
+
+```powershell
+curl -X POST http://127.0.0.1:8010/control/consumables/waste/reset -H "X-Claim-Token: <token>"
+curl -X POST http://127.0.0.1:8010/control/consumables/solvent/a1/reset -H "X-Claim-Token: <token>"
+```
+
+The ack records OpenLab's raw estimate at that moment and **suppresses** that consumable's warning until the estimate shows the condition is genuinely due again — waste climbing `CONSUMABLE_REARM_DELTA_ML` above the acked level (real new waste), or a solvent depleting that far below it. The ack is persisted (`CONSUMABLE_ACK_FILE`), so a service restart never resurrects a cleared warning. While an ack is active, `/status` drops the warning from `required_actions` and surfaces `details.waste_reset_at` / `details.solvent_<slot>_reset_at` instead. *(The authoritative alternative is resetting the bottle-fill level in OpenLab CDS itself, which the sidecar then reflects automatically.)*
+
 **Not available**
 
 | Key | Reason |
@@ -306,6 +323,7 @@ Writes to `C:\SDL_Tools\hplcms_sensor_data.json` every 30 seconds (override via 
 |---|---|
 | `requires_init` | Any required OpenLab core process missing. |
 | `error` | An `ERROR` / `CRITICAL` / `FATAL` event in the last `ERROR_WINDOW_S` of OpenLab logs. |
+| `degraded` | An LC module (pump / DAD / column thermostat / multisampler) reports a hardware `error` while the box would otherwise be `ready` (§2.2 — never report `ready` over a known subsystem fault). `required_actions` gains `check_<module>`, `details.subsystem_fault_modules` lists the faulted roles, and enqueue verbs drop from `allowed_actions`. A fault mid-run stays `busy`/`error` (caught by OLSS / the log tail). |
 | `paused` | OLSS reports `olss_software_status: "Paused"` while OpenLab is connected. Response includes `required_actions: ["resume_paused_sequence"]`. |
 | `busy` | Newest `*.sirslt` mtime within `BUSY_THRESHOLD_S`, a moses-env `python.exe` running, server-managed run active, or OLSS instrument state is `Run`, `Running`, `Busy`, `Prerun`, or `PostRun`. |
 | `ready` | OpenLab core processes up, no recent error, no recent acquisition activity, no active run. |
@@ -353,6 +371,8 @@ Writes to `C:\SDL_Tools\hplcms_sensor_data.json` every 30 seconds (override via 
 | `ROSTER_API_KEY` | _(empty)_ | Optional `X-Api-Key` sent with the roster pull (endpoint is Tailnet-only by default). |
 | `RESERVED_ROBOT_DRAWER` | `D1F` | Drawer reserved for `submitter="robot"` runs; a manual run whose `sample_position` targets it gets 412 `reserved_for_robot`. `""` disables. |
 | `LABWARE_CONFIG_PATH` | _(empty)_ | JSON mapping each drawer code (`D1F`/`D4B`/…) to the plate actually loaded in it; enables labware-aware validation (422 `plate_mismatch`). Generate with `tools/capture_autosampler_config.py`. Empty → built-in `plate_format` check only. |
+| `CONSUMABLE_ACK_FILE` | `C:\SDL_Tools\hplcms_consumable_acks.json` | Persistent store of operator waste/solvent acknowledgments (see below). Empty → in-memory only (acks lost on restart). |
+| `CONSUMABLE_REARM_DELTA_ML` | `200` | How far OpenLab's raw estimate must move back toward the limit (waste climbing / solvent depleting), relative to the acknowledged level, before the warning re-arms. |
 
 ### Sensor daemon
 

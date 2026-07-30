@@ -9,6 +9,11 @@ from typing import Any
 from . import __version__
 from .config import Settings, load_settings
 from .control.actions import allowed_actions as _allowed_actions
+from .control.consumables import (
+    consumable_direction as _consumable_direction,
+    is_suppressed as _consumable_suppressed,
+    raw_volume_signal as _raw_volume_signal,
+)
 from .models import (
     ComponentStatus,
     EquipmentStatus,
@@ -21,6 +26,7 @@ from .models import (
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .control.claims import ClaimHolder
+    from .control.consumables import ConsumableAcks
     from .control.runner import MosesRunner
 
 
@@ -32,12 +38,43 @@ EQUIPMENT_KIND = "hplc"
 # _OLSS_ACTIVE_STATES in control/runner.py (duplicated to avoid import coupling).
 _OLSS_ACTIVE_STATES: frozenset[str] = frozenset({"Run", "Running", "Busy", "Prerun", "PostRun"})
 
+# LC module role → component builder. Single source for both the /status
+# component cards and the subsystem-fault gate (errored_lc_modules) so the two
+# can never disagree about a module's state.
+def _lc_module_builders() -> dict[str, Any]:
+    return {
+        "binary_pump": _build_pump_component,
+        "dad_detector": _build_dad_component,
+        "column_thermostat": _build_column_component,
+        "multisampler": _build_multisampler_component,
+    }
+
+
+def errored_lc_modules(signals: dict[str, Any]) -> list[str]:
+    """Return the roles of LC modules currently reporting a hardware ``error``.
+
+    Uses the exact component builders that populate ``/status`` (so the
+    subsystem-fault interlock in the control router matches what the dashboard
+    renders). A module whose state reconciles to ``busy`` during an active
+    acquisition, or that has no STAT? data, is not counted — only a live
+    ``error`` state. ``connected`` is assumed True here; a module can only be in
+    ``error`` if the log gave us a STAT? for it.
+    """
+    olss_state = signals.get("olss_instrument_state")
+    faulted: list[str] = []
+    for role, builder in _lc_module_builders().items():
+        comp = builder(signals, True, olss_state)
+        if comp is not None and comp.state == "error":
+            faulted.append(role)
+    return faulted
+
 
 def build_status(
     signals: dict[str, Any],
     settings: Settings | None = None,
     runner: "MosesRunner | None" = None,
     claims: "ClaimHolder | None" = None,
+    consumables: "ConsumableAcks | None" = None,
 ) -> EquipmentStatus:
     """Build an ``EquipmentStatus`` from a probe ``read_signals()`` dict."""
     settings = settings or load_settings()
@@ -73,6 +110,30 @@ def build_status(
     solvent_a2_low: bool = bool(signals.get("solvent_a2_low"))
     solvent_b1_low: bool = bool(signals.get("solvent_b1_low"))
     solvent_b2_low: bool = bool(signals.get("solvent_b2_low"))
+
+    # Suppress a consumable warning the operator has acknowledged (emptied waste
+    # / refilled a solvent) until the raw OpenLab estimate shows it is genuinely
+    # due again. Pure read of the ack store (keeps /status side-effect-free); the
+    # timestamps of any *active* suppression are surfaced in details below.
+    suppressed_consumables: dict[str, str] = {}
+    if consumables is not None:
+        delta = float(settings.consumable_rearm_delta_ml)
+
+        def _suppress(key: str, warn: bool) -> bool:
+            if not warn:
+                return warn
+            ack = consumables.get(key)
+            raw = signals.get(_raw_volume_signal(key))
+            if _consumable_suppressed(ack, raw, _consumable_direction(key), delta):
+                suppressed_consumables[key] = ack.get("acked_at", "")  # type: ignore[union-attr]
+                return False
+            return warn
+
+        waste_near_capacity = _suppress("waste", waste_near_capacity)
+        solvent_a1_low = _suppress("a1", solvent_a1_low)
+        solvent_a2_low = _suppress("a2", solvent_a2_low)
+        solvent_b1_low = _suppress("b1", solvent_b1_low)
+        solvent_b2_low = _suppress("b2", solvent_b2_low)
 
     olss_state: str | None = signals.get("olss_instrument_state")
     olss_sw_status: str | None = signals.get("olss_software_status")
@@ -208,14 +269,32 @@ def build_status(
     # Only added when signal data is present; absent = no component card shown.
     _lc_module_conn = olss_connected or bool(signals.get("openlab_acquisition_alive"))
 
-    for role, comp in [
-        ("binary_pump",       _build_pump_component(signals, _lc_module_conn, olss_state)),
-        ("dad_detector",      _build_dad_component(signals, _lc_module_conn, olss_state)),
-        ("column_thermostat", _build_column_component(signals, _lc_module_conn, olss_state)),
-        ("multisampler",      _build_multisampler_component(signals, _lc_module_conn, olss_state)),
-    ]:
+    for role, builder in _lc_module_builders().items():
+        comp = builder(signals, _lc_module_conn, olss_state)
         if comp is not None:
             components[role] = comp
+
+    # §2.2: an LC module reporting a hardware `error` is an active subsystem
+    # fault. The top-level MUST NOT stay `ready` while it knows of one. If we are
+    # otherwise ready, downgrade to `degraded` (MS/comms are up, but a run can't
+    # safely start) and surface a per-module check action. `busy`/`error`/
+    # `requires_init` are left as-is: a fault mid-run is caught by OLSS/log-tail
+    # `error`, and requires_init is the more fundamental condition. This same
+    # module-error set gates enqueue actions (below and in the control router).
+    faulted_modules = [
+        role
+        for role in _lc_module_builders()
+        if role in components and components[role].state == "error"
+    ]
+    if faulted_modules and equipment_state == "ready":
+        equipment_state = "degraded"
+        message = (
+            "Subsystem fault — LC module(s) reporting error: "
+            + ", ".join(faulted_modules)
+        )
+        required_actions = list(required_actions) + [
+            f"check_{role}" for role in faulted_modules
+        ]
 
     details: dict[str, Any] = {
         "instrument_label": settings.instrument_label,
@@ -246,11 +325,22 @@ def build_status(
         details["olss_error"] = signals["olss_error"]
     if signals.get("rc_driver_data_age_s") is not None:
         details["rc_driver_data_age_s"] = signals["rc_driver_data_age_s"]
+    # Consumable flags reflect the *effective* (post-acknowledgment) state so
+    # details never disagree with required_actions.
+    _solvent_low = {
+        "a1": solvent_a1_low, "a2": solvent_a2_low,
+        "b1": solvent_b1_low, "b2": solvent_b2_low,
+    }
     if waste_near_capacity:
         details["waste_near_capacity"] = True
-    for _slot in ("a1", "a2", "b1", "b2"):
-        if signals.get(f"solvent_{_slot}_low"):
+    for _slot, _low in _solvent_low.items():
+        if _low:
             details[f"solvent_{_slot}_low"] = True
+    # Surface the acknowledgment timestamp of each *currently suppressing* ack so
+    # the dashboard can show "emptied/refilled at …" instead of the warning.
+    for _key, _acked_at in suppressed_consumables.items():
+        _label = "waste" if _key == "waste" else f"solvent_{_key}"
+        details[f"{_label}_reset_at"] = _acked_at
 
     # v1.1: surface the current claim holder (null when unclaimed/expired).
     claimed_by = claims.current() if claims is not None else None
@@ -275,6 +365,7 @@ def build_status(
         queue_full=queue_full,
         servicing=servicing,
         workflow_active=workflow_active,
+        subsystem_fault=bool(faulted_modules),
     )
 
     # Surface the precedence state so the dashboard can explain *why* the
@@ -292,6 +383,8 @@ def build_status(
         details["workflow_active"] = True
         if claimed_by is not None and equipment_state == "busy":
             message = f"Autonomous workflow running (held by {claimed_by.owner!r})"
+    if faulted_modules:
+        details["subsystem_fault_modules"] = faulted_modules
 
     return EquipmentStatus(
         equipment_id=EQUIPMENT_ID,

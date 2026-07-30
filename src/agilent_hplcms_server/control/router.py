@@ -13,6 +13,7 @@ from .models import (
     ClaimRejection,
     ClaimRequest,
     ClaimResponse,
+    ConsumableResetResponse,
     EquipmentBusyError,
     HeartbeatResponse,
     InstrumentServicingError,
@@ -29,10 +30,18 @@ from .models import (
     ServiceModeResponse,
     StandbyResponse,
     StartupResponse,
+    SubsystemFaultError,
     UserNotRecognizedError,
     WorkflowActiveError,
     WorkflowEndResponse,
     WorkflowStartResponse,
+)
+from .consumables import (
+    ConsumableAcks,
+    SOLVENT_SLOTS,
+    consumable_direction,
+    is_suppressed,
+    raw_volume_signal,
 )
 from .roster import can_service, can_workflow
 from .roster_sync import RosterProvider
@@ -55,6 +64,10 @@ def _get_claims(request: Request) -> ClaimHolder:
 
 def _get_roster(request: Request) -> RosterProvider:
     return request.app.state.roster  # type: ignore[no-any-return]
+
+
+def _get_consumables(request: Request) -> ConsumableAcks:
+    return request.app.state.consumables  # type: ignore[no-any-return]
 
 
 def _require_claim(request: Request) -> str:
@@ -116,6 +129,30 @@ def _check_servicing(request: Request, signals: dict) -> None:
                     "The queue is halted; resubmit once servicing finishes."
                 ),
                 olss_state=signals.get("olss_instrument_state"),
+            ).model_dump(mode="json"),
+        )
+
+
+def _check_subsystem_fault(signals: dict) -> None:
+    """Refuse an enqueue while an LC module reports a hardware error (409
+    subsystem_fault, fail-closed) so a run never launches into faulted hardware.
+    Uses the same module-state derivation as ``/status`` (imported lazily to
+    avoid a control ⇄ status_builder import cycle), so this refusal and the
+    dropped ``run.submit`` in ``allowed_actions`` can never disagree."""
+    from ..status_builder import errored_lc_modules
+
+    faulted = errored_lc_modules(signals)
+    if faulted:
+        raise HTTPException(
+            status_code=409,
+            detail=SubsystemFaultError(
+                detail=(
+                    "LC module(s) reporting a hardware error: "
+                    + ", ".join(faulted)
+                    + ". Resolve the fault in OpenLab CDS / at the instrument, "
+                    "then resubmit."
+                ),
+                faulted_modules=faulted,
             ).model_dump(mode="json"),
         )
 
@@ -333,7 +370,7 @@ def startup(request: Request) -> StartupResponse:
     status_code=202,
     summary="Quick-submit a run (starts immediately if idle, queues if busy)",
     responses={
-        409: {"model": RequiresInitError | InstrumentServicingError},
+        409: {"model": RequiresInitError | InstrumentServicingError | SubsystemFaultError},
         412: {"model": QueueFullError | ReservedForRobotError},
         423: {"model": ClaimRejection | WorkflowActiveError},
     },
@@ -361,6 +398,7 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     runner.poll(settings=settings)
     _check_requires_init(signals)
     _check_servicing(request, signals)
+    _check_subsystem_fault(signals)
     _check_reserved_drawer(body, settings)
     _check_labware(body, settings)
 
@@ -399,7 +437,7 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     status_code=202,
     summary="Submit a run to the job queue",
     responses={
-        409: {"model": RequiresInitError | InstrumentServicingError},
+        409: {"model": RequiresInitError | InstrumentServicingError | SubsystemFaultError},
         412: {"model": QueueFullError | ReservedForRobotError},
         423: {"model": ClaimRejection | WorkflowActiveError},
     },
@@ -419,6 +457,7 @@ def post_to_queue(body: RunRequest, request: Request) -> QueueResponse:
     runner.poll(settings=settings)
     _check_requires_init(signals)
     _check_servicing(request, signals)
+    _check_subsystem_fault(signals)
     _check_reserved_drawer(body, settings)
     _check_labware(body, settings)
 
@@ -553,7 +592,7 @@ def abort_run(request: Request) -> AbortResponse:
     status_code=202,
     summary="Park the instrument in low-flow standby",
     responses={
-        409: {"model": RequiresInitError | InstrumentServicingError},
+        409: {"model": RequiresInitError | InstrumentServicingError | SubsystemFaultError},
         412: {"model": QueueFullError},
         423: {"model": ClaimRejection | WorkflowActiveError},
     },
@@ -575,6 +614,7 @@ def standby(request: Request) -> StandbyResponse:
     runner.poll(settings=settings)
     _check_requires_init(signals)
     _check_servicing(request, signals)
+    _check_subsystem_fault(signals)
 
     standby_job = {
         "instrument_config_path": "examples/hh_472_config.json",
@@ -748,7 +788,7 @@ def release(
     summary="Take the equipment-blocking workflow lock (HTE platform users only)",
     responses={
         403: {"model": RoleForbiddenError},
-        409: {"model": RequiresInitError | InstrumentServicingError},
+        409: {"model": RequiresInitError | InstrumentServicingError | SubsystemFaultError},
         423: {"model": ClaimRejection},
     },
 )
@@ -786,6 +826,7 @@ def workflow_start(request: Request) -> WorkflowStartResponse:
     runner.poll(settings=settings)
     _check_requires_init(signals)
     _check_servicing(request, signals)
+    _check_subsystem_fault(signals)
 
     grant = claims.start_workflow(token)
     return WorkflowStartResponse(
@@ -882,3 +923,81 @@ def service_end(request: Request) -> ServiceModeResponse:
         service_mode=False,
         message="Service mode cleared. Queue resumes; submissions accepted.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Consumable acknowledgments. OpenLab's bottle-fill numbers are read-only,
+# accumulating estimates; when an operator physically empties the waste bottle
+# or refills a solvent, they acknowledge it here so the near-capacity / low
+# warning is suppressed until the raw estimate shows it is genuinely due again
+# (see control/consumables.py). Any valid claim holder may acknowledge — a
+# routine operator action, not admin-gated.
+# ---------------------------------------------------------------------------
+
+
+def _reset_consumable(request: Request, key: str, label: str) -> ConsumableResetResponse:
+    _require_claim(request)
+    consumables = _get_consumables(request)
+    settings = _get_settings(request)
+
+    signals = _read_signals(request)
+    raw = signals.get(raw_volume_signal(key))
+    raw = float(raw) if isinstance(raw, (int, float)) else None
+    ack = consumables.record(key, raw)
+
+    suppressed = is_suppressed(
+        ack, raw, consumable_direction(key), float(settings.consumable_rearm_delta_ml)
+    )
+    return ConsumableResetResponse(
+        consumable=key,
+        raw_at_ack_ml=raw,
+        acked_at=ack["acked_at"],
+        warning_suppressed=suppressed,
+        message=(
+            f"{label} acknowledged. The warning is suppressed until the OpenLab "
+            "estimate shows it is due again."
+        ),
+    )
+
+
+@router.post(
+    "/consumables/waste/reset",
+    response_model=ConsumableResetResponse,
+    summary="Acknowledge the waste bottle was emptied",
+    responses={423: {"model": ClaimRejection}},
+)
+def reset_waste(request: Request) -> ConsumableResetResponse:
+    """Record that the waste bottle was physically emptied.
+
+    Suppresses ``waste_near_capacity`` / the ``empty_waste_bottle`` required
+    action until OpenLab's (read-only, accumulating) estimate climbs
+    ``CONSUMABLE_REARM_DELTA_ML`` above the level at acknowledgment. Persisted, so
+    a service restart does not resurrect the warning.
+
+    HTTP 423 if the ``X-Claim-Token`` is missing or stale.
+    """
+    return _reset_consumable(request, "waste", "Waste bottle emptied")
+
+
+@router.post(
+    "/consumables/solvent/{slot}/reset",
+    response_model=ConsumableResetResponse,
+    summary="Acknowledge a solvent bottle was refilled",
+    responses={404: {}, 423: {"model": ClaimRejection}},
+)
+def reset_solvent(slot: str, request: Request) -> ConsumableResetResponse:
+    """Record that a solvent bottle (``a1`` / ``a2`` / ``b1`` / ``b2``) was
+    refilled. Suppresses that slot's ``solvent_<slot>_low`` / ``refill_solvent_<slot>``
+    until OpenLab's estimate falls ``CONSUMABLE_REARM_DELTA_ML`` below the level at
+    acknowledgment.
+
+    - HTTP 404 if ``slot`` is not one of a1/a2/b1/b2.
+    - HTTP 423 if the ``X-Claim-Token`` is missing or stale.
+    """
+    slot = slot.lower()
+    if slot not in SOLVENT_SLOTS:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown solvent slot {slot!r}; expected one of {list(SOLVENT_SLOTS)}.",
+        )
+    return _reset_consumable(request, slot, f"Solvent {slot.upper()} refilled")

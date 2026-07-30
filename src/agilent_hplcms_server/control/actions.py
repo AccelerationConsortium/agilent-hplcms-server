@@ -15,11 +15,12 @@ Action names match ``Skill.name`` in the lab skill catalog
 * ``workflow.end``       → ``POST /control/workflow/end``
 
 The *enqueue* actions (``run.submit``, ``instrument.standby``, ``workflow.start``)
-refuse when the queue is full (412), OpenLab is not up (409 requires_init), or a
-technician is driving OpenLab directly (409 instrument_servicing). ``run.abort``
-and ``queue.cancel`` carry no device precondition — they only ever shrink the
-queue / kill the active process — so they are always offered while the service
-itself is operational.
+refuse when the queue is full (412), OpenLab is not up (409 requires_init), a
+technician is driving OpenLab directly (409 instrument_servicing), or an LC
+module reports a hardware fault (409 subsystem_fault). ``run.abort`` and
+``queue.cancel`` carry no device precondition — they only ever shrink the queue /
+kill the active process — so they are always offered while the service itself is
+operational.
 
 ``allowed_actions`` is identity-agnostic by design (§6.2): it reflects the
 device's *state* preconditions, not who is calling. Just as it lists
@@ -40,8 +41,8 @@ ACTION_WORKFLOW_START = "workflow.start"
 ACTION_WORKFLOW_END = "workflow.end"
 
 # Actions whose POST enqueues a Moses job (or, for workflow.start, takes the
-# equipment-blocking lock); gated by requires_init (409), servicing (409), and a
-# full queue (412).
+# equipment-blocking lock); gated by requires_init (409), servicing (409), a
+# subsystem fault (409), and a full queue (412).
 ENQUEUE_ACTIONS = (ACTION_RUN_SUBMIT, ACTION_INSTRUMENT_STANDBY)
 
 
@@ -52,6 +53,7 @@ def allowed_actions(
     queue_full: bool,
     servicing: bool = False,
     workflow_active: bool = False,
+    subsystem_fault: bool = False,
 ) -> list[str]:
     """Return the skill names the device would currently honour.
 
@@ -70,11 +72,19 @@ def allowed_actions(
       the queue is halted and enqueue actions return 409 instrument_servicing.
     - ``workflow_active`` — a workflow holds the equipment-blocking lock; toggles
       the ``workflow.start`` / ``workflow.end`` verbs (see module docstring).
+    - ``subsystem_fault`` — an LC module (pump / DAD / column thermostat /
+      multisampler) reports a hardware error; enqueue actions return 409
+      subsystem_fault so we never launch a run into faulted hardware.
     """
     if not service_operational:
         return []
 
-    can_enqueue = (not requires_init) and (not queue_full) and (not servicing)
+    can_enqueue = (
+        (not requires_init)
+        and (not queue_full)
+        and (not servicing)
+        and (not subsystem_fault)
+    )
 
     out: list[str] = []
     if can_enqueue:

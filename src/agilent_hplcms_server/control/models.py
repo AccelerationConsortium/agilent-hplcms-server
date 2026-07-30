@@ -284,6 +284,21 @@ class PlateMismatchError(BaseModel):
     configured: str | None = None
 
 
+class SubsystemFaultError(BaseModel):
+    """Body for HTTP 409 when an LC module reports a hardware ``error`` (per its
+    STAT? flags in RCDriver.log): the pump, DAD, column thermostat, or
+    multisampler. Enqueue actions are refused so the sidecar never launches a run
+    into faulted hardware — fail-closed. Like requires_init this is a 409
+    (current-state conflict, clears when the module recovers), not a 412, and
+    carries no ``Retry-After`` (recovery time is unpredictable) and MUST NOT
+    populate ``last_error``. Resolve the fault in OpenLab CDS / at the instrument;
+    the module's STAT? refreshes on the next OpenLab poll and the gate clears."""
+
+    error: Literal["subsystem_fault"] = "subsystem_fault"
+    detail: str
+    faulted_modules: list[str]
+
+
 class InstrumentServicingError(BaseModel):
     """Body for HTTP 409 when a technician is running samples directly in
     OpenLab CDS (highest precedence). The sidecar queue is halted and new
@@ -374,6 +389,19 @@ class ServiceModeResponse(BaseModel):
 
     status: Literal["service_mode_on", "service_mode_off"]
     service_mode: bool
+    message: str
+
+
+class ConsumableResetResponse(BaseModel):
+    """Response for the consumable acknowledgment endpoints (waste emptied /
+    solvent refilled). Records the raw OpenLab estimate at the moment of the ack;
+    the corresponding warning is suppressed until that estimate shows the
+    condition is genuinely due again (see control/consumables.py)."""
+
+    consumable: str
+    raw_at_ack_ml: float | None = None
+    acked_at: datetime
+    warning_suppressed: bool
     message: str
 
 
