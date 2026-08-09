@@ -197,3 +197,66 @@ def test_communication_metrics_are_unknown_without_olss_state():
     assert "ms_communication_ok" not in metrics
     assert "pump_communication_ok" not in metrics
     assert "autosampler_communication_ok" not in metrics
+
+
+# ---------------------------------------------------------------------------
+# STATUS_SPEC v1.2 — activity is orthogonal to health (§2.3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_activity_span():
+    """The activity span tracker is module-level state; isolate tests."""
+    from agilent_hplcms_server import status_builder as sb
+
+    sb._activity = "unknown"
+    sb._activity_since = None
+    yield
+    sb._activity = "unknown"
+    sb._activity_since = None
+
+
+@pytest.mark.parametrize(
+    "fixture_name,expected_activity",
+    [
+        ("signals_ready.json", "idle"),
+        ("signals_busy.json", "running"),
+        ("signals_olss_run.json", "running"),
+        # A paused sequence is an operation in progress, not a finished one.
+        ("signals_olss_paused.json", "running"),
+        # §2.3 invariant: requires_init ⇒ idle.
+        ("signals_requires_init.json", "idle"),
+        # probe_error: we cannot observe the instrument at all.
+        ("signals_unknown.json", "unknown"),
+    ],
+)
+def test_activity_is_observed_per_state(fixture_name: str, expected_activity: str):
+    client, _ = _client_with_signals(_load(fixture_name))
+    body = client.get("/status").json()
+    assert body["activity"] == expected_activity
+    if expected_activity != "unknown":
+        assert body["activity_since"] is not None
+
+
+def test_error_with_run_in_flight_reports_error_and_running():
+    """The v1.2 payoff: health-first (§2.2) no longer loses the run — an
+    error landing mid-acquisition reports `error` + activity `running`,
+    which pre-v1.2 collapsed to `error` alone."""
+    signals = _load("signals_olss_run.json")
+    signals["last_error"] = {
+        "code": "olss_error",
+        "message": "Recent OpenLab error event",
+        "severity": "error",
+        "timestamp": "2026-07-26T05:00:00Z",
+    }
+    client, _ = _client_with_signals(signals)
+    body = client.get("/status").json()
+    assert body["equipment_status"] == "error"
+    assert body["activity"] == "running"
+
+
+def test_activity_since_is_span_start_not_poll_time():
+    client, _ = _client_with_signals(_load("signals_ready.json"))
+    first = client.get("/status").json()["activity_since"]
+    second = client.get("/status").json()["activity_since"]
+    assert first == second  # unchanged activity does not restart the span

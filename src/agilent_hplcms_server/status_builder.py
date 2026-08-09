@@ -1,4 +1,4 @@
-"""Map probe signals to a STATUS_SPEC v1.1 ``EquipmentStatus`` envelope."""
+"""Map probe signals to a STATUS_SPEC v1.2 ``EquipmentStatus`` envelope."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from . import __version__
 from .config import Settings, load_settings
 from .control.actions import allowed_actions as _allowed_actions
 from .models import (
+    PROTOCOL_VERSION,
     ComponentStatus,
     EquipmentStatus,
     ErrorInfo,
@@ -31,6 +32,24 @@ EQUIPMENT_KIND = "hplc"
 # OLSS instrument states that indicate an active acquisition. Must match
 # _OLSS_ACTIVE_STATES in control/runner.py (duplicated to avoid import coupling).
 _OLSS_ACTIVE_STATES: frozenset[str] = frozenset({"Run", "Running", "Busy", "Prerun", "PostRun"})
+
+# --- v1.2 activity span tracking (STATUS_SPEC §2.3) --------------------------
+# The primary operation is an ACQUISITION (injection / gradient in progress —
+# a run in flight, whether submitted through this sidecar's queue or directly
+# in OpenLab). Observed from the acquisition signals, never derived from
+# `equipment_status`. Module-level because build_status is otherwise
+# stateless: `activity_since` must stamp the instant the value changes, not
+# the enclosing probe read.
+_activity: str = "unknown"
+_activity_since: datetime | None = None
+
+
+def _note_activity(activity: str) -> tuple[str, datetime | None]:
+    global _activity, _activity_since
+    if activity != _activity:
+        _activity = activity
+        _activity_since = datetime.now(timezone.utc)
+    return _activity, _activity_since
 
 
 def build_status(
@@ -137,6 +156,25 @@ def build_status(
         equipment_state = "ready"
         message = "OpenLab supervisor up; no active acquisition"
         required_actions = []
+
+    # v1.2 activity (§2.3): computed INDEPENDENTLY of the health precedence
+    # above, from the same observed acquisition signals — so a run that is in
+    # flight when an error lands still reports `error` + activity "running"
+    # (health-first, §2.2, without losing the run). A paused sequence is an
+    # operation in progress, not a finished one → "running" (see README).
+    acquiring = bool(
+        sequence_paused
+        or signals.get("acquisition_active")
+        or signals.get("moses_process_alive")
+        or olss_acquiring
+    )
+    if probe_error:
+        observed_activity = "unknown"  # we cannot observe the instrument
+    elif not core_up:
+        observed_activity = "idle"  # §2.3 invariant: requires_init ⇒ idle
+    else:
+        observed_activity = "running" if acquiring else "idle"
+    activity, activity_since = _note_activity(observed_activity)
 
     # Consumable warnings are appended regardless of instrument state so the
     # client can act on them even during a run.
@@ -294,6 +332,9 @@ def build_status(
             message = f"Autonomous workflow running (held by {claimed_by.owner!r})"
 
     return EquipmentStatus(
+        # Explicit: the shared contract model's field default is "1.0" (a
+        # device that doesn't state its version is a pre-spec device).
+        protocol_version=PROTOCOL_VERSION,
         equipment_id=EQUIPMENT_ID,
         equipment_name=EQUIPMENT_NAME,
         equipment_kind=EQUIPMENT_KIND,
@@ -302,6 +343,8 @@ def build_status(
         equipment_status=equipment_state,
         message=message,
         required_actions=required_actions,
+        activity=activity,  # type: ignore[arg-type]
+        activity_since=activity_since,
         device_time=datetime.now(timezone.utc),
         components=components,
         metrics=_build_metrics(signals),

@@ -1,6 +1,6 @@
 [project]
 name = "agilent_hplcms_server"
-version = "0.1.0"
+version = "0.3.0"
 description = "Read-only STATUS_SPEC v1.0 sidecar for the existing Agilent UPLC-MS controller (moses) on this lab PC."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -9,6 +9,9 @@ authors = [
     { name = "Yang Cao" },
 ]
 dependencies = [
+    # Shared STATUS_SPEC contract types (spec major.minor == package
+    # version). Git source pinned by tag in [tool.uv.sources].
+    "sdl-lab-contract",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
     "pydantic>=2.6",
@@ -30,3 +33,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agilent_hplcms_server"]
+
+[tool.uv.sources]
+sdl-lab-contract = { git = "https://github.com/AccelerationConsortium/sdl-lab-contract", tag = "v1.2.0" }

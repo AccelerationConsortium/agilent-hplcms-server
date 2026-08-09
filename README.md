@@ -2,7 +2,7 @@
 
 Status and control sidecar for the Agilent UPLC-MS instrument (`SDL2_LC1290`) on this lab PC. Runs alongside the existing `moses` Python controller and the always-on Agilent OpenLab CDS supervisor.
 
-This repo conforms to lab status spec v1.1: see [`docs/STATUS_SPEC.md`](https://github.com/AccelerationConsortium/ac-organic-lab/blob/main/docs/STATUS_SPEC.md). v1.1 adds cooperative claims (`/control/claim` · `/control/heartbeat` · `/control/release`), `allowed_actions` on `/status`, and `details.claimed_by`. **Claims are hard-enforced**: mutating `/control/*` calls require a valid `X-Claim-Token` and are rejected with HTTP 423 Locked otherwise (read-only `GET /control/queue` and `POST /control/startup` stay open).
+This repo conforms to **lab status spec v1.2** (contract types from the shared [`sdl-lab-contract`](https://github.com/AccelerationConsortium/sdl-lab-contract) package): see [`docs/STATUS_SPEC.md`](https://github.com/AccelerationConsortium/ac-organic-lab/blob/main/docs/STATUS_SPEC.md). v1.1 adds cooperative claims (`/control/claim` · `/control/heartbeat` · `/control/release`), `allowed_actions` on `/status`, and `details.claimed_by`. **Claims are hard-enforced**: mutating `/control/*` calls require a valid `X-Claim-Token` and are rejected with HTTP 423 Locked otherwise (read-only `GET /control/queue` and `POST /control/startup` stay open).
 
 ## Install / run
 
@@ -34,7 +34,7 @@ Start-Process powershell -Verb RunAs -ArgumentList "-Command C:\SDL_Tools\nssm.e
 |---|---|
 | `GET /` | `{equipment_id, equipment_name, protocol_version}` |
 | `GET /health` | `{status: "healthy"}` |
-| `GET /status` | `EquipmentStatus` envelope per STATUS_SPEC v1.1 (incl. `allowed_actions`, `details.claimed_by`) |
+| `GET /status` | `EquipmentStatus` envelope per STATUS_SPEC v1.2 (incl. `allowed_actions`, `details.claimed_by`, `activity`/`activity_since`) |
 | `GET /openapi.json` | Generated OpenAPI spec |
 
 ### Control
@@ -160,6 +160,32 @@ Submissions are gated by precedence (highest wins):
 2. **Workflow** — a robot/agent campaign (a series of runs) holding the equipment-blocking lock via `POST /control/workflow/start`. Non-holders are refused `423 workflow_active` (with `Retry-After`); only the lock holder submits. The lock rides on the claim, so it inherits TTL/heartbeat/auto-expiry — a crashed holder loses it.
 3. **Our queue job running** — normal FIFO queue; ETA is bounded by the gradient `run_time`.
 4. **Idle** — a single sample is submitted into the queue.
+
+## Activity (spec v1.2)
+
+**Primary operation (§2.3): an acquisition** — an injection/gradient in
+flight, whether submitted through this sidecar's queue or started directly in
+OpenLab. `/status` reports `activity: "running"` for exactly that span,
+observed from the acquisition signals (sirslt writes, the Moses process, OLSS
+Run/Prerun/PostRun/Busy) and never derived from `equipment_status`;
+`activity_since` stamps the start of the current span.
+
+Policy decisions, deliberate and reader-visible:
+
+- **A paused sequence is `activity: "running"`** — the operation is in
+  progress, not finished (mirrors the OT-2 pause semantics). The pause itself
+  stays visible in `equipment_status: "busy"` + `required_actions:
+  ["resume_paused_sequence"]` + `details.olss_software_status`.
+- **An error mid-run reports `error` + `activity: "running"`** — health-first
+  (§2.2) no longer erases the fact that a run is in flight.
+- **`metrics["cycles_total"]` is deliberately omitted.** The §9 checklist
+  recommends it for devices whose primary operation can be shorter than 60 s;
+  UPLC-MS runs are minutes to hours, so the sampled activity series sees every
+  run, and completed-run records belong to the results catalog, not /status.
+- **`run.submit` stays in `allowed_actions` while a run is in flight** — this
+  device is queue-based: a submit *enqueues* (the sidecar FIFO serialises), it
+  never starts a second concurrent run, so §2.3's omit-while-running rule does
+  not apply; queue capacity gates it instead (412 `queue_full`).
 
 `details.service_mode` reflects the explicit flag; `details.servicing` reflects either source. A paused OpenLab sequence (`olss_software_status: "Paused"`) is reported as `equipment_status: "busy"` with `required_actions: ["resume_paused_sequence"]` — `paused` is not a legal v1.1 `EquipmentState`.
 
@@ -412,6 +438,6 @@ while True:
 
 ## See also
 
-- [`STATUS_SPEC.md`](https://github.com/AccelerationConsortium/ac-organic-lab/blob/main/docs/STATUS_SPEC.md) — v1.1 contract this repo implements.
+- [`STATUS_SPEC.md`](https://github.com/AccelerationConsortium/ac-organic-lab/blob/main/docs/STATUS_SPEC.md) — the v1.0/v1.1/v1.2 contract this repo implements.
 - [`INTERLOCKS.md`](https://github.com/AccelerationConsortium/ac-organic-lab/blob/main/docs/INTERLOCKS.md) — interlock layer design this server conforms to.
 - [`DEVICE_PC_SETUP.md`](https://github.com/AccelerationConsortium/ac-organic-lab/blob/main/docs/DEVICE_PC_SETUP.md) — canonical Windows install recipe (uv at `C:\SDL_Tools\uv.exe`, NSSM, lab-user run, log paths).
