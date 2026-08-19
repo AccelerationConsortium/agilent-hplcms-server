@@ -43,7 +43,8 @@ import psutil
 
 from ..config import Settings, load_settings
 from .openlab_rest import read_instrument_state
-from .rc_driver_log import read_module_states, read_rc_driver_log
+from .dx_pressure import read_run_pressure
+from .rc_driver_log import read_lc_faults, read_module_states, read_rc_driver_log
 from .sensor_file import read_sensor_file
 
 
@@ -377,6 +378,23 @@ def read_signals(settings: Settings | None = None) -> dict[str, Any]:
     sensor = read_sensor_file(settings.sensor_data_file)
     rc_driver = read_rc_driver_log(settings.rc_driver_log_dir)
     module_states = read_module_states(settings.rc_driver_log_dir)
+    # Faults are reconciled against the module STAT? states read just above: a
+    # module that has since reported READY has recovered.
+    lc_faults = read_lc_faults(
+        settings.rc_driver_log_dir,
+        window_s=settings.lc_fault_window_s,
+        module_states=module_states,
+    )
+    # Post-run pressure QC from the archived .dx traces. Read-only, and the
+    # directory walk behind it is TTL-cached, so this stays off the hot path.
+    run_pressure = read_run_pressure(
+        settings.cds_results_dir,
+        drift_pct=settings.pressure_drift_pct,
+        baseline_runs=settings.pressure_baseline_runs,
+        scan_runs=settings.pressure_scan_runs,
+        root_limit=settings.result_scan_root_limit,
+        dir_limit=settings.result_scan_dir_limit,
+    )
 
     return {
         "openlab_acquisition_alive": bool(acq_alive),
@@ -403,4 +421,8 @@ def read_signals(settings: Settings | None = None) -> dict[str, Any]:
         **rc_driver,
         # Per-module LC status from LDT SendInstruction entries in RCDriver.log
         **module_states,
+        # Active LC module hardware faults (leak / overcurrent / comms loss)
+        **lc_faults,
+        # Post-run pump pressure summary + same-method baseline comparison
+        **run_pressure,
     }

@@ -287,7 +287,7 @@ The ack records OpenLab's raw estimate at that moment and **suppresses** that co
 
 | Key | Reason |
 |---|---|
-| `system_pressure_bar`, `flow_rate_ml_min`, `column_temperature_c` | OpenLab SignalBuffer (port 9753) — WCF/SOAP endpoint, REST sub-paths return 404 |
+| `system_pressure_bar`, `flow_rate_ml_min`, `column_temperature_c` | *Live* values only. OpenLab SignalBuffer (port 9753) is a duplex publish/subscribe WCF service, not REST (GET returns 405). Post-run pressure **is** available — see [Post-run pressure QC](#post-run-pressure-qc). |
 | `calibrant_ok`, `last_calibration_date`, `leak_detected` | No accessible source on this setup |
 
 ## Per-module LC components
@@ -305,6 +305,49 @@ Each component has `state`: `ready` / `busy` / `error` / `not_ready` / `unknown`
 
 - While OLSS reports an active run (`Running`, `Busy`, etc.), all module states are forced to `"busy"`.
 - When OLSS is idle, each module uses its own STAT? readiness flags (`READY` / `NOT_READY` / `ERROR`), ignoring stale run-phase tokens.
+- An **active hardware fault** (below) overrides both — a module can be mid-run, and so reporting `busy`, while the driver has already logged a leak against it.
+
+## Module hardware faults
+
+`RCDriver.log` also carries the LC driver's own error channel, with a severity the driver assigns per event:
+
+```
+ControlIF log error: eLogAndAbortSequence, G7167B:DEBAS04772 - Leak detected [64 64, 0]
+```
+
+| Driver token | Meaning | Reported severity |
+|---|---|---|
+| `eLogAndAbortSequence` | Aborts the whole sequence | `critical` |
+| `eLogAndAbortCurrentRunOnly` | Aborts the current run | `error` |
+| `eLogInformationMessage` | Routine chatter (`"Valve is switched to bypass"`) | ignored |
+
+Faults observed on this instrument: `Leak detected [64]`, `Valve hardware overcurrent [22412]`, `Solvent counter limit exceeded [22055]`, `Communication error`, `Shutdown [63]`.
+
+When a fault is active, `GET /status` reports:
+
+- `equipment_status: "error"`, with `message` naming the module and fault;
+- `last_error` = the fault (module-attributed text, Agilent event code, driver severity) — this **outranks** the log-tail error, which stays reachable via `details.last_error_log_path`;
+- `required_actions: ["check_<role>", ...]` and `details.subsystem_fault_modules`;
+- `details.lc_faults` — the full list, most actionable first, so the dashboard can show the cascade (one module's leak shuts the other three down) rather than only the promoted fault;
+- `allowed_actions` drops `run.submit` / `instrument.standby` / `workflow.start`, and `POST /control/run` refuses with **409 `subsystem_fault`**. A run never launches into faulted hardware.
+
+**Clearing.** The driver never writes a fault-cleared line, so a fault is held until either it ages out of `LC_FAULT_WINDOW_S`, or the module's own `STAT?` — timestamped *after* the fault — reports it back to `READY`. An unresolved fault keeps the module out of `READY`, so it survives; a transient one clears as soon as the module recovers.
+
+See [`docs/fault_detection.md`](docs/fault_detection.md) for the evidence behind this and the plan for pressure monitoring.
+
+## Post-run pressure QC
+
+This instrument has no live pressure feed, but every completed run archives its full pump pressure trace inside `<run>.dx`. The sidecar reads it directly (`probes/dx_trace.py` — pure Python, no .NET) and compares each finished run against its peers.
+
+- **Measured:** peak / min / mean pressure of the newest completed run, from the `PMP1B,Pressure` trace (~24 000 points at 25 ms).
+- **Baseline:** the *median peak* of the recent runs of the **same method**. Per-method and short-horizon on purpose — the same method six days apart on this instrument sat at 197 bar and 422 bar peak after a column change.
+- **Warning:** peak deviating from the baseline by more than `PRESSURE_DRIFT_PCT` adds `check_lc_pressure` to `required_actions`.
+
+`GET /status` gains `metrics.run_pressure_{max,min,mean,baseline}_bar`, `metrics.run_pressure_delta_pct`, and `details.run_pressure` (run, method, baseline_n, drift).
+
+This check is **advisory**: it sets no fault, does not change `equipment_status`, and never blocks run submission — the threshold has no tuning data behind it yet. Promoting it to blocking is a deliberate follow-up.
+
+Cost to `/status` is ~0.8 ms steady-state: the results-tree walk is TTL-cached for 60 s and run summaries are cached on file identity. Nothing is written, so `/status` stays side-effect-free.
 
 ## Sensor daemon
 
@@ -315,7 +358,7 @@ The live MS hardware metrics come from a companion daemon that runs in the `mose
 - **OpenLab InstrumentController** (Named Pipe) — used only for connection events and to know OpenLab is online. Does not supply any sensor readings.
 
 **Data sources confirmed unavailable:**
-- OpenLab SignalBufferService (`DESKTOP-V2PV40S:9753`) — WCF/SOAP POST-only endpoint; REST sub-paths return 404. Would give live pressure, flow rate, column temperature. Deferred.
+- OpenLab SignalBufferService (`DESKTOP-V2PV40S:9753`) — a duplex publish/subscribe WCF service (`ISBSConnectRealtimePlot` + an `InformClient` callback, over Agilent's own `Agilent.OpenLab.Communication` bus), not REST: GET returns 405 on every path. Would give live pressure, flow rate, column temperature. Deferred — see [`docs/fault_detection.md`](docs/fault_detection.md).
 - LC module hardware (`192.168.254.59`) — no HTTP API on that LAN card; telnet port 23 is LAN config only.
 
 ### Run the daemon
@@ -374,6 +417,10 @@ Writes to `C:\SDL_Tools\hplcms_sensor_data.json` every 30 seconds (override via 
 | `OPENLAB_USERNAME` | `sdl2` | Username for OLSS login (empty password, no-auth mode). |
 | `OPENLAB_INSTRUMENT_ID` | `15` | Numeric OLSS instrument ID for SDL2_LC1290. |
 | `SENSOR_DATA_FILE` | `C:\SDL_Tools\hplcms_sensor_data.json` | JSON file written by the sensor daemon; absent → metrics show as `"—"`. |
+| `LC_FAULT_WINDOW_S` | `3600` | Look-back window for LC module hardware faults. `0` disables fault detection. |
+| `PRESSURE_DRIFT_PCT` | `15.0` | Post-run peak-pressure deviation from the same-method baseline that raises `check_lc_pressure`. |
+| `PRESSURE_BASELINE_RUNS` | `8` | Prior same-method runs forming the baseline median. `0` disables pressure QC. |
+| `PRESSURE_SCAN_RUNS` | `24` | Recent completed runs examined when looking for same-method peers. |
 
 ### Control / queue
 
