@@ -41,12 +41,21 @@ module_multisampler_stat_flags
 module_multisampler_stat_age_s
 module_multisampler_drawers_occupied — count of hotel drawers with a plate/vial
 module_multisampler_drawers_total    — total hotel drawer slots reported
+
+Returned signals (module hardware faults — see read_lc_faults)
+--------------------------------------------------------------
+lc_faults             — list[dict] of active faults, most actionable first
+lc_fault_active       — True when at least one fault is active
+lc_fault_severity     — "critical" | "error" of the top fault
+lc_fault_message      — human text of the top fault ("G7167B multisampler: Leak detected")
+lc_fault_module_roles — roles of the modules currently faulted
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -91,6 +100,21 @@ def _read_file(path: Path) -> str:
         logger.debug("rc_driver_log: read failed: %s", exc)
         return ""
     return data.decode("utf-8", errors="replace")
+
+
+def _iter_lines(path: Path) -> Iterator[str]:
+    """Stream a log file line by line.
+
+    The fault scan only ever needs one line at a time, and these logs reach
+    10 MB, so streaming keeps peak memory flat where ``_read_file`` would hold
+    the whole decoded file. Measured on a 10 MB RCDriver.log: streaming the
+    whole file costs ~18 ms, against ~10 MB resident for the slurped form.
+    """
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            yield from f
+    except OSError as exc:
+        logger.debug("rc_driver_log: stream failed: %s", exc)
 
 
 def _find_target_line(log_dir: Path) -> str | None:
@@ -144,6 +168,31 @@ def _stat_flags_to_state(flags: list[str]) -> str:
     if "READY" in fs:
         return "ready"
     return "unknown"
+
+
+def _stat_readiness(flags: list[str] | None) -> str | None:
+    """Readiness carried by a STAT? reply, ignoring its run-phase token.
+
+    ``_stat_flags_to_state`` ranks RUN/PRERUN/POSTRUN above READY because for a
+    component card the run phase is the more useful thing to show. That ranking
+    makes the composite state useless for recovery detection: this instrument
+    stamps *every* STAT? reply with PRERUN (173 of 173 across all retained
+    logs), so the state is never ``"ready"`` and a module could never be
+    observed to recover. The readiness flags themselves are unambiguous —
+    ``NO_ERROR, READY`` means the module is back — so read those directly.
+
+    Returns ``None`` when the reply carries no readiness flag at all.
+    """
+    if not flags:
+        return None
+    fs = {f.upper() for f in flags}
+    if "ERROR" in fs:
+        return "error"
+    if "NOT_READY" in fs or "NOTREADY" in fs:
+        return "not_ready"
+    if "READY" in fs:
+        return "ready"
+    return None
 
 
 def read_module_states(log_dir: str | Path) -> dict[str, Any]:
@@ -299,6 +348,203 @@ def read_module_states(log_dir: str | Path) -> dict[str, Any]:
                 out["module_multisampler_drawers_total"] = len(drawers)
 
     return out
+
+
+# ── Module hardware faults ────────────────────────────────────────────────────
+#
+# The RC driver writes three correlated lines per fault; we parse the
+# `ControlIF log error` one because it carries severity, module, text and code
+# together:
+#
+#   ControlIF log error: eLogAndAbortSequence, G7167B:DEBAS04772 - Leak detected [64 64, 0];Category: ...
+#
+# The `eLog*` token is the severity the driver itself assigns to the event.
+# `eLogInformationMessage` is routine operational chatter ("Valve is switched to
+# bypass") and is dropped; only the two abort levels are faults.
+_FAULT_SEVERITY: dict[str, str] = {
+    "eLogAndAbortSequence": "critical",
+    "eLogAndAbortCurrentRunOnly": "error",
+}
+
+_FAULT_RE = re.compile(
+    r"ControlIF log error: (eLog\w+), "      # severity token
+    r"([A-Za-z0-9]+):(\S+?) - "              # module model : serial
+    r"(.*?)"                                 # human text (lazy)
+    r"(?: \[(\d+) \d+, \d+\])?"              # optional [code code, n]
+    r";Category:"                            # end-of-message anchor
+)
+
+# Abort-level events that are not hardware faults: the controller asking the
+# module to stop is how a normal abort looks from the driver's point of view.
+_FAULT_BENIGN_RE = re.compile(
+    r"Controller stop automation request",
+    re.IGNORECASE,
+)
+
+# "Shutdown" is what every other module reports once one of them faults, so it
+# describes the blast radius rather than the cause. Kept (the system really did
+# shut down) but ranked below a causal fault so `lc_fault_message` names the
+# leak rather than the cascade.
+_FAULT_CASCADE_RE = re.compile(r"^Shutdown$", re.IGNORECASE)
+
+_SEVERITY_RANK: dict[str, int] = {"critical": 0, "error": 1}
+
+# Faults older than this are ignored. The log is append-only and — in every
+# retained log on this instrument — a fault-cleared line is never written, so
+# without a window a leak from last month would pin the instrument into `error`
+# forever. See also the STAT?-recovery reconciliation in _drop_recovered().
+DEFAULT_FAULT_WINDOW_S: int = 3600
+
+
+def _fault_log_candidates(log_dir: Path, window_s: int) -> list[Path]:
+    """Return every RCDriver log that could hold a fault inside the window.
+
+    RCDriver.log rotates at 10 MB, which on a busy day is ~25 minutes, so a
+    fault within the window is often in a rotated file. A log whose mtime
+    predates the window cannot contain an in-window fault, so mtime filtering is
+    both correct and cheap.
+    """
+    cutoff = datetime.now().timestamp() - window_s
+    try:
+        return [
+            p
+            for p in log_dir.glob("*RCDriver*.log")
+            if p.stat().st_mtime >= cutoff
+        ]
+    except OSError:
+        return []
+
+
+def _drop_recovered(
+    faults: list[dict[str, Any]], module_states: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Drop faults whose module has since reported itself READY.
+
+    The driver never logs a fault-cleared line, so recovery is inferred from the
+    module's own STAT? readiness flags: a STAT? that is *newer* than the fault
+    (smaller age) and reports READY means the module came back. This is what
+    makes a one-hour window safe — a genuinely unresolved fault keeps the module
+    out of READY, so it survives the filter.
+
+    Readiness is read via :func:`_stat_readiness`, NOT from the composite
+    ``module_<role>_state``: that state ranks the run-phase token above READY,
+    and every STAT? this instrument emits carries PRERUN, so comparing it to
+    ``"ready"`` never matched and no fault ever cleared on recovery — it only
+    aged out of the window. The composite state is still the fallback for a
+    module whose flags are missing.
+    """
+    out: list[dict[str, Any]] = []
+    for fault in faults:
+        role = fault.get("role")
+        if role:
+            state = _stat_readiness(
+                module_states.get(f"module_{role}_stat_flags")
+            ) or module_states.get(f"module_{role}_state")
+            stat_age = module_states.get(f"module_{role}_stat_age_s")
+            if (
+                state == "ready"
+                and stat_age is not None
+                and stat_age < fault["age_s"]
+            ):
+                continue
+        out.append(fault)
+    return out
+
+
+def read_lc_faults(
+    log_dir: str | Path,
+    window_s: int = DEFAULT_FAULT_WINDOW_S,
+    module_states: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Parse active LC module hardware faults from the RC driver logs.
+
+    Parameters
+    ----------
+    log_dir:
+        Directory holding ``RCDriver.log`` and its rotated siblings.
+    window_s:
+        Only faults this recent count. ``0`` disables fault detection entirely.
+    module_states:
+        The dict from :func:`read_module_states`, used to clear faults whose
+        module has since reported READY. Omitting it means no recovery
+        reconciliation — faults then persist for the whole window.
+
+    Returns an empty dict when there is nothing to report, so the status builder
+    treats missing keys as "no known fault".
+    """
+    if window_s <= 0:
+        return {}
+    log_dir_path = Path(log_dir)
+    if not log_dir_path.exists():
+        return {}
+
+    now = datetime.now()
+    faults: list[dict[str, Any]] = []
+    # A fault is written to several files (and repeated within one), so
+    # de-duplicate on the identity of the event itself.
+    seen: set[tuple[str, str, str]] = set()
+
+    for path in _fault_log_candidates(log_dir_path, window_s):
+        for line in _iter_lines(path):
+            m = _FAULT_RE.search(line)
+            if m is None:
+                continue
+            token, module_code, serial, message, code = m.groups()
+            severity = _FAULT_SEVERITY.get(token)
+            if severity is None:
+                continue
+            message = message.strip().rstrip(".")
+            if _FAULT_BENIGN_RE.search(message):
+                continue
+            ts = _parse_timestamp(line)
+            if ts is None:
+                continue
+            age_s = (now - ts).total_seconds()
+            if age_s > window_s or age_s < 0:
+                continue
+            key = (module_code, message, ts.isoformat())
+            if key in seen:
+                continue
+            seen.add(key)
+            faults.append(
+                {
+                    "module_code": module_code,
+                    "role": _MODULE_ROLES.get(module_code),
+                    "serial": serial,
+                    "message": message,
+                    "code": code,
+                    "severity": severity,
+                    # RC driver timestamps are naive *local* time; astimezone()
+                    # attaches the real local offset so downstream parsing does
+                    # not silently read them as UTC.
+                    "timestamp": ts.astimezone().isoformat(),
+                    "age_s": round(age_s, 1),
+                }
+            )
+
+    faults = _drop_recovered(faults, module_states or {})
+    if not faults:
+        return {}
+
+    # Most actionable first: severity, then causal-before-cascade, then newest.
+    faults.sort(
+        key=lambda f: (
+            _SEVERITY_RANK.get(f["severity"], 9),
+            1 if _FAULT_CASCADE_RE.match(f["message"]) else 0,
+            f["age_s"],
+        )
+    )
+    top = faults[0]
+    label = top["role"] or top["module_code"]
+    return {
+        "lc_faults": faults,
+        "lc_fault_active": True,
+        "lc_fault_severity": top["severity"],
+        "lc_fault_message": f"{top['module_code']} {label}: {top['message']}",
+        "lc_fault_module_roles": sorted(
+            {f["role"] for f in faults if f["role"]}
+        ),
+    }
 
 
 def read_rc_driver_log(log_dir: str | Path) -> dict[str, Any]:

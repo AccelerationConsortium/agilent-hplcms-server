@@ -20,6 +20,16 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class Settings:
     openlab_log_dir: str = os.environ.get(
@@ -150,6 +160,24 @@ class Settings:
         "RC_DRIVER_LOG_DIR",
         r"C:\ProgramData\Agilent\LogFiles\LC Drivers",
     )
+
+    # How far back to look for LC module hardware faults (leak, valve
+    # overcurrent, comms loss) in the RC driver logs. The driver never writes a
+    # fault-cleared line, so a fault is held for this long unless the module's
+    # own STAT? reports it back to READY first (see probes/rc_driver_log.py
+    # read_lc_faults). Set to 0 to disable fault detection.
+    lc_fault_window_s: int = _env_int("LC_FAULT_WINDOW_S", 3600)
+
+    # Post-run pump-pressure QC (probes/dx_pressure.py). Each completed run's
+    # peak pressure is compared against the median peak of the recent runs of
+    # the SAME method; a deviation beyond pressure_drift_pct is reported as an
+    # advisory warning (it sets no fault and blocks no submission). Baselining is
+    # per-method and short-horizon deliberately: the same method six days apart
+    # on this instrument sat at 197 bar and 422 bar peak after a column change.
+    # Set pressure_baseline_runs to 0 to disable.
+    pressure_drift_pct: float = _env_float("PRESSURE_DRIFT_PCT", 15.0)
+    pressure_baseline_runs: int = _env_int("PRESSURE_BASELINE_RUNS", 8)
+    pressure_scan_runs: int = _env_int("PRESSURE_SCAN_RUNS", 24)
 
     # Consumable (waste/solvent) operator acknowledgments. OpenLab's bottle-fill
     # numbers are accumulating estimates the sidecar can only read; an operator

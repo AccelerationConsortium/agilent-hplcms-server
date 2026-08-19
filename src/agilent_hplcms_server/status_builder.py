@@ -57,15 +57,25 @@ def errored_lc_modules(signals: dict[str, Any]) -> list[str]:
     Uses the exact component builders that populate ``/status`` (so the
     subsystem-fault interlock in the control router matches what the dashboard
     renders). A module whose state reconciles to ``busy`` during an active
-    acquisition, or that has no STAT? data, is not counted — only a live
-    ``error`` state. ``connected`` is assumed True here; a module can only be in
-    ``error`` if the log gave us a STAT? for it.
+    acquisition is not counted — only a live ``error`` state. ``connected`` is
+    assumed True here.
+
+    Two things put a module in ``error``: a ``STAT?`` reply carrying the ERROR
+    flag, and an active hardware fault from the driver's own error channel
+    (``lc_fault_module_roles``). The fault roles are unioned in explicitly as
+    well as flowing through the builders, because a module that has logged a
+    fault but never logged a ``STAT?`` produces no component card at all — and a
+    fault must never fail to gate run submission just because we are missing its
+    readiness reply.
     """
     olss_state = signals.get("olss_instrument_state")
     faulted: list[str] = []
     for role, builder in _lc_module_builders().items():
         comp = builder(signals, True, olss_state)
         if comp is not None and comp.state == "error":
+            faulted.append(role)
+    for role in signals.get("lc_fault_module_roles") or ():
+        if role not in faulted:
             faulted.append(role)
     return faulted
 
@@ -120,6 +130,21 @@ def build_status(
             message=last_error_dict.get("message", ""),
             severity=last_error_dict.get("severity", "error"),
             timestamp=_parse_iso(last_error_dict.get("timestamp"))
+            or datetime.now(timezone.utc),
+        )
+
+    # An active LC module fault outranks the log-tail error unconditionally: it
+    # names a module, carries the driver's own severity and an Agilent event
+    # code, and describes hardware rather than software. The displaced log-tail
+    # error stays reachable via details.last_error_log_path.
+    lc_faults: list[dict[str, Any]] = signals.get("lc_faults") or []
+    if lc_faults:
+        top_fault = lc_faults[0]
+        last_error = ErrorInfo(
+            code=top_fault.get("code"),
+            message=signals.get("lc_fault_message") or top_fault.get("message", ""),
+            severity=top_fault.get("severity", "error"),
+            timestamp=_parse_iso(top_fault.get("timestamp"))
             or datetime.now(timezone.utc),
         )
 
@@ -195,8 +220,16 @@ def build_status(
         required_actions = ["start_openlab"]
     elif last_error is not None:
         equipment_state = "error"
-        message = "Recent OpenLab error event in log tail"
-        required_actions = []
+        if lc_faults:
+            message = f"LC module fault — {last_error.message}"
+            # Surfaced here as well as in the `faulted_modules` block below,
+            # which only fires from `ready`; a fault puts us straight in `error`.
+            required_actions = [
+                f"check_{role}" for role in signals.get("lc_fault_module_roles") or ()
+            ]
+        else:
+            message = "Recent OpenLab error event in log tail"
+            required_actions = []
     elif sequence_paused:
         # OLSS "Paused" is not a legal EquipmentState (v1.1 dropped "paused").
         # Report "busy" — the instrument is mid-sequence and unavailable — and
@@ -250,6 +283,14 @@ def build_status(
         required_actions = list(required_actions) + ["refill_solvent_b1"]
     if solvent_b2_low:
         required_actions = list(required_actions) + ["refill_solvent_b2"]
+
+    # Post-run pressure drift is ADVISORY: it appends an action but never changes
+    # equipment_status and never joins faulted_modules, so it cannot halt the lab
+    # on a heuristic that has no tuning data behind it yet. Promoting it to a
+    # blocking condition is a deliberate follow-up once a baseline exists —
+    # see docs/fault_detection.md.
+    if signals.get("run_pressure_drift"):
+        required_actions = list(required_actions) + ["check_lc_pressure"]
 
     # Map OLSS instrument state to a component state string understood by clients.
     def _olss_to_component_state(s: str | None) -> str:
@@ -320,11 +361,17 @@ def build_status(
     # `requires_init` are left as-is: a fault mid-run is caught by OLSS/log-tail
     # `error`, and requires_init is the more fundamental condition. This same
     # module-error set gates enqueue actions (below and in the control router).
+    # Must stay identical to errored_lc_modules(), which the control router uses
+    # for the same gate — hence the same union of component-error and
+    # fault-derived roles (see that function for why the union is needed).
     faulted_modules = [
         role
         for role in _lc_module_builders()
         if role in components and components[role].state == "error"
     ]
+    for role in signals.get("lc_fault_module_roles") or ():
+        if role not in faulted_modules:
+            faulted_modules.append(role)
     if faulted_modules and equipment_state == "ready":
         equipment_state = "degraded"
         message = (
@@ -364,6 +411,24 @@ def build_status(
         details["olss_error"] = signals["olss_error"]
     if signals.get("rc_driver_data_age_s") is not None:
         details["rc_driver_data_age_s"] = signals["rc_driver_data_age_s"]
+    # Full fault list (most actionable first) so the dashboard can show the
+    # cascade — one module's leak shuts the other three down — not just the
+    # single fault promoted to last_error.
+    if lc_faults:
+        details["lc_faults"] = lc_faults
+    if signals.get("run_pressure_run"):
+        details["run_pressure"] = {
+            "run": signals.get("run_pressure_run"),
+            "method": signals.get("run_pressure_method"),
+            "max_bar": signals.get("run_pressure_max_bar"),
+            "min_bar": signals.get("run_pressure_min_bar"),
+            "mean_bar": signals.get("run_pressure_mean_bar"),
+            "duration_s": signals.get("run_pressure_duration_s"),
+            "baseline_bar": signals.get("run_pressure_baseline_bar"),
+            "baseline_n": signals.get("run_pressure_baseline_n"),
+            "delta_pct": signals.get("run_pressure_delta_pct"),
+            "drift": bool(signals.get("run_pressure_drift")),
+        }
     # Consumable flags reflect the *effective* (post-acknowledgment) state so
     # details never disagree with required_actions.
     _solvent_low = {
@@ -448,6 +513,28 @@ def build_status(
     )
 
 
+def _module_state(
+    signals: dict[str, Any],
+    role: str,
+    module_state: str | None,
+    olss_state: str | None,
+    stat_age_s: float | None,
+    stat_flags: list[str] | None = None,
+) -> str:
+    """Component state for one LC module, faults taking precedence.
+
+    An active hardware fault (see ``probes/rc_driver_log.read_lc_faults``) beats
+    whatever ``STAT?`` last said: a module can be mid-run — and so reporting
+    ``busy`` — while the driver has already logged a leak against it. Routing
+    faults through here rather than a parallel list is what keeps
+    ``errored_lc_modules`` (and so the control-side ``subsystem_fault``
+    interlock) in agreement with the component cards.
+    """
+    if role in (signals.get("lc_fault_module_roles") or ()):
+        return "error"
+    return _module_state_with_olss(module_state, olss_state, stat_age_s, stat_flags)
+
+
 def _module_state_with_olss(
     module_state: str | None,
     olss_state: str | None,
@@ -502,7 +589,7 @@ def _build_pump_component(
         parts.append(f"last seen {age / 3600:.1f}h ago")
     return ComponentStatus(
         connected=connected,
-        state=_module_state_with_olss(state_raw, olss_state, age, flags),
+        state=_module_state(signals, "binary_pump", state_raw, olss_state, age, flags),
         message=", ".join(parts) or None,
     )
 
@@ -527,7 +614,7 @@ def _build_dad_component(
         parts.append(f"last seen {age / 3600:.1f}h ago")
     return ComponentStatus(
         connected=connected,
-        state=_module_state_with_olss(state_raw, olss_state, age, flags),
+        state=_module_state(signals, "dad_detector", state_raw, olss_state, age, flags),
         message=", ".join(parts) or None,
     )
 
@@ -548,7 +635,7 @@ def _build_column_component(
         parts.append(f"last seen {age / 3600:.1f}h ago")
     return ComponentStatus(
         connected=connected,
-        state=_module_state_with_olss(state_raw, olss_state, age, flags),
+        state=_module_state(signals, "column_thermostat", state_raw, olss_state, age, flags),
         message=", ".join(parts) or None,
     )
 
@@ -570,7 +657,7 @@ def _build_multisampler_component(
         parts.append(f"last seen {age / 3600:.1f}h ago")
     return ComponentStatus(
         connected=connected,
-        state=_module_state_with_olss(state_raw, olss_state, age, flags),
+        state=_module_state(signals, "multisampler", state_raw, olss_state, age, flags),
         message=", ".join(parts) or None,
     )
 
@@ -605,6 +692,15 @@ def _build_metrics(signals: dict[str, Any]) -> dict[str, MetricValue]:
     _put("drying_gas_temperature_c",      signals.get("drying_gas_temperature_c"),     "\u00b0C")
     _put("nebulizer_pressure_psig",       signals.get("nebulizer_pressure_psig"),      "psig")
     _put("hv_ready",                      signals.get("hv_ready"))
+
+    # --- Post-run pump pressure QC (from the archived .dx traces) ---
+    # Distinct from system_pressure_bar below: these describe the last COMPLETED
+    # run, not the live instrument, which has no pressure feed on this setup.
+    _put("run_pressure_max_bar",          signals.get("run_pressure_max_bar"),         "bar")
+    _put("run_pressure_min_bar",          signals.get("run_pressure_min_bar"),         "bar")
+    _put("run_pressure_mean_bar",         signals.get("run_pressure_mean_bar"),        "bar")
+    _put("run_pressure_baseline_bar",     signals.get("run_pressure_baseline_bar"),    "bar")
+    _put("run_pressure_delta_pct",        signals.get("run_pressure_delta_pct"),       "%")
 
     # --- LC System (from sensor daemon JSON file) ---
     _put("system_pressure_bar",           signals.get("system_pressure_bar"),          "bar")
