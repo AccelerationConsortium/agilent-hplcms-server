@@ -57,10 +57,12 @@ Mutating endpoints (marked 🔒) require a valid `X-Claim-Token` header — acqu
 | 🔒 `POST /control/workflow/end` | Release the workflow lock (the claim is retained). Idempotent. |
 | 🔒 `POST /control/service/start` | Enable service mode — halt the queue and refuse submissions while a technician uses OpenLab CDS. Persistent until cleared. **Admin (service) account only** (else 403). |
 | 🔒 `POST /control/service/end` | Clear service mode and resume the queue. Idempotent. Admin-only. |
+| 🔒 `POST /control/faults/{module}/ack` | Acknowledge an LC module hardware fault after physically checking the module (`binary_pump` / `dad_detector` / `column_thermostat` / `multisampler`). Clears the fault evidence that exists *now*, so `/status` leaves `error` and `run.submit` is accepted again; a newer fault re-arms it. Optional `?note=`. 404 for an unknown module. **Admin (service) account only** (else 403). |
+| 🔒 `DELETE /control/faults/{module}/ack` | Withdraw an acknowledgment, restoring any fault still inside the detection window. 404 if none is recorded. Admin-only. |
 | 🔒 `POST /control/consumables/waste/reset` | Acknowledge the waste bottle was physically emptied. Suppresses `waste_near_capacity` / `empty_waste_bottle` until OpenLab's (read-only, accumulating) estimate shows it is due again. Any claim holder. |
 | 🔒 `POST /control/consumables/solvent/{slot}/reset` | Acknowledge a solvent bottle (`a1`/`a2`/`b1`/`b2`) was refilled. Suppresses that slot's `solvent_<slot>_low` / `refill_solvent_<slot>` until the estimate depletes again. 404 for an unknown slot. |
 
-An enqueue verb (`POST /control/run` · `/control/queue` · `/control/standby` · `/control/workflow/start`) is also refused **409 `subsystem_fault`** when an LC module (pump / DAD / column thermostat / multisampler) reports a hardware `error` — fail-closed, so a run never launches into faulted hardware. Resolve the fault in OpenLab CDS / at the instrument; the module's STAT? refreshes on the next OpenLab poll and the gate clears.
+An enqueue verb (`POST /control/run` · `/control/queue` · `/control/standby` · `/control/workflow/start`) is also refused **409 `subsystem_fault`** when an LC module (pump / DAD / column thermostat / multisampler) reports a hardware `error` — fail-closed, so a run never launches into faulted hardware. Resolve the fault in OpenLab CDS / at the instrument; the module's STAT? refreshes on the next OpenLab poll and the gate clears — or, once the module has been checked, acknowledge it with `POST /control/faults/{module}/ack`.
 
 `GET /status.allowed_actions` reports which of `run.submit` · `run.abort` · `queue.cancel` · `instrument.standby` · `workflow.start` · `workflow.end` the device will currently honour, mirroring the control-side *state* precondition refusals (`run.submit` drops out when the queue is full, OpenLab is down, service mode is on, or an LC module reports a hardware fault; `instrument.standby` and `workflow.start` additionally drop out under auto-detected servicing, since they take the instrument now rather than queueing; `workflow.start`/`workflow.end` toggle on workflow state). `service.*` is an operator/dashboard control rather than an agent skill, so it is reported via `details.service_mode` instead of `allowed_actions`.
 
@@ -340,7 +342,13 @@ When a fault is active, `GET /status` reports:
 - `details.lc_faults` — the full list, most actionable first, so the dashboard can show the cascade (one module's leak shuts the other three down) rather than only the promoted fault;
 - `allowed_actions` drops `run.submit` / `instrument.standby` / `workflow.start`, and `POST /control/run` refuses with **409 `subsystem_fault`**. A run never launches into faulted hardware.
 
-**Clearing.** The driver never writes a fault-cleared line, so a fault is held until either it ages out of `LC_FAULT_WINDOW_S`, or the module's own `STAT?` — timestamped *after* the fault — reports it back to `READY`. An unresolved fault keeps the module out of `READY`, so it survives; a transient one clears as soon as the module recovers.
+**Clearing.** The driver never writes a fault-cleared line, so a fault is held until one of three things happens:
+
+1. it ages out of `LC_FAULT_WINDOW_S` (default 1 h);
+2. the module's own `STAT?` — timestamped *after* the fault — reports it back to `READY`. An unresolved fault keeps the module out of `READY`, so it survives; a transient one clears as soon as the module recovers;
+3. an operator acknowledges it: `POST /control/faults/{module}/ack`.
+
+The acknowledgment exists because (2) is only *observable* at prerun — `STAT?` is written when a run starts, so a module repaired while the instrument sits idle has no way to report its recovery, and the fault holds for the full hour with `run.submit` refused behind it while OpenLab itself shows green. Acking clears the evidence present at that moment (the logged faults **and** a stale `STAT?` still carrying `ERROR`); anything the driver logs afterwards re-arms the fault in full, so it needs no expiry and cannot mask the next failure. An acknowledged module reports `not_ready`, not `ready` — it has not sent a `READY` since, and the sidecar will not invent one. `details.fault_acks` names every module that is green only because someone vouched for it.
 
 See [`docs/fault_detection.md`](docs/fault_detection.md) for the evidence behind this and the plan for pressure monitoring.
 

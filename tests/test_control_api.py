@@ -202,6 +202,7 @@ def _settings(**overrides) -> Settings:
     base = dict(
         hplcms_users="", hte_users="*", hplcms_admins="",
         consumable_ack_file="",  # in-memory ack store — never touch the real file
+        lc_fault_ack_file="",   # ditto for module fault acknowledgments
     )
     base.update(overrides)
     return Settings(**base)
@@ -1637,7 +1638,10 @@ def test_workflow_end_idempotent_without_active_workflow():
 # ---------------------------------------------------------------------------
 
 def _admin_settings(**overrides) -> Settings:
-    base = dict(hplcms_users="", hte_users="", hplcms_admins="Service-Account")
+    base = dict(
+        hplcms_users="", hte_users="", hplcms_admins="Service-Account",
+        consumable_ack_file="", lc_fault_ack_file="",
+    )
     base.update(overrides)
     return Settings(**base)
 
@@ -2075,3 +2079,145 @@ def test_consumable_reset_requires_claim():
     client = _client(_load("signals_ready.json"))  # no X-Claim-Token
     assert client.post("/control/consumables/waste/reset").status_code == 423
     assert client.post("/control/consumables/solvent/a1/reset").status_code == 423
+
+
+# ---------------------------------------------------------------------------
+# LC module fault acknowledgments (POST/DELETE /control/faults/{role}/ack).
+#
+# The exit the fault channel was missing. Agilent's driver never logs a
+# fault-cleared line and a module's STAT? — the one recovery signal the probe can
+# read — is only written at prerun, so a module fixed while the instrument sits
+# idle stays faulted for the whole LC_FAULT_WINDOW_S with run.submit refused
+# behind it. Service-role gated: acknowledging asserts something about the
+# physical instrument and releases a safety interlock.
+# ---------------------------------------------------------------------------
+
+# The multisampler mid-abort: a critical fault plus the stale STAT? that latched
+# ERROR with it. Both channels must go quiet or the module card stays red.
+_ACK_FAULT_AT = "2026-08-20T20:53:47.142000-04:00"
+_ACK_STAT_AT = "2026-08-20T20:53:47.584000"
+_NEEDLE_FAULT_SIGNALS = {
+    "lc_faults": [
+        {
+            "module_code": "G7167B",
+            "role": "multisampler",
+            "serial": "DEBAS04772",
+            "message": "Needle command failed",
+            "code": "25022",
+            "severity": "critical",
+            "timestamp": _ACK_FAULT_AT,
+            "age_s": 900.0,
+        },
+        {
+            "module_code": "G7120A",
+            "role": "binary_pump",
+            "serial": "DEBA201988",
+            "message": "Analysis aborted by another module",
+            "code": None,
+            "severity": "error",
+            "timestamp": _ACK_FAULT_AT,
+            "age_s": 900.0,
+        },
+    ],
+    "lc_fault_active": True,
+    "lc_fault_severity": "critical",
+    "lc_fault_message": "G7167B multisampler: Needle command failed",
+    "lc_fault_module_roles": ["binary_pump", "multisampler"],
+    "module_multisampler_state": "error",
+    "module_multisampler_stat_flags": ["PRERUN", "ERROR", "NOT_READY"],
+    "module_multisampler_stat_age_s": 900.0,
+    "module_multisampler_stat_at": _ACK_STAT_AT,
+    "module_binary_pump_state": "not_ready",
+    "module_binary_pump_stat_flags": ["PRERUN", "NO_ERROR", "NOT_READY"],
+    "module_binary_pump_stat_age_s": 900.0,
+    "module_binary_pump_stat_at": _ACK_STAT_AT,
+}
+
+
+def _faulted_signals() -> dict:
+    return {**_load("signals_ready.json"), **_NEEDLE_FAULT_SIGNALS}
+
+
+def _tech_client(runner: MosesRunner | None = None) -> TestClient:
+    """A client claiming as the service account, which may acknowledge faults."""
+    return _authed_client(
+        _faulted_signals(),
+        runner=runner,
+        owner="Service-Account",
+        settings=_admin_settings(),
+    )
+
+
+def test_fault_ack_requires_a_claim():
+    client = _client(_faulted_signals())  # no X-Claim-Token
+
+    assert client.post("/control/faults/multisampler/ack").status_code == 423
+
+
+def test_fault_ack_requires_the_service_role():
+    """An hte account may submit runs and refill bottles, but not vouch for
+    hardware: clearing this interlock is the service account's call."""
+    client = _authed_client(_faulted_signals())  # default roster → automation
+
+    r = client.post("/control/faults/multisampler/ack")
+    assert r.status_code == 403
+    assert r.json()["detail"]["required_role"] == "service"
+
+
+def test_fault_ack_unknown_module_is_404():
+    client = _tech_client()
+
+    assert client.post("/control/faults/laser_cannon/ack").status_code == 404
+
+
+def test_fault_ack_clears_the_module_and_reopens_submission():
+    """End-to-end: the evening of 2026-08-20, but with a technician on site."""
+    client = _tech_client(runner=FakeRunner(busy=False))
+
+    before = client.get("/status").json()
+    assert before["equipment_status"] == "error"
+    assert "run.submit" not in before["allowed_actions"]
+    assert client.post("/control/run", json=VALID_RUN_BODY).status_code == 409
+
+    r = client.post(
+        "/control/faults/multisampler/ack", params={"note": "needle checked, D2F reseated"}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["module"] == "multisampler"
+    assert body["fault_cleared"] is True
+    assert body["faults_through"] is not None
+    assert body["stat_through"] is not None
+
+    # The pump's cascade fault is untouched, so the instrument is not yet clear.
+    assert body["faulted_modules"] == ["binary_pump"]
+
+    after = client.get("/status").json()
+    assert after["components"]["multisampler"]["state"] == "not_ready"
+    assert "multisampler" in after["details"]["fault_acks"]
+    assert after["details"]["subsystem_fault_modules"] == ["binary_pump"]
+
+    # Acking the cascade too clears the instrument and lets a run through.
+    assert client.post("/control/faults/binary_pump/ack").json()["faulted_modules"] == []
+    final = client.get("/status").json()
+    assert final["equipment_status"] == "ready"
+    assert "run.submit" in final["allowed_actions"]
+    assert client.post("/control/run", json=VALID_RUN_BODY).status_code in (200, 202)
+
+
+def test_withdrawing_the_ack_restores_the_refusal():
+    client = _tech_client(runner=FakeRunner(busy=False))
+    client.post("/control/faults/multisampler/ack")
+    client.post("/control/faults/binary_pump/ack")
+    assert client.get("/status").json()["equipment_status"] == "ready"
+
+    r = client.delete("/control/faults/multisampler/ack")
+    assert r.status_code == 200, r.text
+    assert r.json()["fault_cleared"] is False
+    assert r.json()["faulted_modules"] == ["multisampler"]
+
+    assert client.get("/status").json()["equipment_status"] == "error"
+    assert client.post("/control/run", json=VALID_RUN_BODY).status_code == 409
+
+    # Withdrawing a second time has nothing left to withdraw.
+    assert client.delete("/control/faults/multisampler/ack").status_code == 404

@@ -13,7 +13,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__
 from .config import Settings, load_settings
-from .control import ConsumableAcks, MosesRunner, RosterProvider, router as control_router
+from .control import (
+    ConsumableAcks,
+    FaultAcks,
+    MosesRunner,
+    RosterProvider,
+    router as control_router,
+)
 from .control.claims import ClaimHolder
 from .models import EquipmentStatus, HealthResponse, PROTOCOL_VERSION, ProbeResponse
 from .probes import read_signals as _default_read_signals
@@ -49,6 +55,7 @@ def create_app(
     claims: ClaimHolder | None = None,
     roster: RosterProvider | None = None,
     consumables: ConsumableAcks | None = None,
+    fault_acks: FaultAcks | None = None,
 ) -> FastAPI:
     """Build the FastAPI app. Tests can inject a fake ``reader`` or ``runner``."""
     settings = settings or load_settings()
@@ -59,6 +66,10 @@ def create_app(
     consumables_instance = (
         consumables if consumables is not None
         else ConsumableAcks(settings.consumable_ack_file)
+    )
+    fault_acks_instance = (
+        fault_acks if fault_acks is not None
+        else FaultAcks(settings.lc_fault_ack_file)
     )
 
     @asynccontextmanager
@@ -101,6 +112,7 @@ def create_app(
     app.state.claims = claims_instance
     app.state.roster = roster_instance
     app.state.consumables = consumables_instance
+    app.state.fault_acks = fault_acks_instance
 
     app.include_router(control_router)
 
@@ -125,6 +137,7 @@ def create_app(
             runner=runner_instance,
             claims=claims_instance,
             consumables=consumables_instance,
+            fault_acks=fault_acks_instance,
         )
 
     return app

@@ -95,10 +95,23 @@ def can_service(role: Role | None) -> bool:
     return role == "service"
 
 
+def can_ack_fault(role: Role | None) -> bool:
+    """Only a service role may acknowledge an LC module hardware fault.
+
+    Acknowledging is an assertion about the *physical* instrument ("I looked at
+    the needle and it is fine") that releases the subsystem-fault interlock and
+    lets runs start again. That is the same kind of authority as the service
+    toggle, so it carries the same gate rather than the looser one on consumable
+    acknowledgments — refilling a bottle cannot crash a needle into a vial.
+    """
+    return role == "service"
+
+
 __all__ = [
     "Role",
     "resolve_role",
     "can_submit",
     "can_workflow",
     "can_service",
+    "can_ack_fault",
 ]

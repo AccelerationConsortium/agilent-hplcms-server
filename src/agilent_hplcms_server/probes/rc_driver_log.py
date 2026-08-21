@@ -25,20 +25,25 @@ Returned signals (per-module status — keyed by module role)
 module_binary_pump_state        — "ready" | "busy" | "error" | "not_ready" | "unknown"
 module_binary_pump_stat_flags   — list[str] of STAT? flag tokens
 module_binary_pump_stat_age_s   — seconds since last STAT? was seen for this module
+module_binary_pump_stat_at      — ISO timestamp of that STAT? (naive local, the
+                                  driver log's own clock domain)
 module_binary_pump_on           — True when ACT:PUMP? replied 1 (pump running)
 module_dad_detector_state       — same states as above (G7117B)
 module_dad_detector_stat_flags  — STAT? flag list
 module_dad_detector_stat_age_s  — age of STAT? data
+module_dad_detector_stat_at     — ISO timestamp of that STAT? (naive local)
 module_dad_lamp_on              — True when last LAMP command sent was LAMP 1
 module_dad_lamp_rated_hours     — rated lamp lifetime in hours (from LAMP:INFO?)
 module_dad_lamp_hours_used      — estimated accumulated on-time in hours
 module_column_thermostat_state  — column compartment state (G7116B)
 module_column_thermostat_stat_flags
 module_column_thermostat_stat_age_s
+module_column_thermostat_stat_at
 module_column_thermostat_on     — True when last THRM command sent was THRM 1
 module_multisampler_state       — multisampler state (G7167B)
 module_multisampler_stat_flags
 module_multisampler_stat_age_s
+module_multisampler_stat_at
 module_multisampler_drawers_occupied — count of hotel drawers with a plate/vial
 module_multisampler_drawers_total    — total hotel drawer slots reported
 
@@ -303,6 +308,12 @@ def read_module_states(log_dir: str | Path) -> dict[str, Any]:
         out[f"module_{role}_state"] = _stat_flags_to_state(flags)
         out[f"module_{role}_stat_flags"] = flags
         out[f"module_{role}_stat_age_s"] = round(age_s, 1)
+        # Absolute time of this STAT? reply, in the driver log's own (naive
+        # local) clock domain. `stat_age_s` is measured from the poll, so the
+        # same reply reports a different age on every read; an operator fault
+        # acknowledgment needs a stable identity for the evidence it clears
+        # (see control/fault_acks.py).
+        out[f"module_{role}_stat_at"] = ts.isoformat()
 
     # ── DAD lamp signals ───────────────────────────────────────────────────
     if lamp_info_seen is not None:
@@ -377,7 +388,26 @@ _FAULT_RE = re.compile(
 # Abort-level events that are not hardware faults: the controller asking the
 # module to stop is how a normal abort looks from the driver's point of view.
 _FAULT_BENIGN_RE = re.compile(
-    r"Controller stop automation request",
+    r"Controller stop automation request"
+    # "Analysis aborted by another module" is not a fault of the module that
+    # logs it. Two independent pieces of evidence say so. The driver files it as
+    # `EV 00150` — an *event* — in all 21 occurrences across every retained log,
+    # never once as the `EE` an error carries (the needle crash of 2026-08-20
+    # 20:53:47 is `EE 25225`, logged 100 ms before the three cascade lines it
+    # caused). And it is written just as readily for a *software* abort: three
+    # runs aborted via `UnifiedControl.AbortRun` between 21:13 and 21:17 that
+    # evening each stamped it on the multisampler, DAD and pump, latching all
+    # three into `error` and refusing `run.submit` for an hour over what was
+    # someone pressing stop.
+    #
+    # Whatever really aborted the run says so itself: an LC module logs its own
+    # `EE` fault, which is what gates. The gap this leaves is an abort raised by
+    # a module outside _MODULE_ROLES — the MS — which now reports nothing rather
+    # than misattributing the fault to three innocent LC modules. Reporting the
+    # wrong module is worse than reporting none: it sends a technician to the
+    # pump for a mass-spec problem, and blocks submission on hardware that is
+    # fine.
+    r"|Analysis aborted by another module",
     re.IGNORECASE,
 )
 
@@ -523,6 +553,21 @@ def read_lc_faults(
             )
 
     faults = _drop_recovered(faults, module_states or {})
+    return summarize_faults(faults)
+
+
+def summarize_faults(faults: list[dict[str, Any]]) -> dict[str, Any]:
+    """Roll a fault list up into the ``lc_fault_*`` signals.
+
+    Split out from :func:`read_lc_faults` because it is applied twice: once here
+    over everything parsed from the logs, and again in
+    ``control/fault_acks.apply_fault_acks`` over what survives an operator
+    acknowledgment. Both paths must agree on which fault is "top" and on the
+    exact wording of ``lc_fault_message``, so the ranking lives in one place.
+
+    Sorts in place (most actionable first) and returns ``{}`` for an empty list,
+    so the status builder reads missing keys as "no known fault".
+    """
     if not faults:
         return {}
 
