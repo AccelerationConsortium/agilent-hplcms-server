@@ -961,8 +961,25 @@ def test_poll_halts_queue_during_servicing():
     assert runner.launched == []
 
 
-def test_run_409_instrument_servicing():
+def test_run_is_queued_while_a_technician_run_is_detected():
+    # Auto-detected servicing (OLSS is acquiring a run we did not queue) is
+    # ordinary "busy": the job is accepted and held, and the runner starts it
+    # once the instrument frees. Refusing at the door made the documented
+    # "busy -> FIFO queue" branch unreachable for the commonest kind of busy,
+    # and blocked every submission whenever a colleague ran one sample by hand.
     runner = FakeRunner(busy=False, servicing=True)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    r = client.post("/control/run", json=VALID_RUN_BODY)
+    assert r.status_code == 202, r.text
+    assert runner.submitted != []          # accepted
+    assert runner.get_active() is None     # never launched into the session
+
+
+def test_run_409_under_explicit_service_mode():
+    # The explicit toggle is a human declaring they own the instrument, so a
+    # job that would surface later without them asking is refused outright.
+    runner = FakeRunner(busy=False)
+    runner.set_service_mode(True)
     client = _authed_client(_load("signals_ready.json"), runner=runner)
     r = client.post("/control/run", json=VALID_RUN_BODY)
     assert r.status_code == 409
@@ -972,11 +989,31 @@ def test_run_409_instrument_servicing():
     assert runner.submitted == []  # never enqueued
 
 
-def test_queue_not_accepting_during_servicing():
+def test_queue_accepts_and_names_the_hold_during_a_technician_run():
     runner = FakeRunner(busy=False, servicing=True)
     client = _client(_load("signals_ready.json"), runner=runner)
     body = client.get("/control/queue").json()
+    assert body["accepting_jobs"] is True
+    assert body["dispatch_held_reason"] == "servicing"
+
+
+def test_queue_not_accepting_under_explicit_service_mode():
+    runner = FakeRunner(busy=False)
+    runner.set_service_mode(True)
+    client = _client(_load("signals_ready.json"), runner=runner)
+    body = client.get("/control/queue").json()
     assert body["accepting_jobs"] is False
+    assert body["dispatch_held_reason"] == "service_mode"
+
+
+def test_standby_still_refused_during_a_technician_run():
+    # Parking the instrument is actuation, not enqueueing: it would disturb the
+    # technician's session now, so it stays refused under either source.
+    runner = FakeRunner(busy=False, servicing=True)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    r = client.post("/control/standby")
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "instrument_servicing"
 
 
 # ---------------------------------------------------------------------------
@@ -1400,16 +1437,29 @@ def test_allowed_actions_requires_init_drops_enqueue_verbs():
     assert "queue.cancel" in actions
 
 
-def test_allowed_actions_servicing_drops_enqueue_verbs():
+def test_allowed_actions_keeps_run_submit_during_a_technician_run():
+    # §6.2: the list must mirror what the endpoints would honour. The enqueue
+    # routes now accept during auto-detected servicing, so run.submit must be
+    # advertised; the two verbs that take the instrument must not be.
     runner = FakeRunner(busy=False, servicing=True)
     client = _client(_load("signals_ready.json"), runner=runner)
     body = client.get("/status").json()
     actions = body["allowed_actions"]
-    assert "run.submit" not in actions
+    assert "run.submit" in actions
     assert "instrument.standby" not in actions
     assert "workflow.start" not in actions
     assert "run.abort" in actions and "queue.cancel" in actions
     assert body["details"]["servicing"] is True
+
+
+def test_allowed_actions_service_mode_drops_enqueue_verbs():
+    runner = FakeRunner(busy=False)
+    runner.set_service_mode(True)
+    client = _client(_load("signals_ready.json"), runner=runner)
+    actions = client.get("/status").json()["allowed_actions"]
+    assert "run.submit" not in actions
+    assert "instrument.standby" not in actions
+    assert "workflow.start" not in actions
 
 
 def test_allowed_actions_unknown_state_is_empty():
