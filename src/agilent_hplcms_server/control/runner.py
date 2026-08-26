@@ -167,8 +167,10 @@ class MosesRunner:
         holds no active job, sustained for ``servicing_debounce_polls``
         consecutive ``/status`` observations. The debounce avoids a false
         positive in the one-poll gap after our Moses process exits but before
-        OLSS clears its currentRun. While True the queue is halted and
-        submissions are refused 409 instrument_servicing (highest precedence).
+        OLSS clears its currentRun. While True *dispatch* is halted: pending
+        jobs wait and start once it clears. Submissions are refused (409
+        instrument_servicing) only under the explicit ``service_mode`` flag —
+        see :meth:`service_mode` and the router's ``_check_service_mode``.
         """
         settings = settings or load_settings()
         with self._lock:
@@ -341,9 +343,11 @@ class MosesRunner:
         """Add a run to the queue. Returns (queue_id, position).
 
         Position 0 means started immediately (instrument was idle and not being
-        serviced). Higher-precedence refusals (servicing 409, workflow 423) are
-        enforced by the router before this is called; the servicing guard here is
-        defense-in-depth so we never launch a job into a technician's session.
+        serviced). The servicing guard below is the *primary* mechanism for an
+        auto-detected technician run: the router accepts such an enqueue, and
+        this parks the job rather than launching it into their session. Only the
+        explicit service-mode flag (409) and the workflow lock (423) refuse
+        earlier, at the router.
 
         Raises
         ------

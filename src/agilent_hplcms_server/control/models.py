@@ -189,6 +189,10 @@ class QueueStatusResponse(BaseModel):
     max_depth: int
     instrument_online: bool
     accepting_jobs: bool
+    # Why dispatch is paused while the queue still accepts work: "service_mode"
+    # (explicit toggle — an enqueue is refused too), "servicing" (an OpenLab CDS
+    # run we did not queue; jobs are held and start when it ends), or None.
+    dispatch_held_reason: Literal["service_mode", "servicing"] | None = None
     instrument_state: str | None = None
 
 

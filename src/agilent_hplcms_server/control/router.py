@@ -113,11 +113,42 @@ def _require_claim(request: Request) -> str:
     )
 
 
+def _check_service_mode(request: Request, signals: dict) -> None:
+    """Refuse an enqueue while the explicit service-mode toggle is on (409
+    instrument_servicing, highest precedence).
+
+    Only the *explicit* toggle refuses here. Auto-detected servicing — OLSS
+    acquiring a run we did not queue — is ordinary "busy": the enqueue is
+    accepted and :meth:`MosesRunner.submit_to_queue` parks it, then ``poll``
+    starts it once the instrument frees. Refusing that case at the door left
+    the queue sitting empty while it rejected work, and made this route's
+    documented "busy -> FIFO queue" branch unreachable whenever a colleague ran
+    a sample by hand. The explicit toggle is different in kind: a human has
+    declared they own the instrument, and a job surfacing later without them
+    asking for it is exactly what they are preventing.
+    """
+    runner = _get_runner(request)
+    if runner.service_mode():
+        raise HTTPException(
+            status_code=409,
+            detail=InstrumentServicingError(
+                detail=(
+                    "The instrument is in service mode. The queue is halted; "
+                    "resubmit once servicing finishes."
+                ),
+                olss_state=signals.get("olss_instrument_state"),
+            ).model_dump(mode="json"),
+        )
+
+
 def _check_servicing(request: Request, signals: dict) -> None:
-    """Refuse an enqueue while a technician is running samples directly in
-    OpenLab CDS (409 instrument_servicing, highest precedence). ``poll`` /
-    ``notify_olss_state`` must have run from the current signals first so the
-    runner's servicing debounce is up to date."""
+    """Refuse an action that takes the instrument *now* while it is held for
+    servicing, from either source (409 instrument_servicing).
+
+    Enqueueing is deliberately not one of these — see
+    :func:`_check_service_mode`. ``poll`` / ``notify_olss_state`` must have run
+    from the current signals first so the servicing debounce is up to date.
+    """
     runner = _get_runner(request)
     settings = _get_settings(request)
     if runner.is_servicing(settings):
@@ -126,7 +157,7 @@ def _check_servicing(request: Request, signals: dict) -> None:
             detail=InstrumentServicingError(
                 detail=(
                     "A technician is running samples directly in OpenLab CDS. "
-                    "The queue is halted; resubmit once servicing finishes."
+                    "Retry once servicing finishes."
                 ),
                 olss_state=signals.get("olss_instrument_state"),
             ).model_dump(mode="json"),
@@ -380,8 +411,10 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
 
     - Idle instrument → starts immediately (``status: accepted``).
     - Busy instrument → FIFO queue (``status: queued``, ``queue_position`` is 1-based).
+    - Technician running OpenLab CDS directly → FIFO queue, held until they
+      finish (auto-detected servicing does not refuse — see ``_check_service_mode``).
     - HTTP 409 ``requires_init`` if any OpenLab core process is missing.
-    - HTTP 409 ``instrument_servicing`` if a technician is driving OpenLab CDS.
+    - HTTP 409 ``instrument_servicing`` if the explicit service-mode flag is on.
     - HTTP 412 ``queue_full`` if the queue is at max depth (with ``Retry-After``).
     - HTTP 412 ``reserved_for_robot`` if a non-robot run targets the reserved tray.
     - HTTP 422 if any parameter is out of hardware range, a ``well`` is off-plate,
@@ -397,7 +430,7 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     _notify_runner_from_signals(runner, signals)
     runner.poll(settings=settings)
     _check_requires_init(signals)
-    _check_servicing(request, signals)
+    _check_service_mode(request, signals)
     _check_subsystem_fault(signals)
     _check_reserved_drawer(body, settings)
     _check_labware(body, settings)
@@ -456,7 +489,7 @@ def post_to_queue(body: RunRequest, request: Request) -> QueueResponse:
     _notify_runner_from_signals(runner, signals)
     runner.poll(settings=settings)
     _check_requires_init(signals)
-    _check_servicing(request, signals)
+    _check_service_mode(request, signals)
     _check_subsystem_fault(signals)
     _check_reserved_drawer(body, settings)
     _check_labware(body, settings)
@@ -498,13 +531,22 @@ def get_queue(request: Request) -> QueueStatusResponse:
     active = runner.get_active()
     all_jobs = runner.get_all_jobs()
     pending_count = runner.queue_depth()
-    # Not accepting while a technician is servicing (queue halted) or the queue
-    # is at depth with an active run.
+    # accepting_jobs mirrors the enqueue door: only the explicit service-mode
+    # toggle and a full queue refuse there. Auto-detected servicing does not —
+    # the job is accepted and held — so it is reported separately, as the
+    # reason dispatch is paused, letting a reader tell "queued and starting"
+    # from "queued, waiting for the technician to finish".
     accepting_jobs = (
         instrument_online
-        and not runner.is_servicing(settings)
+        and not runner.service_mode()
         and (active is None or pending_count < settings.queue_max_depth)
     )
+    if runner.service_mode():
+        dispatch_held_reason = "service_mode"
+    elif runner.is_servicing(settings):
+        dispatch_held_reason = "servicing"
+    else:
+        dispatch_held_reason = None
 
     return QueueStatusResponse(
         queue=[_entry_to_queued_run(e) for e in all_jobs],
@@ -513,6 +555,7 @@ def get_queue(request: Request) -> QueueStatusResponse:
         max_depth=settings.queue_max_depth,
         instrument_online=instrument_online,
         accepting_jobs=accepting_jobs,
+        dispatch_held_reason=dispatch_held_reason,
         instrument_state=signals.get("olss_instrument_state"),
     )
 
@@ -797,9 +840,10 @@ def workflow_start(request: Request) -> WorkflowStartResponse:
 
     - HTTP 423 if the ``X-Claim-Token`` is missing or stale.
     - HTTP 403 ``role_forbidden`` unless the claim owner's role is ``hte``.
-    - HTTP 409 ``requires_init`` / ``instrument_servicing`` (same enqueue gates
-      as a run): a workflow can't start if OpenLab is down or a technician holds
-      the instrument.
+    - HTTP 409 ``requires_init`` / ``instrument_servicing``: a workflow can't
+      start if OpenLab is down or the instrument is held for servicing from
+      either source. Unlike a single run — which queues — taking the
+      equipment-blocking lock claims the instrument now, so it waits.
     """
     token = _require_claim(request)
     claims = _get_claims(request)
@@ -888,7 +932,12 @@ def _require_service_role(request: Request) -> None:
 )
 def service_start(request: Request) -> ServiceModeResponse:
     """Turn on the persistent service-mode flag. New submissions are then
-    refused 409 instrument_servicing and the queue is halted until cleared.
+    refused 409 instrument_servicing and dispatch is halted until cleared.
+
+    This is the stronger of the two servicing signals: auto-detecting a
+    technician's OpenLab run only halts *dispatch* (submissions still queue),
+    whereas this flag also closes the door, because a human has declared they
+    own the instrument.
 
     - HTTP 423 if the ``X-Claim-Token`` is missing or stale.
     - HTTP 403 ``role_forbidden`` unless the claim owner is an admin account.

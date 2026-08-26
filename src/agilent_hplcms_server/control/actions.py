@@ -41,8 +41,9 @@ ACTION_WORKFLOW_START = "workflow.start"
 ACTION_WORKFLOW_END = "workflow.end"
 
 # Actions whose POST enqueues a Moses job (or, for workflow.start, takes the
-# equipment-blocking lock); gated by requires_init (409), servicing (409), a
-# subsystem fault (409), and a full queue (412).
+# equipment-blocking lock); gated by requires_init (409), service mode (409), a
+# subsystem fault (409), and a full queue (412). Auto-detected servicing gates
+# only the instrument-taking verbs — an enqueue is accepted and held.
 ENQUEUE_ACTIONS = (ACTION_RUN_SUBMIT, ACTION_INSTRUMENT_STANDBY)
 
 
@@ -52,6 +53,7 @@ def allowed_actions(
     requires_init: bool,
     queue_full: bool,
     servicing: bool = False,
+    service_mode: bool = False,
     workflow_active: bool = False,
     subsystem_fault: bool = False,
 ) -> list[str]:
@@ -68,8 +70,13 @@ def allowed_actions(
       actions return 409.
     - ``queue_full`` — the FIFO queue is at ``queue_max_depth`` with an active
       run; enqueue actions return 412.
-    - ``servicing`` — a technician is running samples directly in OpenLab CDS;
-      the queue is halted and enqueue actions return 409 instrument_servicing.
+    - ``servicing`` — the instrument is held for servicing, from either source
+      (the explicit toggle, or an auto-detected OpenLab CDS run). Dispatch is
+      halted, so the verbs that *take* the instrument now are withheld;
+      ``run.submit`` is not, because the queue accepts and holds the job.
+    - ``service_mode`` — the explicit technician toggle only. This is the one
+      that refuses an enqueue at the door (409 instrument_servicing), so it is
+      the one that withholds ``run.submit``.
     - ``workflow_active`` — a workflow holds the equipment-blocking lock; toggles
       the ``workflow.start`` / ``workflow.end`` verbs (see module docstring).
     - ``subsystem_fault`` — an LC module (pump / DAD / column thermostat /
@@ -79,21 +86,26 @@ def allowed_actions(
     if not service_operational:
         return []
 
+    # Enqueueing is not actuation: a queued run waits for the instrument, so it
+    # is refused only by conditions that make the job itself impossible.
     can_enqueue = (
         (not requires_init)
         and (not queue_full)
-        and (not servicing)
+        and (not service_mode)
         and (not subsystem_fault)
     )
+    # Parking the instrument and taking the workflow lock both claim the
+    # hardware now, so they additionally wait out any servicing.
+    can_take_instrument = can_enqueue and (not servicing)
 
     out: list[str] = []
     if can_enqueue:
         out.append(ACTION_RUN_SUBMIT)
     out.append(ACTION_RUN_ABORT)
     out.append(ACTION_QUEUE_CANCEL)
-    if can_enqueue:
+    if can_take_instrument:
         out.append(ACTION_INSTRUMENT_STANDBY)
-    if can_enqueue and not workflow_active:
+    if can_take_instrument and not workflow_active:
         out.append(ACTION_WORKFLOW_START)
     if workflow_active:
         out.append(ACTION_WORKFLOW_END)

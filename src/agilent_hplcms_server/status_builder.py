@@ -462,12 +462,14 @@ def build_status(
     # refreshed the runner's servicing debounce from this observation.
     queue_full = runner.is_queue_full(settings) if runner is not None else False
     servicing = runner.is_servicing(settings) if runner is not None else False
+    service_mode = runner.service_mode() if runner is not None else False
     workflow_active = claims.is_workflow_active() if claims is not None else False
     allowed = _allowed_actions(
         service_operational=(probe_error is None),
         requires_init=(equipment_state == "requires_init"),
         queue_full=queue_full,
         servicing=servicing,
+        service_mode=service_mode,
         workflow_active=workflow_active,
         subsystem_fault=bool(faulted_modules),
     )
@@ -477,8 +479,9 @@ def build_status(
     # above from the OLSS/acquisition signals); these refine the human message.
     if runner is not None:
         # Persistent admin toggle, distinct from the (possibly auto-detected)
-        # servicing state above. The dashboard reads this to render its toggle.
-        details["service_mode"] = runner.service_mode()
+        # servicing state above. The dashboard reads this to render its toggle,
+        # and it is the source that refuses an enqueue outright.
+        details["service_mode"] = service_mode
     if servicing:
         details["servicing"] = True
         if equipment_state == "busy":

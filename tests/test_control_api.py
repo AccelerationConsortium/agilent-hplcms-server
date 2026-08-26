@@ -1557,33 +1557,48 @@ def test_subsystem_fault_does_not_override_busy():
 
 
 def test_allowed_actions_helper_matches_refusal_property():
-    """Unit-level §6.2 property: ``verb in allowed_actions`` iff an enqueue POST
-    would NOT refuse, across every combination of the gating conditions."""
+    """Unit-level §6.2 property: ``verb in allowed_actions`` iff the matching POST
+    would NOT refuse, across every combination of the gating conditions.
+
+    The two groups part company on servicing. An enqueue is accepted and held
+    while a technician run is auto-detected, so ``run.submit`` stays offered;
+    the verbs that take the instrument now do not."""
     from agilent_hplcms_server.control.actions import allowed_actions
 
     import itertools
 
-    for requires_init, queue_full, servicing, workflow_active, subsystem_fault in (
-        itertools.product((False, True), repeat=5)
-    ):
+    for (
+        requires_init,
+        queue_full,
+        servicing,
+        service_mode,
+        workflow_active,
+        subsystem_fault,
+    ) in itertools.product((False, True), repeat=6):
+        # The explicit toggle is one of the two sources of servicing, so
+        # service_mode without servicing is not a state the runner can report.
+        if service_mode and not servicing:
+            continue
         actions = allowed_actions(
             service_operational=True,
             requires_init=requires_init,
             queue_full=queue_full,
             servicing=servicing,
+            service_mode=service_mode,
             workflow_active=workflow_active,
             subsystem_fault=subsystem_fault,
         )
         can_enqueue = (
             (not requires_init)
             and (not queue_full)
-            and (not servicing)
+            and (not service_mode)
             and (not subsystem_fault)
         )
+        can_take_instrument = can_enqueue and (not servicing)
         assert ("run.submit" in actions) is can_enqueue
-        assert ("instrument.standby" in actions) is can_enqueue
+        assert ("instrument.standby" in actions) is can_take_instrument
         assert ("workflow.start" in actions) is (
-            can_enqueue and not workflow_active
+            can_take_instrument and not workflow_active
         )
         assert ("workflow.end" in actions) is workflow_active
         # Non-enqueue verbs are always offered while operational.

@@ -47,7 +47,7 @@ Mutating endpoints (marked 🔒) require a valid `X-Claim-Token` header — acqu
 | `POST /control/heartbeat` | Refresh the claim TTL (header `X-Claim-Token`). 204 on success; 401 if the token is unknown/expired. |
 | `POST /control/release` | Release the claim (header `X-Claim-Token`). Idempotent — always 204. |
 | `POST /control/startup` | Read-only readiness check — reports whether OpenLab processes are running. Never starts OpenLab. |
-| 🔒 `POST /control/run` | Submit a run. Starts immediately if idle; queues behind the active run if busy. Returns `status: "accepted"` or `"queued"`. 409 `instrument_servicing` when a technician holds the instrument; 412 `queue_full` (with `Retry-After`) when the queue is at depth; 412 `reserved_for_robot` when a manual run targets the robot-reserved drawer; 423 `workflow_active` when a workflow holds the lock. |
+| 🔒 `POST /control/run` | Submit a run. Starts immediately if idle; queues behind the active run if busy — including when a technician's own OpenLab run is what makes it busy. Returns `status: "accepted"` or `"queued"`. 409 `instrument_servicing` when the explicit service-mode flag is on; 412 `queue_full` (with `Retry-After`) when the queue is at depth; 412 `reserved_for_robot` when a manual run targets the robot-reserved drawer; 423 `workflow_active` when a workflow holds the lock. |
 | 🔒 `POST /control/queue` | Submit a run and get back a `queue_id` for tracking. Same semantics as `/control/run` with a richer response. |
 | `GET /control/queue` | View all jobs (pending, running, recent done/failed) plus `instrument_online` and `accepting_jobs` signals. |
 | 🔒 `DELETE /control/queue/{queue_id}` | Cancel a pending job. 409 if it is currently running (use abort instead), 404 if already done. |
@@ -62,7 +62,7 @@ Mutating endpoints (marked 🔒) require a valid `X-Claim-Token` header — acqu
 
 An enqueue verb (`POST /control/run` · `/control/queue` · `/control/standby` · `/control/workflow/start`) is also refused **409 `subsystem_fault`** when an LC module (pump / DAD / column thermostat / multisampler) reports a hardware `error` — fail-closed, so a run never launches into faulted hardware. Resolve the fault in OpenLab CDS / at the instrument; the module's STAT? refreshes on the next OpenLab poll and the gate clears.
 
-`GET /status.allowed_actions` reports which of `run.submit` · `run.abort` · `queue.cancel` · `instrument.standby` · `workflow.start` · `workflow.end` the device will currently honour, mirroring the control-side *state* precondition refusals (enqueue verbs drop out when the queue is full, OpenLab is down, a technician is servicing, or an LC module reports a hardware fault; `workflow.start`/`workflow.end` toggle on workflow state). `service.*` is an operator/dashboard control rather than an agent skill, so it is reported via `details.service_mode` instead of `allowed_actions`.
+`GET /status.allowed_actions` reports which of `run.submit` · `run.abort` · `queue.cancel` · `instrument.standby` · `workflow.start` · `workflow.end` the device will currently honour, mirroring the control-side *state* precondition refusals (`run.submit` drops out when the queue is full, OpenLab is down, service mode is on, or an LC module reports a hardware fault; `instrument.standby` and `workflow.start` additionally drop out under auto-detected servicing, since they take the instrument now rather than queueing; `workflow.start`/`workflow.end` toggle on workflow state). `service.*` is an operator/dashboard control rather than an agent skill, so it is reported via `details.service_mode` instead of `allowed_actions`.
 
 ### Sample submission & positions
 
@@ -128,7 +128,7 @@ curl http://sdl2-pc-06-uplc.tail6a1dd7.ts.net:8010/status
 Per [`INTERLOCKS.md`](https://github.com/AccelerationConsortium/ac-organic-lab/blob/main/docs/INTERLOCKS.md):
 
 - **Layer 1 — Hardware limits:** Pydantic field validators on all numeric parameters (e.g. injection volume ≤ 20 µL, run time ≤ 120 min, flow rate ≤ 2 mL/min). Violations → HTTP 422.
-- **Layer 2 — Device state machine:** HTTP 409 `requires_init` if any OpenLab core process is missing; HTTP 409 `instrument_servicing` if a technician holds the instrument; HTTP 409 `subsystem_fault` if an LC module reports a hardware error (fail-closed); HTTP 412 `queue_full` (with `Retry-After`) if the queue is at max depth (default 20); HTTP 423 `workflow_active` if a workflow holds the lock.
+- **Layer 2 — Device state machine:** HTTP 409 `requires_init` if any OpenLab core process is missing; HTTP 409 `instrument_servicing` if the explicit service-mode flag is on (an auto-detected technician run queues the job instead of refusing); HTTP 409 `subsystem_fault` if an LC module reports a hardware error (fail-closed); HTTP 412 `queue_full` (with `Retry-After`) if the queue is at max depth (default 20); HTTP 423 `workflow_active` if a workflow holds the lock.
 - Moses is **never imported** — only called as a subprocess from the `moses_v4_yoyo` conda env. The sidecar stays in its own venv with no vendor dependencies.
 - A **script allowlist** (`MOSES_ALLOWED_SCRIPTS`) prevents arbitrary script execution.
 
@@ -160,9 +160,9 @@ This server's `MosesRunner` is the **sole** job queue. OpenLab's native sequence
 
 Submissions are gated by precedence (highest wins):
 
-1. **Technician servicing** — the queue is *halted* (the next pending job waits, it is not dropped) and new submissions are refused `409 instrument_servicing` (no `Retry-After` — duration is unpredictable). Two sources:
-   - **Explicit service mode (primary).** A technician about to use OpenLab CDS directly flips a persistent flag via the dashboard → `POST /control/service/start` (and `…/service/end` to clear). It is *not* tied to a claim, so a dropped dashboard/claim never silently un-blocks a maintenance window — it stays on until explicitly cleared. Admin-only (see roles).
-   - **Auto-detect (fallback)** for when nobody flips the switch: OLSS shows a real acquisition (a `runQueue.currentRun`, i.e. `olss_current_run` is present) while this server holds no active job, sustained over `SERVICING_DEBOUNCE_POLLS` `/status` observations. Keyed on `currentRun`, **not** bare `state=="Busy"`, so data analysis / reprocessing does *not* halt the queue.
+1. **Technician servicing** — *dispatch* is halted: the next pending job waits and starts once servicing clears, it is never dropped. Two sources, which differ in whether a **new** submission is accepted:
+   - **Explicit service mode (primary).** A technician about to use OpenLab CDS directly flips a persistent flag via the dashboard → `POST /control/service/start` (and `…/service/end` to clear). It is *not* tied to a claim, so a dropped dashboard/claim never silently un-blocks a maintenance window — it stays on until explicitly cleared. Admin-only (see roles). New submissions are **refused** `409 instrument_servicing` (no `Retry-After` — duration is unpredictable): a human has declared they own the instrument, so a job surfacing later without them asking is exactly what they are preventing.
+   - **Auto-detect (fallback)** for when nobody flips the switch: OLSS shows a real acquisition (a `runQueue.currentRun`, i.e. `olss_current_run` is present) while this server holds no active job, sustained over `SERVICING_DEBOUNCE_POLLS` `/status` observations. Keyed on `currentRun`, **not** bare `state=="Busy"`, so data analysis / reprocessing does *not* halt the queue. New submissions are **accepted and held** — this is ordinary "busy". Refusing them left the queue sitting empty with every slot free while it rejected work, and blocked all submissions whenever a colleague ran one sample by hand. `GET /control/queue` reports `accepting_jobs: true` with `dispatch_held_reason: "servicing"`; under explicit service mode it reports `accepting_jobs: false` and `dispatch_held_reason: "service_mode"`.
 2. **Workflow** — a robot/agent campaign (a series of runs) holding the equipment-blocking lock via `POST /control/workflow/start`. Non-holders are refused `423 workflow_active` (with `Retry-After`); only the lock holder submits. The lock rides on the claim, so it inherits TTL/heartbeat/auto-expiry — a crashed holder loses it.
 3. **Our queue job running** — normal FIFO queue; ETA is bounded by the gradient `run_time`.
 4. **Idle** — a single sample is submitted into the queue.
@@ -193,7 +193,7 @@ Policy decisions, deliberate and reader-visible:
   never starts a second concurrent run, so §2.3's omit-while-running rule does
   not apply; queue capacity gates it instead (412 `queue_full`).
 
-`details.service_mode` reflects the explicit flag; `details.servicing` reflects either source. A paused OpenLab sequence (`olss_software_status: "Paused"`) is reported as `equipment_status: "busy"` with `required_actions: ["resume_paused_sequence"]` — `paused` is not a legal v1.1 `EquipmentState`.
+`details.service_mode` reflects the explicit flag — the one that refuses a submission; `details.servicing` reflects either source, i.e. dispatch being held. A paused OpenLab sequence (`olss_software_status: "Paused"`) is reported as `equipment_status: "busy"` with `required_actions: ["resume_paused_sequence"]` — `paused` is not a legal v1.1 `EquipmentState`.
 
 ### Claims, roles, and the lab roster
 
