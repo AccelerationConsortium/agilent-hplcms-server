@@ -78,6 +78,7 @@ class FakeRunner(MosesRunner):
         run_id: str = "test-run-1",
         queue_full: bool = False,
         servicing: bool = False,
+        handoff_in_flight: bool = False,
     ) -> None:
         super().__init__()
         if busy or queue_full:
@@ -85,10 +86,12 @@ class FakeRunner(MosesRunner):
             self._jobs[run_id] = entry
             self._active_id = run_id
         self.submitted: list[dict] = []
+        self.handoffs: list[dict] = []
         self.aborted = False
         self._next_run_id = "queued-run-1"
         self._queue_full = queue_full
         self._servicing = servicing
+        self._handoff_in_flight = handoff_in_flight
 
     def is_queue_full(self, settings=None) -> bool:  # type: ignore[override]
         return self._queue_full
@@ -135,6 +138,34 @@ class FakeRunner(MosesRunner):
             request_dict={"script_name": script_name, **job},
             settings=settings,
         )
+
+    def submit_openlab_handoff(  # type: ignore[override]
+        self,
+        script_name: str,
+        job: dict,
+        request_dict: dict,
+        settings=None,
+    ) -> str:
+        from agilent_hplcms_server.control.runner import HandoffInProgress
+
+        if self._handoff_in_flight:
+            raise HandoffInProgress("An OpenLab handoff dispatch is already in flight.")
+        handoff_id = "handoff-run-1"
+        entry = JobEntry(
+            queue_id=handoff_id,
+            script_name=script_name,
+            job=job,
+            request_dict=request_dict,
+            queued_at=datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+            status="dispatching",
+            dispatch="openlab",
+            pid=4242,
+            process=_make_mock_proc(),
+            job_path=Path("fake_handoff.json"),
+        )
+        self._jobs[handoff_id] = entry
+        self.handoffs.append({"script_name": script_name, "job": job, "run_id": handoff_id})
+        return handoff_id
 
     def abort(self, settings=None) -> tuple[bool, int]:  # type: ignore[override]
         n_cleared = len(self._pending_ids)
@@ -1014,6 +1045,283 @@ def test_standby_still_refused_during_a_technician_run():
     r = client.post("/control/standby")
     assert r.status_code == 409
     assert r.json()["detail"]["error"] == "instrument_servicing"
+
+
+# ---------------------------------------------------------------------------
+# dispatch="openlab" — fire-and-forget handoff into OpenLab's native run queue
+# ---------------------------------------------------------------------------
+# The queue-ownership pivot made the sidecar FIFO the only path to the
+# instrument, which also made queued work invisible from OpenLab's own Run
+# Queue — the surface a technician plans from. dispatch="openlab" restores the
+# pre-pivot submission mode as an explicit per-request opt-in: a submit-and-exit
+# Moses script enqueues the job in OpenLab and returns, and the sidecar tracks
+# only the handoff (dispatching → handed_off | failed), never the acquisition.
+# Once the run acquires, the sidecar sees it as an OpenLab run it did not queue
+# — i.e. exactly like technician activity — so the FIFO holds behind it.
+
+OPENLAB_RUN_BODY = {**VALID_RUN_BODY, "dispatch": "openlab"}
+
+
+def test_openlab_dispatch_hands_off_during_a_technician_run():
+    # The motivating case: a technician sequence is acquiring, the FIFO is
+    # held — an openlab dispatch still goes out, lining up in OpenLab's queue.
+    runner = FakeRunner(busy=False, servicing=True)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    r = client.post("/control/run", json=OPENLAB_RUN_BODY)
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["status"] == "dispatching"
+    assert body["run_id"] == "handoff-run-1"
+    assert runner.handoffs != []           # handed to the submit script
+    assert runner.submitted == []          # never entered the FIFO
+    assert runner.get_active() is None     # never took the FIFO slot
+
+
+def test_openlab_dispatch_still_refused_under_explicit_service_mode():
+    # The explicit toggle means a human declared they own the instrument;
+    # lining work up behind them in OpenLab is still work they did not ask for.
+    runner = FakeRunner(busy=False)
+    runner.set_service_mode(True)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    r = client.post("/control/run", json=OPENLAB_RUN_BODY)
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "instrument_servicing"
+    assert runner.handoffs == []
+
+
+def test_openlab_dispatch_rejects_an_explicit_script_name():
+    # The mode determines the script (config-owned); a caller-chosen script
+    # under dispatch="openlab" is a contradiction, refused rather than ignored.
+    runner = FakeRunner(busy=False)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    body = {**OPENLAB_RUN_BODY, "script_name": "examples/agent_agilent.py"}
+    r = client.post("/control/run", json=body)
+    assert r.status_code == 422
+    assert "script_name" in r.text
+    assert runner.handoffs == []
+
+
+def test_openlab_dispatch_412_while_a_dispatch_is_in_flight():
+    # One submit subprocess at a time: concurrent Moses invocations against
+    # OpenLab are unexercised territory, so a second dispatch waits its turn.
+    runner = FakeRunner(busy=False, handoff_in_flight=True)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    r = client.post("/control/run", json=OPENLAB_RUN_BODY)
+    assert r.status_code == 412
+    detail = r.json()["detail"]
+    assert detail["error"] == "dispatch_in_progress"
+    assert r.headers.get("Retry-After") is not None
+    assert runner.handoffs == []
+
+
+def test_openlab_dispatch_still_validates_the_reserved_drawer():
+    # Pre-enqueue validation is dispatch-agnostic: the robot-drawer reservation
+    # and labware geometry guard OpenLab-bound jobs exactly like FIFO jobs.
+    runner = FakeRunner(busy=False)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    body = {
+        **OPENLAB_RUN_BODY,
+        "samples": [
+            {"sample_name": "cpd_01", "sample_position": "D1F-A1", "injection_volume": 2.0}
+        ],
+    }
+    r = client.post("/control/run", json=body)
+    assert r.status_code == 412
+    assert r.json()["detail"]["error"] == "reserved_for_robot"
+    assert runner.handoffs == []
+
+
+def test_post_queue_openlab_dispatch_returns_dispatching():
+    runner = FakeRunner(busy=False, servicing=True)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    r = client.post("/control/queue", json=OPENLAB_RUN_BODY)
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["status"] == "dispatching"
+    assert body["position"] == 0
+    assert runner.submitted == []
+
+
+def test_queue_view_shows_the_handoff_and_excludes_it_from_pending():
+    runner = FakeRunner(busy=False, servicing=True)
+    client = _authed_client(_load("signals_ready.json"), runner=runner)
+    r = client.post("/control/run", json=OPENLAB_RUN_BODY)
+    assert r.status_code == 202, r.text
+    hid = r.json()["run_id"]
+    runner._jobs[hid].status = "handed_off"  # the poller reaped a clean exit
+    body = client.get("/control/queue").json()
+    jobs = {j["queue_id"]: j for j in body["queue"]}
+    assert jobs[hid]["dispatch"] == "openlab"
+    assert jobs[hid]["status"] == "handed_off"
+    assert body["pending_count"] == 0
+    assert body["active_run_id"] is None
+
+
+# --- MosesRunner handoff lifecycle (real runner, faked subprocess) ---------
+
+
+def _handoff_settings(tmp_path: Path) -> "Settings":
+    """Settings pointing every Moses path at tmp_path, with both the batch and
+    the enqueue script present so either dispatch path can launch."""
+    work = tmp_path / "work"
+    (work / "examples").mkdir(parents=True)
+    (work / "examples" / "agent_agilent.py").write_text("# stub", encoding="utf-8")
+    (work / "examples" / "agent_agilent_enqueue.py").write_text("# stub", encoding="utf-8")
+    return Settings(
+        moses_work_dir=str(work),
+        run_jobs_dir=str(tmp_path / "jobs"),
+        moses_allowed_scripts="examples/agent_agilent.py",
+        moses_openlab_submit_script="examples/agent_agilent_enqueue.py",
+        hplcms_users="",
+        hte_users="*",
+        hplcms_admins="",
+        consumable_ack_file="",
+    )
+
+
+def _dispatching_handoff_entry(runner: MosesRunner, rc: int | None) -> JobEntry:
+    """Wire a dispatching handoff entry (mock submit subprocess) into a runner."""
+    entry = JobEntry(
+        queue_id="h-1",
+        script_name="examples/agent_agilent_enqueue.py",
+        job={"samples": [{"sample_name": "cpd_01"}]},
+        request_dict={},
+        queued_at=datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+        status="dispatching",
+        dispatch="openlab",
+        pid=999,
+        process=_make_mock_proc(),
+        job_path=Path("fake_handoff.json"),
+    )
+    entry.process.poll.return_value = rc  # type: ignore[union-attr]
+    runner._jobs["h-1"] = entry
+    runner._handoff_id = "h-1"
+    return entry
+
+
+def test_handoff_dispatches_outside_the_fifo_slot(tmp_path, monkeypatch):
+    from agilent_hplcms_server.control import runner as runner_mod
+
+    monkeypatch.setattr(runner_mod.subprocess, "Popen", lambda *a, **k: _make_mock_proc())
+    runner = MosesRunner()
+    s = _handoff_settings(tmp_path)
+
+    hid = runner.submit_openlab_handoff(
+        script_name=s.moses_openlab_submit_script,
+        job={"samples": [{"sample_name": "cpd_01"}]},
+        request_dict={},
+        settings=s,
+    )
+    entry = runner._jobs[hid]
+    assert entry.status == "dispatching"
+    assert entry.dispatch == "openlab"
+    assert runner.get_active() is None
+    assert runner.queue_depth() == 0
+
+    # The FIFO slot is untouched: a sidecar submission still launches at once.
+    run_id, position = runner.submit_to_queue(
+        script_name="examples/agent_agilent.py",
+        job={"samples": [{"sample_name": "cpd_02"}]},
+        request_dict={},
+        settings=s,
+    )
+    assert position == 0
+    assert runner.get_active() is not None
+    assert run_id != hid
+
+
+def test_second_handoff_while_dispatching_raises(tmp_path, monkeypatch):
+    from agilent_hplcms_server.control import runner as runner_mod
+    from agilent_hplcms_server.control.runner import HandoffInProgress
+
+    monkeypatch.setattr(runner_mod.subprocess, "Popen", lambda *a, **k: _make_mock_proc())
+    runner = MosesRunner()
+    s = _handoff_settings(tmp_path)
+    runner.submit_openlab_handoff(
+        script_name=s.moses_openlab_submit_script,
+        job={"samples": []},
+        request_dict={},
+        settings=s,
+    )
+    with pytest.raises(HandoffInProgress):
+        runner.submit_openlab_handoff(
+            script_name=s.moses_openlab_submit_script,
+            job={"samples": []},
+            request_dict={},
+            settings=s,
+        )
+
+
+def test_poll_reaps_a_clean_handoff_as_handed_off():
+    runner = MosesRunner()
+    entry = _dispatching_handoff_entry(runner, rc=0)
+
+    runner.poll(settings=Settings())
+
+    assert entry.status == "handed_off"
+    assert entry.process is None
+    assert entry.finished_at is not None
+    assert runner.get_active() is None
+
+
+def test_poll_marks_a_failed_handoff_with_reason():
+    runner = MosesRunner()
+    entry = _dispatching_handoff_entry(runner, rc=2)
+
+    runner.poll(settings=Settings())
+
+    assert entry.status == "failed"
+    assert "exit code 2" in (entry.error_msg or "").lower()
+
+
+def test_poll_reaps_handoff_then_next_dispatch_is_accepted(tmp_path, monkeypatch):
+    from agilent_hplcms_server.control import runner as runner_mod
+
+    monkeypatch.setattr(runner_mod.subprocess, "Popen", lambda *a, **k: _make_mock_proc())
+    runner = MosesRunner()
+    s = _handoff_settings(tmp_path)
+    entry = _dispatching_handoff_entry(runner, rc=0)
+    runner.poll(settings=s)
+    assert entry.status == "handed_off"
+
+    # The slot is free again: a new dispatch goes out without a 412.
+    hid = runner.submit_openlab_handoff(
+        script_name=s.moses_openlab_submit_script,
+        job={"samples": []},
+        request_dict={},
+        settings=s,
+    )
+    assert runner._jobs[hid].status == "dispatching"
+
+
+def test_abort_kills_a_dispatching_handoff():
+    runner = MosesRunner()
+    entry = _dispatching_handoff_entry(runner, rc=None)
+    proc = entry.process
+
+    was_active, _ = runner.abort(settings=Settings())
+
+    assert was_active is False  # the FIFO slot was empty
+    assert entry.status == "failed"
+    assert entry.error_msg == "Aborted by operator"
+    proc.terminate.assert_called_once()  # type: ignore[union-attr]
+
+
+def test_cancel_refuses_a_dispatching_handoff():
+    runner = MosesRunner()
+    _dispatching_handoff_entry(runner, rc=None)
+    with pytest.raises(RuntimeError):
+        runner.cancel_queued("h-1")
+
+
+def test_cancel_refuses_a_handed_off_job():
+    # Once handed off, the job lives in OpenLab's queue — cancel it there.
+    runner = MosesRunner()
+    entry = _dispatching_handoff_entry(runner, rc=None)
+    entry.status = "handed_off"
+    runner._handoff_id = None
+    with pytest.raises(LookupError):
+        runner.cancel_queued("h-1")
 
 
 # ---------------------------------------------------------------------------
