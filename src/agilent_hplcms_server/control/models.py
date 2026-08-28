@@ -111,6 +111,29 @@ class RunRequest(BaseModel):
             "reserved_for_robot unless submitter='robot'."
         ),
     )
+    dispatch: Literal["sidecar", "openlab"] = Field(
+        default="sidecar",
+        description=(
+            "Which queue receives the job. 'sidecar' (default): the sidecar's own "
+            "FIFO — completion tracked by process exit, dispatch held during "
+            "technician servicing. 'openlab': fire-and-forget handoff into OpenLab's "
+            "native Run Queue via a submit-and-exit Moses script — the job lines up "
+            "behind whatever OpenLab is acquiring, and the sidecar tracks only the "
+            "handoff (dispatching → handed_off | failed), never the acquisition."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _script_is_mode_owned_for_openlab(self) -> "RunRequest":
+        """Under dispatch='openlab' the mode determines the script (device config,
+        MOSES_OPENLAB_SUBMIT_SCRIPT). A caller-chosen script contradicts that;
+        refusing beats silently ignoring the field."""
+        if self.dispatch == "openlab" and "script_name" in self.model_fields_set:
+            raise ValueError(
+                "script_name is not honored for dispatch='openlab' — the submit "
+                "script is device configuration (MOSES_OPENLAB_SUBMIT_SCRIPT)."
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_wells(self) -> "RunRequest":
@@ -140,10 +163,13 @@ class RunRequest(BaseModel):
 
 
 class RunResponse(BaseModel):
-    """Response for POST /control/run (backward-compat quick-submit)."""
+    """Response for POST /control/run (backward-compat quick-submit).
+
+    ``dispatching`` is the dispatch="openlab" acceptance: the submit-and-exit
+    script is in flight; poll GET /control/queue for ``handed_off``/``failed``."""
 
     run_id: str
-    status: Literal["accepted", "queued"]
+    status: Literal["accepted", "queued", "dispatching"]
     message: str
     pid: int | None = None
     started_at: datetime | None = None
@@ -155,12 +181,16 @@ class QueuedRun(BaseModel):
 
     Status is process-exit authoritative (queue-ownership pivot): ``pending``
     (queued), ``running`` (Moses subprocess alive), ``done`` (exit 0),
-    ``failed`` (non-zero exit, aborted, or cancelled)."""
+    ``failed`` (non-zero exit, aborted, or cancelled). A dispatch="openlab"
+    entry instead moves ``dispatching`` → ``handed_off`` | ``failed``: exit 0
+    means the job now sits in OpenLab's own run queue, and the sidecar tracks
+    nothing further about it."""
 
     queue_id: str
     request: dict[str, Any]
     queued_at: datetime
-    status: Literal["pending", "running", "done", "failed"]
+    status: Literal["pending", "running", "done", "failed", "dispatching", "handed_off"]
+    dispatch: Literal["sidecar", "openlab"] = "sidecar"
     started_at: datetime | None = None
     finished_at: datetime | None = None
     pid: int | None = None
@@ -172,11 +202,12 @@ class QueuedRun(BaseModel):
 
 
 class QueueResponse(BaseModel):
-    """Response for POST /control/queue."""
+    """Response for POST /control/queue. ``dispatching`` as in RunResponse;
+    a handoff carries ``position`` 0 — it never occupies the FIFO."""
 
     queue_id: str
     position: int
-    status: Literal["queued"]
+    status: Literal["queued", "dispatching"]
     message: str
 
 
@@ -251,6 +282,20 @@ class QueueFullError(BaseModel):
     detail: str
     max_depth: int
     current_depth: int
+    retry_after_s: float | None = None
+
+
+class DispatchInProgressError(BaseModel):
+    """Body for HTTP 412 when a dispatch="openlab" submission arrives while a
+    previous submit subprocess is still in flight. One dispatch at a time —
+    concurrent Moses invocations against OpenLab are deliberately not
+    attempted. 412 (precondition) per §6.1: the request becomes valid once the
+    in-flight dispatch exits, which takes seconds, so ``retry_after_s`` is
+    populated and mirrored into ``Retry-After``. MUST NOT populate
+    ``last_error`` (§6.3)."""
+
+    error: Literal["dispatch_in_progress"] = "dispatch_in_progress"
+    detail: str
     retry_after_s: float | None = None
 
 

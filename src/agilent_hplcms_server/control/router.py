@@ -14,6 +14,7 @@ from .models import (
     ClaimRequest,
     ClaimResponse,
     ConsumableResetResponse,
+    DispatchInProgressError,
     EquipmentBusyError,
     HeartbeatResponse,
     InstrumentServicingError,
@@ -45,7 +46,7 @@ from .consumables import (
 )
 from .roster import can_service, can_workflow
 from .roster_sync import RosterProvider
-from .runner import JobEntry, MosesRunner
+from .runner import HandoffInProgress, JobEntry, MosesRunner
 
 router = APIRouter(prefix="/control", tags=["control"])
 
@@ -214,13 +215,15 @@ def _missing_openlab_processes(signals: dict) -> list[str]:
 
 
 def _entry_to_queued_run(entry: JobEntry) -> QueuedRun:
-    # Status is process-exit authoritative and maps 1:1 to the API
-    # (pending / running / done / failed) — no internal aliasing.
+    # Status is process-exit authoritative and maps 1:1 to the API — no
+    # internal aliasing. dispatch tells a reader which lifecycle the status
+    # belongs to (FIFO vs OpenLab handoff).
     return QueuedRun(
         queue_id=entry.queue_id,
         request=entry.request_dict,
         queued_at=entry.queued_at,
         status=entry.status,
+        dispatch=entry.dispatch,
         started_at=entry.started_at,
         finished_at=entry.finished_at,
         pid=entry.pid,
@@ -245,11 +248,14 @@ def _compose_moses_job(body: RunRequest) -> dict:
 
     Each sample's ``sample_position`` (e.g. "D1B-A1") is already the full Agilent
     multisampler address and is forwarded to Moses **verbatim** — Moses feeds it
-    straight to the instrument as the vial/SampleLocation. ``plate_format`` and
-    ``submitter`` are sidecar-side concerns (well-geometry validation and the
-    robot-drawer reservation) and are not forwarded to Moses.
+    straight to the instrument as the vial/SampleLocation. ``plate_format``,
+    ``submitter``, and ``dispatch`` are sidecar-side concerns (well-geometry
+    validation, the robot-drawer reservation, queue routing) and are not
+    forwarded to Moses.
     """
-    job = body.model_dump(exclude={"script_name", "samples", "plate_format", "submitter"})
+    job = body.model_dump(
+        exclude={"script_name", "samples", "plate_format", "submitter", "dispatch"}
+    )
     job["samples"] = [
         {
             "sample_name": s.sample_name,
@@ -381,6 +387,40 @@ def _do_enqueue(
         ) from exc
 
 
+def _do_openlab_handoff(
+    job: dict,
+    request_dict: dict,
+    runner: MosesRunner,
+    settings: Settings,
+) -> str:
+    """Hand off to OpenLab's queue; translates runner exceptions to HTTP errors.
+
+    The submit script is config-owned (``moses_openlab_submit_script``), never
+    request-chosen — RunRequest refuses a caller-set ``script_name`` in this
+    mode, so no allowlist check applies here."""
+    try:
+        return runner.submit_openlab_handoff(
+            script_name=settings.moses_openlab_submit_script,
+            job=job,
+            request_dict=request_dict,
+            settings=settings,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except HandoffInProgress as exc:
+        # §6.1: valid once the in-flight dispatch exits (seconds) → 412 with
+        # Retry-After. Like queue_full it MUST NOT touch last_error (§6.3).
+        retry_after_s = float(settings.openlab_dispatch_retry_after_s)
+        raise HTTPException(
+            status_code=412,
+            detail=DispatchInProgressError(
+                detail=str(exc),
+                retry_after_s=retry_after_s,
+            ).model_dump(mode="json"),
+            headers={"Retry-After": str(int(retry_after_s))},
+        ) from exc
+
+
 @router.post("/startup", response_model=StartupResponse, summary="Check instrument readiness")
 def startup(request: Request) -> StartupResponse:
     """Read-only readiness check. Never starts OpenLab — that is a manual operator action."""
@@ -402,7 +442,7 @@ def startup(request: Request) -> StartupResponse:
     summary="Quick-submit a run (starts immediately if idle, queues if busy)",
     responses={
         409: {"model": RequiresInitError | InstrumentServicingError | SubsystemFaultError},
-        412: {"model": QueueFullError | ReservedForRobotError},
+        412: {"model": QueueFullError | ReservedForRobotError | DispatchInProgressError},
         423: {"model": ClaimRejection | WorkflowActiveError},
     },
 )
@@ -413,6 +453,12 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     - Busy instrument → FIFO queue (``status: queued``, ``queue_position`` is 1-based).
     - Technician running OpenLab CDS directly → FIFO queue, held until they
       finish (auto-detected servicing does not refuse — see ``_check_service_mode``).
+    - ``dispatch: "openlab"`` → fire-and-forget handoff into OpenLab's native
+      run queue (``status: dispatching``); poll GET /control/queue for
+      ``handed_off``/``failed``. Bypasses the FIFO — it lines up in OpenLab
+      even behind a technician's acquisition — but every gate below applies
+      unchanged, plus HTTP 412 ``dispatch_in_progress`` while a previous
+      dispatch subprocess is still in flight.
     - HTTP 409 ``requires_init`` if any OpenLab core process is missing.
     - HTTP 409 ``instrument_servicing`` if the explicit service-mode flag is on.
     - HTTP 412 ``queue_full`` if the queue is at max depth (with ``Retry-After``).
@@ -436,6 +482,24 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     _check_labware(body, settings)
 
     job = _compose_moses_job(body)
+
+    if body.dispatch == "openlab":
+        handoff_id = _do_openlab_handoff(
+            job=job,
+            request_dict=body.model_dump(),
+            runner=runner,
+            settings=settings,
+        )
+        return RunResponse(
+            run_id=handoff_id,
+            status="dispatching",
+            message=(
+                "Handing off to OpenLab's run queue. Poll GET /control/queue "
+                "for handed_off; the acquisition itself is not tracked here."
+            ),
+            queue_position=None,
+        )
+
     run_id, position = _do_enqueue(
         script_name=body.script_name,
         job=job,
@@ -471,7 +535,7 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     summary="Submit a run to the job queue",
     responses={
         409: {"model": RequiresInitError | InstrumentServicingError | SubsystemFaultError},
-        412: {"model": QueueFullError | ReservedForRobotError},
+        412: {"model": QueueFullError | ReservedForRobotError | DispatchInProgressError},
         423: {"model": ClaimRejection | WorkflowActiveError},
     },
 )
@@ -480,6 +544,9 @@ def post_to_queue(body: RunRequest, request: Request) -> QueueResponse:
 
     Use ``GET /control/queue`` to check status and ``DELETE /control/queue/{queue_id}``
     to cancel before it starts. ``position`` is 0 if started immediately, 1-based otherwise.
+    ``dispatch: "openlab"`` behaves as on POST /control/run: the handoff is
+    tracked under the returned ``queue_id`` (``dispatching`` → ``handed_off``),
+    ``position`` is 0, and cancellation after handoff happens in OpenLab CDS.
     """
     _require_claim(request)
     runner = _get_runner(request)
@@ -495,6 +562,24 @@ def post_to_queue(body: RunRequest, request: Request) -> QueueResponse:
     _check_labware(body, settings)
 
     job = _compose_moses_job(body)
+
+    if body.dispatch == "openlab":
+        handoff_id = _do_openlab_handoff(
+            job=job,
+            request_dict=body.model_dump(),
+            runner=runner,
+            settings=settings,
+        )
+        return QueueResponse(
+            queue_id=handoff_id,
+            position=0,
+            status="dispatching",
+            message=(
+                "Handing off to OpenLab's run queue. Poll GET /control/queue "
+                "for handed_off; the acquisition itself is not tracked here."
+            ),
+        )
+
     queue_id, position = _do_enqueue(
         script_name=body.script_name,
         job=job,

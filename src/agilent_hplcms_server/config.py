@@ -65,6 +65,14 @@ class Settings:
         "MOSES_ALLOWED_SCRIPTS",
         "examples/agent_agilent.py",
     )
+    # Script for dispatch="openlab" submissions (relative to moses_work_dir):
+    # submits the job into OpenLab's native run queue and exits without
+    # waiting for the acquisition. Config-owned — the mode determines the
+    # script, so RunRequest.script_name is refused under dispatch="openlab".
+    moses_openlab_submit_script: str = os.environ.get(
+        "MOSES_OPENLAB_SUBMIT_SCRIPT",
+        "examples/agent_agilent_enqueue.py",
+    )
     run_jobs_dir: str = os.environ.get(
         "RUN_JOBS_DIR",
         r"C:\SDL_Tools\hplcms_jobs",
@@ -78,6 +86,9 @@ class Settings:
     # Advisory Retry-After (seconds) returned with HTTP 423 workflow_active
     # refusals (a robot/agent campaign holds the equipment-blocking lock).
     workflow_active_retry_after_s: int = _env_int("WORKFLOW_ACTIVE_RETRY_AFTER_S", 60)
+    # Advisory Retry-After (seconds) returned with HTTP 412 dispatch_in_progress
+    # refusals. A submit-and-exit dispatch lasts seconds, not a run duration.
+    openlab_dispatch_retry_after_s: int = _env_int("OPENLAB_DISPATCH_RETRY_AFTER_S", 10)
     # Servicing detection debounce: number of consecutive /status observations
     # of "OLSS busy AND no active sidecar job" required before the sidecar
     # declares a technician is driving OpenLab directly and halts the queue /

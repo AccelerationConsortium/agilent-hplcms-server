@@ -18,6 +18,13 @@ no OLSS-driven finalization, no "enqueued/waiting in OpenLab's queue" state. The
 only thing the runner still learns from OLSS is whether a *technician* is driving
 the instrument directly (servicing), so it can halt the queue.
 
+One explicit exception to queue ownership: ``dispatch="openlab"``
+(:meth:`MosesRunner.submit_openlab_handoff`) hands a job to OpenLab's native
+queue fire-and-forget. Process exit stays authoritative — but only for the
+*submission* (``dispatching`` → ``handed_off`` | ``failed``); the acquisition
+belongs to OpenLab and is never tracked. Once it acquires, OLSS shows a run we
+did not queue, so the FIFO holds behind it exactly as it does for a technician.
+
 **One reconciliation on the exit code** (see :meth:`_classify_nonzero_exit`):
 ``run_batch`` in ``examples/agent_agilent.py`` runs the samples *and then* a
 post-run standby-park step, and raises (→ non-zero exit) if **either** fails. So
@@ -50,16 +57,33 @@ from ..config import Settings, load_settings
 logger = logging.getLogger(__name__)
 
 
+class HandoffInProgress(RuntimeError):
+    """A previous ``dispatch="openlab"`` submit subprocess has not exited yet.
+
+    One dispatch at a time: concurrent Moses invocations against OpenLab are
+    deliberately not attempted. A dispatch lasts seconds, so callers retry."""
+
+
 @dataclass
 class JobEntry:
     """Internal tracking entry for one queued/active/completed run.
 
-    Status lifecycle (process-exit authoritative):
+    Status lifecycle (process-exit authoritative). ``dispatch`` selects which
+    of the two disjoint lifecycles applies:
+
+    ``dispatch="sidecar"`` — the FIFO owns the run end to end:
 
     - ``pending`` — queued, subprocess not yet launched.
     - ``running`` — Moses subprocess is alive (acquiring synchronously).
     - ``done``    — subprocess exited 0.
     - ``failed``  — subprocess exited non-zero, or the job was aborted/cancelled.
+
+    ``dispatch="openlab"`` — the sidecar tracks only the handoff; the
+    acquisition belongs to OpenLab's own run queue and is never tracked:
+
+    - ``dispatching`` — submit-and-exit subprocess is alive.
+    - ``handed_off``  — subprocess exited 0: the job sits in OpenLab's queue.
+    - ``failed``      — subprocess exited non-zero, or was aborted.
     """
 
     queue_id: str
@@ -67,7 +91,10 @@ class JobEntry:
     job: dict[str, Any]          # Moses job spec written to disk
     request_dict: dict[str, Any]  # original RunRequest as dict (for API display)
     queued_at: datetime
-    status: Literal["pending", "running", "done", "failed"] = "pending"
+    status: Literal[
+        "pending", "running", "done", "failed", "dispatching", "handed_off"
+    ] = "pending"
+    dispatch: Literal["sidecar", "openlab"] = "sidecar"
     started_at: datetime | None = None
     finished_at: datetime | None = None
     pid: int | None = None
@@ -120,6 +147,9 @@ class MosesRunner:
         #      job completion — process exit does that.
         self._service_mode: bool = False
         self._olss_run_no_job_streak: int = 0
+        # Single slot for an in-flight dispatch="openlab" submit subprocess.
+        # Independent of _active_id: a handoff never occupies the FIFO slot.
+        self._handoff_id: str | None = None
 
     # ------------------------------------------------------------------
     # Read-only queries
@@ -271,6 +301,31 @@ class MosesRunner:
         next_entry: JobEntry | None = None
 
         with self._lock:
+            if self._handoff_id is not None:
+                h = self._jobs[self._handoff_id]
+                h_rc = h.process.poll() if h.process else 0
+                if h_rc is not None:
+                    h.finished_at = datetime.now(timezone.utc)
+                    h.process = None
+                    if h_rc == 0:
+                        h.status = "handed_off"
+                        logger.info(
+                            "Handoff %s submitted to OpenLab's run queue", h.queue_id
+                        )
+                    else:
+                        h.status = "failed"
+                        tail = self._read_log_tail(h.log_path)
+                        last_line = next(
+                            (ln.strip() for ln in reversed(tail.splitlines()) if ln.strip()),
+                            "",
+                        )
+                        h.error_msg = f"OpenLab handoff failed (exit code {h_rc})" + (
+                            f": {last_line}" if last_line else ""
+                        )
+                        logger.info("Handoff %s failed: %s", h.queue_id, h.error_msg)
+                    self._handoff_id = None
+                    self._evict_history()
+
             if self._active_id is not None:
                 entry = self._jobs[self._active_id]
                 rc = entry.process.poll() if entry.process else 0
@@ -405,6 +460,73 @@ class MosesRunner:
             self._pending_ids.append(queue_id)
             return queue_id, len(self._pending_ids)
 
+    def submit_openlab_handoff(
+        self,
+        script_name: str,
+        job: dict[str, Any],
+        request_dict: dict[str, Any],
+        settings: Settings | None = None,
+    ) -> str:
+        """Hand a run to OpenLab's native queue via a submit-and-exit script.
+
+        ``dispatch="openlab"`` bypasses the FIFO on purpose: the script
+        enqueues the job in OpenLab (Agilent SDK ``submit_single_run``, no wait
+        loop) and exits, and the runner tracks only that submission —
+        ``dispatching`` → ``handed_off`` | ``failed`` by process exit. The
+        acquisition itself is OpenLab's. Once it starts, OLSS shows a run we
+        did not queue, so it reads as *servicing* and FIFO dispatch holds
+        behind it — the two queues compose without extra coordination.
+
+        The script is config-owned (``moses_openlab_submit_script``) and is
+        deliberately NOT checked against ``moses_allowed_scripts`` — that
+        allowlist constrains request-chosen scripts, and this one cannot be
+        chosen by the request.
+
+        Raises
+        ------
+        HandoffInProgress
+            A previous dispatch subprocess has not exited yet (one at a time).
+        FileNotFoundError
+            The configured submit script does not exist.
+        """
+        settings = settings or load_settings()
+
+        work_dir = Path(settings.moses_work_dir)
+        script_path = work_dir / script_name
+        if not script_path.exists():
+            raise FileNotFoundError(f"OpenLab submit script not found: {script_path}")
+
+        jobs_dir = Path(settings.run_jobs_dir)
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+
+        queue_id = str(uuid.uuid4())
+        entry = JobEntry(
+            queue_id=queue_id,
+            script_name=script_name,
+            job=job,
+            request_dict=request_dict,
+            queued_at=datetime.now(timezone.utc),
+            dispatch="openlab",
+            job_path=jobs_dir / f"{queue_id}.json",
+        )
+
+        with self._lock:
+            if self._handoff_id is not None:
+                raise HandoffInProgress(
+                    "A previous OpenLab dispatch is still in flight; retry in a "
+                    "few seconds."
+                )
+            entry.job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
+            self._jobs[queue_id] = entry
+            self._spawn_script(entry, settings)
+            entry.status = "dispatching"
+            self._handoff_id = queue_id
+            logger.info(
+                "Dispatching handoff %s to OpenLab's queue (PID %s, script %s)",
+                queue_id, entry.pid, script_name,
+            )
+        return queue_id
+
     def cancel_queued(self, queue_id: str) -> JobEntry:
         """Cancel a pending job.
 
@@ -421,8 +543,13 @@ class MosesRunner:
             entry = self._jobs.get(queue_id)
             if entry is None:
                 raise KeyError(queue_id)
-            if entry.status == "running":
+            if entry.status in ("running", "dispatching"):
                 raise RuntimeError("Job is currently running; use /control/abort to stop it.")
+            if entry.status == "handed_off":
+                raise LookupError(
+                    "Job already handed off to OpenLab's run queue; cancel it in "
+                    "OpenLab CDS."
+                )
             if entry.status in ("done", "failed"):
                 raise LookupError(f"Job already {entry.status}.")
             try:
@@ -446,7 +573,9 @@ class MosesRunner:
         settings = settings or load_settings()
         now = datetime.now(timezone.utc)
         proc_to_kill: subprocess.Popen | None = None  # type: ignore[type-arg]
+        handoff_to_kill: subprocess.Popen | None = None  # type: ignore[type-arg]
         run_id = "none"
+        was_active = False
 
         with self._lock:
             n_cleared = len(self._pending_ids)
@@ -458,30 +587,41 @@ class MosesRunner:
                     e.error_msg = "Aborted (queue cleared)"
             self._pending_ids.clear()
 
-            if self._active_id is None:
-                return False, n_cleared
+            # An in-flight OpenLab dispatch dies with everything else — abort
+            # is the big red button, whichever slot the work sits in. (A job
+            # already handed_off is out of reach: it lives in OpenLab's queue.)
+            if self._handoff_id is not None:
+                h = self._jobs[self._handoff_id]
+                handoff_to_kill = h.process
+                h.status = "failed"
+                h.finished_at = now
+                h.error_msg = "Aborted by operator"
+                self._handoff_id = None
 
-            entry = self._jobs[self._active_id]
-            proc_to_kill = entry.process
-            run_id = self._active_id
-            # Mark failed *inside* the lock so GET /control/queue immediately
-            # reflects the aborted state regardless of concurrent poll() calls.
-            entry.status = "failed"
-            entry.finished_at = now
-            entry.error_msg = "Aborted by operator"
-            self._active_id = None
+            if self._active_id is not None:
+                entry = self._jobs[self._active_id]
+                proc_to_kill = entry.process
+                run_id = self._active_id
+                # Mark failed *inside* the lock so GET /control/queue immediately
+                # reflects the aborted state regardless of concurrent poll() calls.
+                entry.status = "failed"
+                entry.finished_at = now
+                entry.error_msg = "Aborted by operator"
+                self._active_id = None
+                was_active = True
             self._evict_history()
 
         # Terminate outside the lock to avoid holding it during proc.wait().
-        if proc_to_kill:
-            proc_to_kill.terminate()
-            try:
-                proc_to_kill.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc_to_kill.kill()
+        for proc in (proc_to_kill, handoff_to_kill):
+            if proc:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
 
         logger.info("Aborted run %s; cleared %d queued run(s)", run_id, n_cleared)
-        return True, n_cleared
+        return was_active, n_cleared
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -561,7 +701,20 @@ class MosesRunner:
             self._launch_locked(entry, settings)
 
     def _launch_locked(self, entry: JobEntry, settings: Settings) -> None:
-        """Launch entry. Must be called WITH the lock held."""
+        """Launch entry into the FIFO slot. Must be called WITH the lock held."""
+        self._spawn_script(entry, settings)
+        entry.status = "running"
+        self._active_id = entry.queue_id
+        logger.info(
+            "Started run %s (PID %s, script %s, log %s)",
+            entry.queue_id, entry.pid, entry.script_name, entry.log_path,
+        )
+
+    def _spawn_script(self, entry: JobEntry, settings: Settings) -> None:
+        """Spawn entry's Moses script and record pid/process/log on the entry.
+
+        Slot assignment and status are the caller's job — the FIFO launcher and
+        the OpenLab handoff share only these subprocess mechanics."""
         work_dir = Path(settings.moses_work_dir)
         script_path = work_dir / entry.script_name
 
@@ -581,21 +734,16 @@ class MosesRunner:
             if log_fh:
                 log_fh.close()  # subprocess holds its own handle; safe to close parent's copy
 
-        entry.status = "running"
         entry.pid = proc.pid
         entry.process = proc
         entry.started_at = datetime.now(timezone.utc)
         entry.log_path = log_path
-        self._active_id = entry.queue_id
-        logger.info(
-            "Started run %s (PID %d, script %s, log %s)",
-            entry.queue_id, proc.pid, entry.script_name, log_path,
-        )
 
     def _evict_history(self) -> None:
         """Remove oldest completed entries when over limit. Call WITH lock held."""
         completed = [
-            (k, v) for k, v in self._jobs.items() if v.status in ("done", "failed")
+            (k, v) for k, v in self._jobs.items()
+            if v.status in ("done", "failed", "handed_off")
         ]
         if len(completed) > self._HISTORY_LIMIT:
             completed.sort(key=lambda kv: kv[1].finished_at or kv[1].queued_at)
