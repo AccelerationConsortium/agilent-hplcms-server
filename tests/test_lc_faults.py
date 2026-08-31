@@ -520,3 +520,58 @@ def test_the_module_that_caused_the_abort_still_faults(tmp_path: Path):
         "Needle command failed",
     }
     assert errored_lc_modules(_healthy_signals(**out)) == ["multisampler"]
+
+
+# --- multisampler hotel occupancy --------------------------------------------
+#
+# HOTEL_STATE reports one entry per physical drawer; each drawer has two
+# independently loadable halves (the D#F / D#B split used by sample addresses),
+# so four entries describe eight holders.
+
+
+def _hotel_line(when: datetime, state: str) -> str:
+    """One `LIST "HOTEL_STATE"` reply, in the driver's exact shape."""
+    module = "G7167B:DEBAS04772"
+    return (
+        f"EventId: 6481077;Timestamp: {_stamp(when)};Thread Id: 24;"
+        f'Message: LDT SendInstruction: Module:[{module}]; '
+        f'Instruction:[LIST "HOTEL_STATE"]; '
+        f"Reply:[[{module}:IN]: RA 00000 HOTEL_STATE: [HOTEL_STATE: {state}]]"
+        + _TAIL
+    )
+
+
+def test_hotel_occupancy_counts_both_halves_of_every_drawer(tmp_path: Path):
+    """Verbatim reading from this instrument on 30 Aug 2026: five of the eight
+    holders hold a container. Counting only the first half-field reported 2/4
+    and treated D1 and D3 — whose loaded half is the one it skipped — as empty.
+    """
+    _write_log(
+        tmp_path,
+        [_hotel_line(_ago(30), "[1,0,0,0,1], [2,0,0,1,0], [3,0,0,0,1], [4,0,0,1,1]")],
+    )
+    sig = read_module_states(tmp_path)
+    assert sig["module_multisampler_drawers_total"] == 8
+    assert sig["module_multisampler_drawers_occupied"] == 5
+
+
+def test_hotel_occupancy_treats_state_2_as_occupied(tmp_path: Path):
+    """Half-fields are tri-state. 2 occurs regularly in the retained logs and is
+    not empty, so an `== 1` test under-counts it."""
+    _write_log(
+        tmp_path,
+        [_hotel_line(_ago(30), "[1,0,0,2,0], [2,0,0,0,0], [3,0,0,0,0], [4,0,0,0,0]")],
+    )
+    sig = read_module_states(tmp_path)
+    assert sig["module_multisampler_drawers_total"] == 8
+    assert sig["module_multisampler_drawers_occupied"] == 1
+
+
+def test_hotel_occupancy_all_empty(tmp_path: Path):
+    _write_log(
+        tmp_path,
+        [_hotel_line(_ago(30), "[1,0,0,0,0], [2,0,0,0,0], [3,0,0,0,0], [4,0,0,0,0]")],
+    )
+    sig = read_module_states(tmp_path)
+    assert sig["module_multisampler_drawers_occupied"] == 0
+    assert sig["module_multisampler_drawers_total"] == 8

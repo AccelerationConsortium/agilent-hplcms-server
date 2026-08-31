@@ -44,8 +44,8 @@ module_multisampler_state       — multisampler state (G7167B)
 module_multisampler_stat_flags
 module_multisampler_stat_age_s
 module_multisampler_stat_at
-module_multisampler_drawers_occupied — count of hotel drawers with a plate/vial
-module_multisampler_drawers_total    — total hotel drawer slots reported
+module_multisampler_drawers_occupied — hotel halves reporting a container (non-zero)
+module_multisampler_drawers_total    — hotel halves reported (2 per drawer: D#F + D#B)
 
 Returned signals (module hardware faults — see read_lc_faults)
 --------------------------------------------------------------
@@ -353,10 +353,31 @@ def read_module_states(log_dir: str | Path) -> dict[str, Any]:
         if (now - ts).total_seconds() <= _MODULE_CMD_MAX_AGE_S:
             drawers = re.findall(r"\[(\d+),(\d+),(\d+),(\d+),(\d+)\]", state_str)
             if drawers:
-                # field index 3 = container_present (1 = present, 0 = empty)
-                n_occupied = sum(1 for d in drawers if d[3] == "1")
-                out["module_multisampler_drawers_occupied"] = n_occupied
-                out["module_multisampler_drawers_total"] = len(drawers)
+                # HOTEL_STATE returns one entry per physical drawer (field 0 =
+                # drawer number 1-4), and each drawer has two independently
+                # loadable halves — the front/back split the D#F / D#B sample
+                # addresses use. Fields 3 and 4 are those halves, so the hotel
+                # holds 2 x len(drawers) containers, not len(drawers): the
+                # multisampler's own device layout (OpenLab .scml) declares
+                # eight user-addressable holders, D1F..D4B.
+                #
+                # Reading only field 3 reported four slots and counted the
+                # other four as if they did not exist — D1 and D3 hold a plate
+                # in the half this missed and were reported empty throughout.
+                #
+                # Fields 3/4 are tri-state (0/1/2). 0 is empty; 1 and 2 are
+                # both non-empty, and which is which is NOT established — the
+                # values change within seconds during acquisition, so they
+                # likely distinguish "loaded" from "in transport / being
+                # accessed" rather than describing what an operator loaded.
+                # Counting non-zero is therefore the strongest claim the data
+                # supports. Do not gate anything safety-critical on this until
+                # the codes are confirmed at the instrument.
+                halves = [h for d in drawers for h in (d[3], d[4])]
+                out["module_multisampler_drawers_occupied"] = sum(
+                    1 for h in halves if h != "0"
+                )
+                out["module_multisampler_drawers_total"] = len(halves)
 
     return out
 
