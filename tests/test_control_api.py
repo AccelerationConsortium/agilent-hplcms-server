@@ -1100,6 +1100,21 @@ def test_standby_still_refused_during_a_technician_run():
     assert r.json()["detail"]["error"] == "instrument_servicing"
 
 
+def test_workflow_start_refused_under_either_servicing_source():
+    """Taking the equipment lock cannot wait in the queue, so unlike run.submit
+    it is refused by the inferred source too."""
+    inferred = FakeRunner(busy=False, servicing=True)
+    client = _authed_client(_load("signals_ready.json"), runner=inferred)
+    r = client.post("/control/workflow/start")
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "instrument_servicing"
+
+    explicit = FakeRunner(busy=False)
+    explicit.set_service_mode(True)
+    client2 = _authed_client(_load("signals_ready.json"), runner=explicit)
+    assert client2.post("/control/workflow/start").status_code == 409
+
+
 # ---------------------------------------------------------------------------
 # dispatch="openlab" — fire-and-forget handoff into OpenLab's native run queue
 # ---------------------------------------------------------------------------
