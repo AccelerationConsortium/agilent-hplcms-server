@@ -14,6 +14,7 @@ from .control.consumables import (
     is_suppressed as _consumable_suppressed,
     raw_volume_signal as _raw_volume_signal,
 )
+from .control.fault_acks import apply_fault_acks as _apply_acks_to_signals
 from .models import (
     PROTOCOL_VERSION,
     ComponentStatus,
@@ -28,7 +29,17 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .control.claims import ClaimHolder
     from .control.consumables import ConsumableAcks
+    from .control.fault_acks import FaultAcks
     from .control.runner import MosesRunner
+
+
+def _apply_fault_acks(
+    signals: dict[str, Any], fault_acks: "FaultAcks | None"
+) -> dict[str, Any]:
+    """Drop fault evidence an operator has acknowledged. Read-only on the store."""
+    if fault_acks is None:
+        return signals
+    return _apply_acks_to_signals(signals, fault_acks.snapshot())
 
 
 EQUIPMENT_ID = "agilent_uplc_ms"
@@ -51,7 +62,9 @@ def _lc_module_builders() -> dict[str, Any]:
     }
 
 
-def errored_lc_modules(signals: dict[str, Any]) -> list[str]:
+def errored_lc_modules(
+    signals: dict[str, Any], fault_acks: "FaultAcks | None" = None
+) -> list[str]:
     """Return the roles of LC modules currently reporting a hardware ``error``.
 
     Uses the exact component builders that populate ``/status`` (so the
@@ -67,7 +80,13 @@ def errored_lc_modules(signals: dict[str, Any]) -> list[str]:
     fault but never logged a ``STAT?`` produces no component card at all — and a
     fault must never fail to gate run submission just because we are missing its
     readiness reply.
+
+    ``fault_acks`` applies the same operator acknowledgments ``build_status``
+    applies, and for the same reason: this function and the status envelope are
+    two readers of one truth, so an operator who has cleared a fault on the
+    dashboard must find ``run.submit`` accepting again.
     """
+    signals = _apply_fault_acks(signals, fault_acks)
     olss_state = signals.get("olss_instrument_state")
     faulted: list[str] = []
     for role, builder in _lc_module_builders().items():
@@ -105,9 +124,16 @@ def build_status(
     runner: "MosesRunner | None" = None,
     claims: "ClaimHolder | None" = None,
     consumables: "ConsumableAcks | None" = None,
+    fault_acks: "FaultAcks | None" = None,
 ) -> EquipmentStatus:
     """Build an ``EquipmentStatus`` from a probe ``read_signals()`` dict."""
     settings = settings or load_settings()
+
+    # Operator fault acknowledgments are applied first, so every consumer below
+    # — components, faulted_modules, last_error, details — reads the same
+    # post-ack view that errored_lc_modules() gates run submission on. Pure: the
+    # caller's dict is untouched and the ack store is only read.
+    signals = _apply_fault_acks(signals, fault_acks)
 
     # If the server-managed runner has an active process, treat the instrument
     # as busy regardless of what the probe says. This closes the race window
@@ -416,6 +442,11 @@ def build_status(
     # single fault promoted to last_error.
     if lc_faults:
         details["lc_faults"] = lc_faults
+    # Which modules are green only because an operator vouched for them, and
+    # when. Mirrors the consumable `*_reset_at` fields: a suppressed warning must
+    # never be silently suppressed.
+    if signals.get("fault_acks_active"):
+        details["fault_acks"] = signals["fault_acks_active"]
     if signals.get("run_pressure_run"):
         details["run_pressure"] = {
             "run": signals.get("run_pressure_run"),

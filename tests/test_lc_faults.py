@@ -440,3 +440,83 @@ def test_no_fault_leaves_status_untouched():
     assert status.last_error is None
     assert "lc_faults" not in status.details
     assert "run.submit" in status.allowed_actions
+
+
+def test_cascade_abort_is_not_a_fault_of_the_module_that_logs_it(tmp_path: Path):
+    """"Analysis aborted by another module" says nothing about this module.
+
+    The driver files it as `EV 00150` — an event — in all 21 occurrences across
+    every retained log, never as the `EE` an error carries, and writes it just as
+    readily for a software `UnifiedControl.AbortRun`. Counting it latched three
+    healthy modules into `error` and refused run.submit for an hour whenever
+    anyone pressed stop.
+    """
+    _write_log(
+        tmp_path,
+        [
+            _fault_line(
+                _ago(60),
+                "eLogAndAbortCurrentRunOnly",
+                "G7120A:DEBA201988",
+                "Analysis aborted by another module",
+            ),
+            _fault_line(
+                _ago(60),
+                "eLogAndAbortCurrentRunOnly",
+                "G7117B:DEBAW05689",
+                "Analysis aborted by another module",
+            ),
+        ],
+    )
+
+    assert read_lc_faults(tmp_path) == {}
+
+
+def test_the_module_that_caused_the_abort_still_faults(tmp_path: Path):
+    """Dropping the cascade must not drop the cause: the needle crash of
+    2026-08-20 20:53:47, with the three cascade lines it triggered 100 ms on."""
+    when = _ago(900)
+    _write_log(
+        tmp_path,
+        [
+            _fault_line(
+                when,
+                "eLogAndAbortSequence",
+                "G7167B:DEBAS04772",
+                "Pusher hit the vessel top [25225 25225, 0]",
+            ),
+            _fault_line(
+                when,
+                "eLogAndAbortSequence",
+                "G7167B:DEBAS04772",
+                "Needle command failed [25022 25022, 3]",
+            ),
+            _fault_line(
+                when,
+                "eLogAndAbortCurrentRunOnly",
+                "G7120A:DEBA201988",
+                "Analysis aborted by another module",
+            ),
+            _fault_line(
+                when,
+                "eLogAndAbortCurrentRunOnly",
+                "G7117B:DEBAW05689",
+                "Analysis aborted by another module",
+            ),
+            _fault_line(
+                when,
+                "eLogAndAbortCurrentRunOnly",
+                "G7116B:DEBAZ09019",
+                "Analysis aborted by another module",
+            ),
+        ],
+    )
+    out = read_lc_faults(tmp_path)
+
+    # Only the multisampler is faulted — the three it took down are not.
+    assert out["lc_fault_module_roles"] == ["multisampler"]
+    assert {f["message"] for f in out["lc_faults"]} == {
+        "Pusher hit the vessel top",
+        "Needle command failed",
+    }
+    assert errored_lc_modules(_healthy_signals(**out)) == ["multisampler"]

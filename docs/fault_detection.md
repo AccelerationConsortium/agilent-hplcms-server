@@ -95,7 +95,15 @@ last month would pin the instrument into `error` forever. Two reconciliations:
 
    Note the remaining limit: `STAT?` is only written at prerun, so recovery is only
    *observable* when a run starts. Fix the hardware and start nothing, and the
-   window is still the only exit — there is no manual fault acknowledgment.
+   window is the only automatic exit. That gap bit on 2026-08-20: the multisampler
+   drove its needle into a vessel top in D2F at 20:53:47 (`Pusher hit the vessel
+   top [25225]` → `Needle command failed [25022]` → `Draw command aborted
+   [25478]`), took the other three modules down with it via `Analysis aborted by
+   another module`, and recovered minutes later — OpenLab was showing `Idle` /
+   `OK` by 21:06 while `/status` still reported `error` and refused `run.submit`.
+   No run started, so no `STAT?` was written, so nothing could observe the
+   recovery. **Manual acknowledgment** (below) is the third exit added for exactly
+   this case.
 
 **Rotation.** `RCDriver.log` rotates at 10 MB, and a busy day rotates it in ~25
 minutes (observed 2026-08-11: 9.5 MB at 10:35, rotated by 10:45). A fault inside the
@@ -134,9 +142,50 @@ lc_fault_module_roles  list[str]
 - **`required_actions`** ← `check_<role>`, matching the existing convention.
 - **`details.lc_faults`** ← the full list, for the dashboard.
 
+### Manual acknowledgment (`control/fault_acks.py`)
+
+`POST /control/faults/{module}/ack` records that an operator has physically
+checked a faulted module; `DELETE` withdraws it. Service-role gated — it asserts
+something about the hardware and releases the `subsystem_fault` interlock, which
+is the service toggle's kind of authority rather than the consumable
+acknowledgments' (refilling a bottle cannot crash a needle into a vial).
+
+Shaped after `control/consumables.py`, for the same reason that module exists: a
+warning the device cannot clear on its own, and can only *read* evidence about,
+trains operators to ignore it. A file-backed store that only `/control/*` mutates,
+plus a **pure** suppression function `build_status` applies, so `/status` stays
+side-effect-free.
+
+**Both fault channels are acknowledged together.** Filtering `lc_faults` alone
+would leave the module red anyway: the multisampler's last `STAT?` before an
+abort is `ERROR, NOT_READY`, and `status_builder._module_state_with_olss` reads
+that ERROR flag straight into a component state of `error`. So an ack also drops
+the ERROR token from a `STAT?` it covers — and only that token, leaving
+`NOT_READY` to stand. The module has not reported ready since, and inventing a
+`READY` it never sent would be a worse lie than showing a stale not-ready.
+`not_ready` is enough, because both the status gate and the interlock test for
+`error` exactly.
+
+**Re-arming is automatic, so an ack needs no expiry.** Evidence is matched by its
+own event time, not by "older than the ack": faults carry `timestamp`, and each
+`STAT?` now carries `module_<role>_stat_at` (added for this — `stat_age_s` is
+measured from the poll, so the same reply reports a different age every read).
+Both come from the driver log's naive-local clock while an ack is stamped in UTC,
+so storing the acknowledged event times verbatim, in the driver's own domain,
+keeps the comparison exact. Anything the driver logs afterwards is evidence the
+operator has not seen and counts in full — the ack cannot mask the next failure,
+and acking a module with nothing wrong records null thresholds that suppress
+nothing.
+
+`errored_lc_modules()` takes the acks too, so the dashboard view and the router's
+409 refusal cannot drift apart — the same single-source discipline the
+component-builder sharing already enforces.
+
 ### Configuration
 
 `LC_FAULT_WINDOW_S` (default 3600). Setting it to 0 disables the probe.
+`LC_FAULT_ACK_FILE` (default `C:\SDL_Tools\hplcms_fault_acks.json`) persists
+acknowledgments, so a service restart cannot resurrect a cleared fault.
 
 ## Phase 2 — post-run pressure QC from the `.dx` archive
 
@@ -290,6 +339,13 @@ turns either into something a person actually sees, and is worth doing before Ph
 - **Promote pressure drift to blocking.** Advisory today; revisit once there is enough
   baseline data to trust a threshold.
 - **Tune the drift threshold** (`PRESSURE_DRIFT_PCT`, 15 %) against real history.
+- **Unattended recovery.** The acknowledgment is a human in the loop, which does
+  nothing for a fault at 02:00 with no run scheduled. Treating OLSS `Idle` +
+  `softwareStatus OK`, observed after the fault, as recovery evidence would clear
+  it unattended — but whether OLSS returns to `Idle` *immediately* after an abort
+  is unverified, and if it does, keying on it would defeat the interlock
+  entirely. Needs OLSS state sampled across a real fault before it can be
+  trusted; Phase 4's push path is the better answer to the same 02:00 problem.
 - **Confirm the pump's pressure-limit event code.** A limit trip surfaces through the
   Phase-1 channel like any other fault, but has not occurred in the retained logs, so
   the code is unconfirmed. Nothing depends on knowing it — codes pass through as

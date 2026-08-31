@@ -454,6 +454,26 @@ class ConsumableResetResponse(BaseModel):
     message: str
 
 
+class FaultAckResponse(BaseModel):
+    """Response for the LC module fault acknowledgment endpoints.
+
+    ``faults_through`` / ``stat_through`` are the acknowledged evidence: the
+    newest fault event and the ``STAT?`` reply covered by this ack, in the RC
+    driver log's own clock. Anything the driver logs after them re-arms the
+    fault, so the ack needs no expiry (see control/fault_acks.py).
+    ``fault_cleared`` reports whether the module actually came out of ``error``
+    — false when a *newer* fault is already outstanding.
+    """
+
+    module: str
+    acked_at: datetime
+    faults_through: datetime | None = None
+    stat_through: datetime | None = None
+    fault_cleared: bool
+    faulted_modules: list[str] = Field(default_factory=list)
+    message: str
+
+
 class ClaimRejection(BaseModel):
     """Body for HTTP 409 (claim contended) and HTTP 423 (control call without a
     valid token). The SDK treats 409/423 identically."""

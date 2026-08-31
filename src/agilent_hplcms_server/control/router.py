@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 
 from ..config import Settings, load_settings
@@ -16,6 +18,7 @@ from .models import (
     ConsumableResetResponse,
     DispatchInProgressError,
     EquipmentBusyError,
+    FaultAckResponse,
     HeartbeatResponse,
     InstrumentServicingError,
     PlateMismatchError,
@@ -44,7 +47,8 @@ from .consumables import (
     is_suppressed,
     raw_volume_signal,
 )
-from .roster import can_service, can_workflow
+from .fault_acks import FAULT_ROLES, FaultAcks
+from .roster import can_ack_fault, can_service, can_workflow
 from .roster_sync import RosterProvider
 from .runner import HandoffInProgress, JobEntry, MosesRunner
 
@@ -69,6 +73,10 @@ def _get_roster(request: Request) -> RosterProvider:
 
 def _get_consumables(request: Request) -> ConsumableAcks:
     return request.app.state.consumables  # type: ignore[no-any-return]
+
+
+def _get_fault_acks(request: Request) -> FaultAcks:
+    return request.app.state.fault_acks  # type: ignore[no-any-return]
 
 
 def _require_claim(request: Request) -> str:
@@ -165,15 +173,19 @@ def _check_servicing(request: Request, signals: dict) -> None:
         )
 
 
-def _check_subsystem_fault(signals: dict) -> None:
+def _check_subsystem_fault(request: Request, signals: dict) -> None:
     """Refuse an enqueue while an LC module reports a hardware error (409
     subsystem_fault, fail-closed) so a run never launches into faulted hardware.
     Uses the same module-state derivation as ``/status`` (imported lazily to
     avoid a control ⇄ status_builder import cycle), so this refusal and the
-    dropped ``run.submit`` in ``allowed_actions`` can never disagree."""
+    dropped ``run.submit`` in ``allowed_actions`` can never disagree.
+
+    Operator acknowledgments are passed through for that same reason: a fault an
+    operator has cleared on the dashboard must also stop refusing submissions,
+    or the two halves of one decision drift apart."""
     from ..status_builder import errored_lc_modules
 
-    faulted = errored_lc_modules(signals)
+    faulted = errored_lc_modules(signals, _get_fault_acks(request))
     if faulted:
         raise HTTPException(
             status_code=409,
@@ -182,7 +194,8 @@ def _check_subsystem_fault(signals: dict) -> None:
                     "LC module(s) reporting a hardware error: "
                     + ", ".join(faulted)
                     + ". Resolve the fault in OpenLab CDS / at the instrument, "
-                    "then resubmit."
+                    "then resubmit — or acknowledge it via "
+                    "POST /control/faults/{module}/ack once the module is checked."
                 ),
                 faulted_modules=faulted,
             ).model_dump(mode="json"),
@@ -479,7 +492,7 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     runner.poll(settings=settings)
     _check_requires_init(signals)
     _check_service_mode(request, signals)
-    _check_subsystem_fault(signals)
+    _check_subsystem_fault(request, signals)
     _check_reserved_drawer(body, settings)
     _check_labware(body, settings)
 
@@ -559,7 +572,7 @@ def post_to_queue(body: RunRequest, request: Request) -> QueueResponse:
     runner.poll(settings=settings)
     _check_requires_init(signals)
     _check_service_mode(request, signals)
-    _check_subsystem_fault(signals)
+    _check_subsystem_fault(request, signals)
     _check_reserved_drawer(body, settings)
     _check_labware(body, settings)
 
@@ -744,7 +757,7 @@ def standby(request: Request) -> StandbyResponse:
     runner.poll(settings=settings)
     _check_requires_init(signals)
     _check_servicing(request, signals)
-    _check_subsystem_fault(signals)
+    _check_subsystem_fault(request, signals)
 
     standby_job = {
         "instrument_config_path": "examples/hh_472_config.json",
@@ -957,7 +970,7 @@ def workflow_start(request: Request) -> WorkflowStartResponse:
     runner.poll(settings=settings)
     _check_requires_init(signals)
     _check_servicing(request, signals)
-    _check_subsystem_fault(signals)
+    _check_subsystem_fault(request, signals)
 
     grant = claims.start_workflow(token)
     return WorkflowStartResponse(
@@ -1137,3 +1150,159 @@ def reset_solvent(slot: str, request: Request) -> ConsumableResetResponse:
             detail=f"Unknown solvent slot {slot!r}; expected one of {list(SOLVENT_SLOTS)}.",
         )
     return _reset_consumable(request, slot, f"Solvent {slot.upper()} refilled")
+
+
+# ---------------------------------------------------------------------------
+# LC module fault acknowledgments. Agilent's driver never logs a fault-cleared
+# line, and the recovery it *can* be observed by — a module's own STAT? going
+# READY — is only written at prerun. A module fixed while the instrument sits
+# idle therefore has no way to say so, and the fault holds for the whole
+# LC_FAULT_WINDOW_S (default an hour) with run.submit refused behind it, long
+# after OpenLab itself has gone back to green. These endpoints are the missing
+# exit: an operator who has physically checked the module clears the evidence.
+#
+# Service-role gated, unlike the consumable acknowledgments above. Acknowledging
+# a fault asserts something about the physical instrument and releases a safety
+# interlock; refilling a bottle cannot crash a needle into a vial.
+# ---------------------------------------------------------------------------
+
+
+def _require_fault_ack_role(request: Request) -> str | None:
+    """403 unless the current claim holder may acknowledge hardware faults."""
+    held = _get_claims(request).current()
+    if held is None or not can_ack_fault(held.role):  # type: ignore[arg-type]
+        raise HTTPException(
+            status_code=403,
+            detail=RoleForbiddenError(
+                detail=(
+                    "Acknowledging an LC module fault requires a service-role "
+                    "account."
+                ),
+                owner=held.owner if held else None,
+                role=held.role if held else None,
+                required_role="service",
+            ).model_dump(mode="json"),
+        )
+    return held.owner
+
+
+def _validate_role(role: str) -> str:
+    role = role.lower()
+    if role not in FAULT_ROLES:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown LC module {role!r}; expected one of {list(FAULT_ROLES)}.",
+        )
+    return role
+
+
+@router.post(
+    "/faults/{role}/ack",
+    response_model=FaultAckResponse,
+    summary="Acknowledge an LC module hardware fault after checking the module",
+    responses={
+        403: {"model": RoleForbiddenError},
+        404: {},
+        423: {"model": ClaimRejection},
+    },
+)
+def ack_fault(role: str, request: Request, note: str | None = None) -> FaultAckResponse:
+    """Record that an operator has physically checked a faulted LC module.
+
+    Clears the fault evidence **that exists right now** — the module's logged
+    faults and, if its last ``STAT?`` still carries ERROR, that reply — so
+    ``/status`` leaves ``error`` and the ``subsystem_fault`` interlock stops
+    refusing ``run.submit``. Anything the driver logs afterwards re-arms the
+    fault in full, so the acknowledgment needs no expiry and cannot mask the
+    next failure.
+
+    The acknowledged module is reported ``not_ready`` rather than ``ready``: it
+    has not sent a READY since (``STAT?`` is only written at prerun), and
+    claiming otherwise would invent a reply the module never made.
+
+    - HTTP 404 if ``role`` is not a known LC module.
+    - HTTP 403 ``role_forbidden`` unless the claim owner is a service account.
+    - HTTP 423 if the ``X-Claim-Token`` is missing or stale.
+    """
+    role = _validate_role(role)
+    _require_claim(request)
+    owner = _require_fault_ack_role(request)
+
+    fault_acks = _get_fault_acks(request)
+    signals = _read_signals(request)
+    ack = fault_acks.record(role, signals, owner=owner, note=note)
+
+    # Re-derive from the store rather than trusting the ack blind: a fault newer
+    # than the evidence just acknowledged leaves the module faulted, and the
+    # response has to say so instead of reporting a clear that did not happen.
+    from ..status_builder import errored_lc_modules
+
+    faulted = errored_lc_modules(signals, fault_acks)
+    cleared = role not in faulted
+    if cleared:
+        message = (
+            f"{role} fault acknowledged; the module no longer reports an error. "
+            "A newer fault from the driver will re-arm it."
+        )
+    else:
+        message = (
+            f"{role} acknowledged, but it is still reporting a fault newer than "
+            "the evidence acknowledged — the module has not recovered."
+        )
+    return FaultAckResponse(
+        module=role,
+        acked_at=ack["acked_at"],
+        faults_through=ack["faults_through"],
+        stat_through=ack["stat_through"],
+        fault_cleared=cleared,
+        faulted_modules=faulted,
+        message=message,
+    )
+
+
+@router.delete(
+    "/faults/{role}/ack",
+    response_model=FaultAckResponse,
+    summary="Withdraw an LC module fault acknowledgment",
+    responses={
+        403: {"model": RoleForbiddenError},
+        404: {},
+        423: {"model": ClaimRejection},
+    },
+)
+def unack_fault(role: str, request: Request) -> FaultAckResponse:
+    """Withdraw an acknowledgment, restoring any fault it was suppressing.
+
+    For an ack taken in error. The underlying evidence was never deleted — only
+    filtered — so whatever is still inside ``LC_FAULT_WINDOW_S`` comes straight
+    back.
+
+    - HTTP 404 if ``role`` is not a known LC module, or has no acknowledgment.
+    - HTTP 403 ``role_forbidden`` unless the claim owner is a service account.
+    - HTTP 423 if the ``X-Claim-Token`` is missing or stale.
+    """
+    role = _validate_role(role)
+    _require_claim(request)
+    _require_fault_ack_role(request)
+
+    fault_acks = _get_fault_acks(request)
+    if not fault_acks.clear(role):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No fault acknowledgment recorded for {role!r}.",
+        )
+
+    from ..status_builder import errored_lc_modules
+
+    signals = _read_signals(request)
+    faulted = errored_lc_modules(signals, fault_acks)
+    return FaultAckResponse(
+        module=role,
+        acked_at=datetime.now(timezone.utc),
+        fault_cleared=role not in faulted,
+        faulted_modules=faulted,
+        message=(
+            f"{role} fault acknowledgment withdrawn; any fault still inside the "
+            "detection window applies again."
+        ),
+    )

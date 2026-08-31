@@ -179,6 +179,17 @@ class Settings:
     # read_lc_faults). Set to 0 to disable fault detection.
     lc_fault_window_s: int = _env_int("LC_FAULT_WINDOW_S", 3600)
 
+    # Operator acknowledgments for LC module faults (control/fault_acks.py).
+    # The window above is a blunt timer: a module fixed while the instrument sits
+    # idle writes no STAT?, so it cannot be *observed* to recover and the fault
+    # holds for the full hour, blocking run.submit long after OpenLab has gone
+    # back to green. An operator who has physically checked the module clears the
+    # evidence here. Persisted so a restart does not resurrect a cleared fault.
+    lc_fault_ack_file: str = os.environ.get(
+        "LC_FAULT_ACK_FILE",
+        r"C:\SDL_Tools\hplcms_fault_acks.json",
+    )
+
     # Post-run pump-pressure QC (probes/dx_pressure.py). Each completed run's
     # peak pressure is compared against the median peak of the recent runs of
     # the SAME method; a deviation beyond pressure_drift_pct is reported as an

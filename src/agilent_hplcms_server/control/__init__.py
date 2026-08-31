@@ -5,8 +5,15 @@ plus the v1.1 claim protocol (/control/claim, /control/heartbeat, /control/relea
 """
 
 from .consumables import ConsumableAcks
+from .fault_acks import FaultAcks
 from .roster_sync import RosterProvider
 from .router import router
 from .runner import MosesRunner
 
-__all__ = ["router", "MosesRunner", "RosterProvider", "ConsumableAcks"]
+__all__ = [
+    "router",
+    "MosesRunner",
+    "RosterProvider",
+    "ConsumableAcks",
+    "FaultAcks",
+]
