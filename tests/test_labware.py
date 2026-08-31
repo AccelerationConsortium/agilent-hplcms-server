@@ -225,3 +225,135 @@ def test_unknown_custom_plate_name_still_compares():
 def test_canonical_plate_name_folds_both_vocabularies():
     assert canonical_plate_name("96-well") == canonical_plate_name("*96Agilent*")
     assert canonical_plate_name("54-vial") == "54vialplate"
+
+
+# ---------------------------------------------------------------------------
+# Height: clearance and labelling
+# ---------------------------------------------------------------------------
+
+def test_plate_taller_than_drawer_clearance_is_reported():
+    """z_dimension_mm is the drawer-top height the arm must clear. A plate
+    standing above it cannot be loaded without the transport striking it."""
+    plate = PlateType(
+        plate_type="96DeepAgilent45mm", rows=8, cols=12,
+        well_height_mm=48.0, z_dimension_mm=45.0,
+    )
+    assert plate.clearance_exceeded_by() == 3.0
+
+
+def test_plate_within_clearance_reports_none():
+    plate = PlateType(
+        plate_type="96DeepAgilent45mm", rows=8, cols=12,
+        well_height_mm=44.0, z_dimension_mm=45.0,
+    )
+    assert plate.clearance_exceeded_by() is None
+
+
+def test_clearance_unknown_when_either_figure_missing():
+    """A config captured without the device Z must not fail closed on a guess."""
+    assert PlateType(plate_type="x", rows=6, cols=9,
+                     well_height_mm=36.0).clearance_exceeded_by() is None
+    assert PlateType(plate_type="x", rows=6, cols=9,
+                     z_dimension_mm=45.0).clearance_exceeded_by() is None
+
+
+def test_height_label_present_and_absent():
+    assert PlateType(plate_type="x", rows=6, cols=9,
+                     well_height_mm=36.0).height_label() == " (36 mm tall)"
+    assert PlateType(plate_type="x", rows=6, cols=9).height_label() == ""
+
+
+# ---------------------------------------------------------------------------
+# tools/scml_to_opentrons.py -- OpenLab geometry -> Opentrons schema-2
+# ---------------------------------------------------------------------------
+
+def _load_converter_module():
+    spec = importlib.util.spec_from_file_location(
+        "scml_to_opentrons", TOOLS / "scml_to_opentrons.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# A minimal SampleContainer in OpenLab's shape: 2x2, footprint 100x80, A1
+# centred 15 mm from the left and 10 mm down from the UPPER edge.
+_FIXTURE_CONTAINER = """<SampleContainer Version="1.0.0.0">
+  <Common>
+    <Identifier>{ABC-123}</Identifier>
+    <DisplayName>*TestPlate*</DisplayName>
+    <NumLocation>4</NumLocation>
+    <IsPlate>true</IsPlate>
+  </Common>
+  <Geometry><CartesianContainer>
+    <Units>
+      <RowOffset>10</RowOffset><ColumnOffset>15</ColumnOffset>
+      <RowDistance>20</RowDistance><ColumnDistance>25</ColumnDistance>
+      <NumRows>2</NumRows><NumCols>2</NumCols>
+      <XWellDiameter>8</XWellDiameter><YWellDiameter>8</YWellDiameter>
+      <WellIsSquare>false</WellIsSquare>
+      <WellHeight>40</WellHeight><WellDepth>30</WellDepth>
+      <WellVolume>1000</WellVolume>
+    </Units>
+    <XSize>100</XSize><YSize>80</YSize>
+  </CartesianContainer></Geometry>
+</SampleContainer>"""
+
+
+def test_convert_flips_y_from_agilent_upper_left_origin():
+    """Agilent measures y DOWN from the upper edge; Opentrons measures it UP
+    from the front. Getting this backwards mirrors the plate."""
+    defn = _load_converter_module().convert(_FIXTURE_CONTAINER)
+    assert defn is not None
+    assert defn["wells"]["A1"]["x"] == 15.0
+    assert defn["wells"]["A1"]["y"] == 70.0          # 80 - 10
+    assert defn["wells"]["B2"]["x"] == 40.0          # 15 + 25
+    assert defn["wells"]["B2"]["y"] == 50.0          # 80 - (10 + 20)
+
+
+def test_convert_well_z_is_the_well_bottom():
+    """Opentrons z is the well BOTTOM above the plate base, which Agilent gives
+    only indirectly as height minus depth."""
+    defn = _load_converter_module().convert(_FIXTURE_CONTAINER)
+    assert defn["wells"]["A1"]["z"] == 10.0          # 40 - 30
+    assert defn["wells"]["A1"]["depth"] == 30.0
+
+
+def test_convert_carries_height_as_a_first_class_field():
+    """The whole point: height stops being a comment."""
+    defn = _load_converter_module().convert(_FIXTURE_CONTAINER)
+    assert defn["dimensions"] == {
+        "xDimension": 100.0, "yDimension": 80.0, "zDimension": 40.0
+    }
+
+
+def test_convert_ordering_is_column_major():
+    defn = _load_converter_module().convert(_FIXTURE_CONTAINER)
+    assert defn["ordering"] == [["A1", "B1"], ["A2", "B2"]]
+    assert set(defn["wells"]) == {"A1", "B1", "A2", "B2"}
+
+
+def test_convert_emits_well_shape_and_volume():
+    defn = _load_converter_module().convert(_FIXTURE_CONTAINER)
+    a1 = defn["wells"]["A1"]
+    assert a1["shape"] == "circular"
+    assert a1["diameter"] == 8.0
+    assert a1["totalLiquidVolume"] == 1000.0
+
+
+def test_convert_rejects_a_non_container_blob():
+    assert _load_converter_module().convert("<SampleContainerDevice/>") is None
+    assert _load_converter_module().convert("not xml at all") is None
+
+
+def test_load_name_strips_openlab_decoration_and_splits_camelcase():
+    """loadName must be lowercase, and ac-organic-lab's store additionally
+    requires an underscore. Splitting Agilent's CamelCase satisfies both."""
+    ln = _load_converter_module().load_name_for
+    assert ln("*54VialPlate*") == "54_vial_plate"
+    assert ln("96DeepAgilent45mm") == "96_deep_agilent45mm"
+    assert ln("G4267-40071 - Reference vial rack (5)") == "g4267_40071_reference_vial_rack_5"
+    for name in ("*54VialPlate*", "96DeepAgilent45mm", "*96Agilent*"):
+        assert "_" in ln(name), "store requires at least one underscore"
+        assert ln(name) == ln(name).lower()
