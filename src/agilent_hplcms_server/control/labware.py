@@ -125,6 +125,33 @@ class PlateType(BaseModel):
         col = int(m.group(2))
         return 0 <= row_idx < self.rows and 1 <= col <= self.cols
 
+    def height_label(self) -> str:
+        """' (44.0 mm tall)' when the height is known, '' otherwise.
+
+        Height is what a name mismatch actually costs: two plates can share
+        every addressable position and differ only in how far the needle must
+        descend. Saying so turns an opaque name comparison into the physical
+        fact the operator has to act on.
+        """
+        if self.well_height_mm is None:
+            return ""
+        return f" ({self.well_height_mm:g} mm tall)"
+
+    def clearance_exceeded_by(self) -> float | None:
+        """How far this plate exceeds its drawer's clearance, in mm, or None.
+
+        ``z_dimension_mm`` is the drawer-top height the arm must clear, captured
+        from the multisampler's own device layout. A configured plate taller
+        than that cannot physically be loaded without the transport striking it,
+        so such a config describes an impossible drawer and is refused rather
+        than driven into. None when either figure is unknown, or when the plate
+        fits.
+        """
+        if self.well_height_mm is None or self.z_dimension_mm is None:
+            return None
+        overshoot = self.well_height_mm - self.z_dimension_mm
+        return overshoot if overshoot > 0 else None
+
 
 class LabwareConfig(BaseModel):
     """Drawer code ('D1F'/'D4B'/...) -> the plate type loaded in that drawer."""

@@ -508,6 +508,40 @@ def test_run_rejects_96_well_declaration_against_deep_well_drawer(tmp_path):
     assert detail["configured"] == "96DeepAgilent45mm"
 
 
+# A drawer whose configured plate stands above the drawer's own clearance --
+# a config that describes a physically impossible drawer.
+_D4B_TOO_TALL = {"D4B": {"plate_type": "96DeepAgilent45mm", "rows": 8, "cols": 12,
+                         "well_height_mm": 48.0, "z_dimension_mm": 45.0}}
+
+
+def test_run_refuses_drawer_whose_plate_exceeds_clearance(tmp_path):
+    """Fails closed on an impossible config rather than driving into it."""
+    runner = FakeRunner(busy=False)
+    settings = _labware_settings(tmp_path, _D4B_TOO_TALL)
+    client = _authed_client(_load("signals_ready.json"), runner=runner, settings=settings)
+    body = {**VALID_RUN_BODY, "samples": [
+        {"sample_name": "s1", "sample_position": "D4B-A1", "injection_volume": 2.0}
+    ]}
+    r = client.post("/control/run", json=body)
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "plate_mismatch"
+    assert "3 mm above the drawer's clearance" in detail["detail"]
+
+
+def test_plate_mismatch_message_names_the_configured_height(tmp_path):
+    """A name mismatch is only actionable if it says what it costs physically."""
+    runner = FakeRunner(busy=False)
+    settings = _labware_settings(tmp_path, _D4B_DEEP96)
+    client = _authed_client(_load("signals_ready.json"), runner=runner, settings=settings)
+    body = {**VALID_RUN_BODY, "plate_format": "96-well", "samples": [
+        {"sample_name": "s1", "sample_position": "D4B-A1", "injection_volume": 2.0}
+    ]}
+    r = client.post("/control/run", json=body)
+    assert r.status_code == 422, r.text
+    assert "44 mm tall" in r.json()["detail"]["detail"]
+
+
 def test_run_no_labware_config_uses_legacy_check():
     """With no labware config, the built-in 96-well check still applies."""
     runner = FakeRunner(busy=False)

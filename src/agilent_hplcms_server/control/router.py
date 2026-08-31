@@ -335,6 +335,23 @@ def _check_labware(body: RunRequest, settings: Settings) -> None:
                     configured=None,
                 ).model_dump(mode="json"),
             )
+        overshoot = plate.clearance_exceeded_by()
+        if overshoot is not None:
+            raise HTTPException(
+                status_code=422,
+                detail=PlateMismatchError(
+                    detail=(
+                        f"Drawer {s.drawer!r} is configured with the "
+                        f"{plate.plate_type!r} plate{plate.height_label()}, which "
+                        f"stands {overshoot:g} mm above the drawer's clearance. That "
+                        "plate cannot be loaded there without the transport striking "
+                        "it; fix the labware config or the drawer's container type."
+                    ),
+                    drawer=s.drawer,
+                    declared=body.plate_format,
+                    configured=plate.plate_type,
+                ).model_dump(mode="json"),
+            )
         if body.plate_format is not None and not plate_names_match(
             body.plate_format, plate.plate_type
         ):
@@ -343,7 +360,9 @@ def _check_labware(body: RunRequest, settings: Settings) -> None:
                 detail=PlateMismatchError(
                     detail=(
                         f"Declared plate_format {body.plate_format!r} does not match the "
-                        f"{plate.plate_type!r} plate configured in the {s.drawer!r} drawer."
+                        f"{plate.plate_type!r} plate{plate.height_label()} configured in "
+                        f"the {s.drawer!r} drawer. The needle descends to the configured "
+                        "plate's geometry, so a height difference is a collision."
                     ),
                     drawer=s.drawer,
                     declared=body.plate_format,
