@@ -6,7 +6,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, Response
 
 from ..config import Settings, load_settings
 from .claims import ClaimConflict, ClaimHolder
-from .labware import load_labware
+from .labware import load_labware, plate_names_match
 from .models import (
     AbortResponse,
     CancelResponse,
@@ -322,7 +322,9 @@ def _check_labware(body: RunRequest, settings: Settings) -> None:
                     configured=None,
                 ).model_dump(mode="json"),
             )
-        if body.plate_format is not None and body.plate_format != plate.plate_type:
+        if body.plate_format is not None and not plate_names_match(
+            body.plate_format, plate.plate_type
+        ):
             raise HTTPException(
                 status_code=422,
                 detail=PlateMismatchError(

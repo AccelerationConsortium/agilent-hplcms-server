@@ -15,7 +15,9 @@ from pathlib import Path
 from agilent_hplcms_server.control.labware import (
     LabwareConfig,
     PlateType,
+    canonical_plate_name,
     load_labware,
+    plate_names_match,
 )
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
@@ -179,3 +181,47 @@ def test_capture_collect_and_build_config(tmp_path):
     cfg = LabwareConfig.model_validate(config)
     assert cfg.for_drawer("D4B").contains("F9")
     assert not cfg.for_drawer("D4B").contains("G1")
+
+
+# ---------------------------------------------------------------------------
+# Plate-name vocabulary (canonical names <-> OpenLab container names)
+# ---------------------------------------------------------------------------
+
+def test_legacy_name_matches_openlab_container_name():
+    """A caller declaring "54-vial" means the same plate the config calls
+    "*54VialPlate*"; comparing them verbatim would refuse every honest run."""
+    assert plate_names_match("54-vial", "*54VialPlate*")
+    assert plate_names_match("96-well", "*96Agilent*")
+    assert plate_names_match("384-well", "*384Agilent*")
+
+
+def test_plate_name_match_is_symmetric():
+    """Either vocabulary may sit on either side (config or declaration)."""
+    assert plate_names_match("*54VialPlate*", "54-vial")
+    assert plate_names_match("*96Agilent*", "96-well")
+
+
+def test_deep_well_plate_never_matches_shallow_96_well():
+    """The needle-crash case: 96DeepAgilent45mm (44.0 mm) and *96Agilent*
+    (14.3 mm) share 8x12 geometry, so only the name separates them. A caller
+    declaring "96-well" must NOT satisfy a drawer holding the deep plate."""
+    assert not plate_names_match("96-well", "96DeepAgilent45mm")
+    assert not plate_names_match("*96Agilent*", "96DeepAgilent45mm")
+    assert plate_names_match("96DeepAgilent45mm", "96DeepAgilent45mm")
+
+
+def test_plate_name_match_ignores_case_and_punctuation():
+    assert plate_names_match("54_VIAL", "*54vialplate*")
+    assert plate_names_match("  96-Well  ", "*96AGILENT*")
+
+
+def test_unknown_custom_plate_name_still_compares():
+    """Custom labware isn't in the alias table; it must still match itself and
+    not something else."""
+    assert plate_names_match("MyCustomRack-A", "mycustomrack a")
+    assert not plate_names_match("MyCustomRack-A", "MyCustomRack-B")
+
+
+def test_canonical_plate_name_folds_both_vocabularies():
+    assert canonical_plate_name("96-well") == canonical_plate_name("*96Agilent*")
+    assert canonical_plate_name("54-vial") == "54vialplate"

@@ -455,6 +455,58 @@ def test_run_matching_declared_plate_format_accepted(tmp_path):
     assert r.status_code == 202, r.text
 
 
+# The same drawer as _D4B_54VIAL, but named the way OpenLab (and the capture
+# tool) names it — the form a generated labware config actually contains.
+_D4B_OPENLAB = {"D4B": {"plate_type": "*54VialPlate*", "rows": 6, "cols": 9,
+                        "num_locations": 54, "well_height_mm": 36.0}}
+# Same 8x12 addressable geometry as *96Agilent*, 29.7 mm taller.
+_D4B_DEEP96 = {"D4B": {"plate_type": "96DeepAgilent45mm", "rows": 8, "cols": 12,
+                       "num_locations": 96, "well_height_mm": 44.0}}
+
+
+def test_run_accepts_canonical_name_against_openlab_named_config(tmp_path):
+    """A generated config names the plate "*54VialPlate*"; callers (and
+    hardware_smoke_test.py) declare canonical names. Both name one plate, so
+    the declaration is accepted."""
+    runner = FakeRunner(busy=False)
+    settings = _labware_settings(tmp_path, _D4B_OPENLAB)
+    client = _authed_client(_load("signals_ready.json"), runner=runner, settings=settings)
+    body = {**VALID_RUN_BODY, "plate_format": "54-vial", "samples": [
+        {"sample_name": "s1", "sample_position": "D4B-A1", "injection_volume": 2.0}
+    ]}
+    r = client.post("/control/run", json=body)
+    assert r.status_code == 202, r.text
+
+
+def test_run_accepts_openlab_name_against_openlab_named_config(tmp_path):
+    runner = FakeRunner(busy=False)
+    settings = _labware_settings(tmp_path, _D4B_OPENLAB)
+    client = _authed_client(_load("signals_ready.json"), runner=runner, settings=settings)
+    body = {**VALID_RUN_BODY, "plate_format": "*54VialPlate*", "samples": [
+        {"sample_name": "s1", "sample_position": "D4B-A1", "injection_volume": 2.0}
+    ]}
+    r = client.post("/control/run", json=body)
+    assert r.status_code == 202, r.text
+
+
+def test_run_rejects_96_well_declaration_against_deep_well_drawer(tmp_path):
+    """The 29 Aug needle crash, as an HTTP refusal: the drawer holds a 44 mm
+    deep-well plate and the caller declares a shallow 96-well. Identical rows
+    and cols, so only the name catches it."""
+    runner = FakeRunner(busy=False)
+    settings = _labware_settings(tmp_path, _D4B_DEEP96)
+    client = _authed_client(_load("signals_ready.json"), runner=runner, settings=settings)
+    body = {**VALID_RUN_BODY, "plate_format": "96-well", "samples": [
+        {"sample_name": "s1", "sample_position": "D4B-A1", "injection_volume": 2.0}
+    ]}
+    r = client.post("/control/run", json=body)
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "plate_mismatch"
+    assert detail["declared"] == "96-well"
+    assert detail["configured"] == "96DeepAgilent45mm"
+
+
 def test_run_no_labware_config_uses_legacy_check():
     """With no labware config, the built-in 96-well check still applies."""
     runner = FakeRunner(busy=False)

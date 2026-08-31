@@ -37,6 +37,60 @@ from pydantic import BaseModel, Field
 
 _WELL_RE = re.compile(r"^([A-Za-z])(\d{1,2})$")
 
+# ── Plate-name vocabulary ────────────────────────────────────────────────────
+#
+# Two vocabularies name the same physical plate. Callers (and the built-in
+# ``plate_format`` check in control/models.py) use canonical names — "96-well",
+# "54-vial". OpenLab names its Sample Containers differently — "*96Agilent*",
+# "*54VialPlate*" — and those are the names ``capture_autosampler_config.py``
+# writes into the labware config, because they carry the captured geometry.
+#
+# Comparing the two verbatim makes every honest declaration fail, so a declared
+# name is resolved through this table before comparison. The mapping is only
+# for names that mean the *same* container: notably ``96DeepAgilent45mm`` has no
+# canonical alias, because no canonical name distinguishes a 44 mm deep-well
+# plate from a 14.3 mm one — and conflating them is exactly the needle crash
+# this module exists to prevent.
+_LEGACY_PLATE_ALIASES: dict[str, str] = {
+    "96-well": "*96Agilent*",
+    "384-well": "*384Agilent*",
+    "54-vial": "*54VialPlate*",
+}
+
+
+def _fold(name: str) -> str:
+    """Fold a plate name to a comparison key (case/punctuation insensitive).
+
+    OpenLab wraps some container names in asterisks and the two vocabularies
+    disagree on hyphens and case, none of which distinguishes one plate from
+    another.
+    """
+    return re.sub(r"[^a-z0-9]", "", name.strip().lower())
+
+
+# Aliases are matched on the folded key, so "54-vial", "54_vial" and "54 VIAL"
+# all resolve. The table above stays written in the readable canonical form.
+_FOLDED_ALIASES: dict[str, str] = {
+    _fold(k): _fold(v) for k, v in _LEGACY_PLATE_ALIASES.items()
+}
+
+
+def canonical_plate_name(name: str) -> str:
+    """Resolve a plate name to the key used for equality between vocabularies."""
+    folded = _fold(name)
+    return _FOLDED_ALIASES.get(folded, folded)
+
+
+def plate_names_match(declared: str, configured: str) -> bool:
+    """True if two plate names refer to the same container.
+
+    Symmetric, so it holds whichever vocabulary each side is written in: a
+    caller declaring "54-vial" matches a config naming "*54VialPlate*", and the
+    reverse. An unrecognised name is still compared — folded — against the
+    other side, so custom labware works without being listed here.
+    """
+    return canonical_plate_name(declared) == canonical_plate_name(configured)
+
 
 class PlateType(BaseModel):
     """Geometry of the container currently loaded in one autosampler tray.
