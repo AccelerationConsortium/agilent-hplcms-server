@@ -135,6 +135,7 @@ def stage_readonly(base: str) -> bool:
         assert isinstance(body, dict)
         print(f"      instrument_online: {body.get('instrument_online')}")
         print(f"      accepting_jobs   : {body.get('accepting_jobs')}")
+        print(f"      dispatch_held    : {body.get('dispatch_held_reason')}")
         print(f"      active_run_id    : {body.get('active_run_id')}")
         print(f"      pending_count    : {body.get('pending_count')}")
         idle = body.get("active_run_id") is None and not body.get("pending_count")

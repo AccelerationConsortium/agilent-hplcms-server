@@ -112,13 +112,18 @@ Decided and implemented 2026-06-23, after the v1.1 control surface above shipped
   is now `pending → running → done | failed`.
 
 - **Submission precedence (highest wins):**
-  1. **Servicing** → `409 instrument_servicing`; queue halted (pending jobs wait, not
-     dropped). Two sources: an **explicit, persistent admin toggle**
+  1. **Servicing** → queue halted (pending jobs wait, not dropped). Two sources,
+     differing in whether a new submission is refused: an **explicit, persistent
+     admin toggle** → `409 instrument_servicing`
      (`POST /control/service/start` | `…/service/end`, *not* claim-bound so a dropped
      dashboard never un-blocks a maintenance window), and an **auto-detect fallback**
      keyed on `olss_current_run` (a real acquisition) while no sidecar job is active,
      debounced over `SERVICING_DEBOUNCE_POLLS`. Keyed on `currentRun`, not bare
      `state=="Busy"`, because OLSS `state` cannot distinguish a run from data analysis.
+     The inferred source is ordinary *busy*: submissions are **accepted** and held
+     (`GET /control/queue` reports `dispatch_held_reason: "servicing"`, `run.submit`
+     stays in `allowed_actions`); only `instrument.standby` / `workflow.start` — which
+     take the instrument rather than queue for it — are refused `409` by either source.
   2. **Workflow** → non-holder gets `423 workflow_active` (+ `Retry-After`). The
      equipment-blocking lock is a `workflow` flag on the single-slot claim
      (`POST /control/workflow/start` | `…/end`); it inherits TTL/heartbeat/auto-expiry.
