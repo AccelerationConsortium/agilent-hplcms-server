@@ -22,6 +22,8 @@ from .models import (
     HeartbeatResponse,
     InstrumentServicingError,
     PlateMismatchError,
+    LabwareRejection,
+    RequestValidationRejection,
     QueueFullError,
     QueueResponse,
     QueueStatusResponse,
@@ -477,6 +479,7 @@ def startup(request: Request) -> StartupResponse:
     responses={
         409: {"model": RequiresInitError | InstrumentServicingError | SubsystemFaultError},
         412: {"model": QueueFullError | ReservedForRobotError | DispatchInProgressError},
+        422: {"model": LabwareRejection | RequestValidationRejection},
         423: {"model": ClaimRejection | WorkflowActiveError},
     },
 )
@@ -570,6 +573,7 @@ def submit_run(body: RunRequest, request: Request) -> RunResponse:
     responses={
         409: {"model": RequiresInitError | InstrumentServicingError | SubsystemFaultError},
         412: {"model": QueueFullError | ReservedForRobotError | DispatchInProgressError},
+        422: {"model": LabwareRejection | RequestValidationRejection},
         423: {"model": ClaimRejection | WorkflowActiveError},
     },
 )

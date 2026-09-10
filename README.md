@@ -35,7 +35,9 @@ Start-Process powershell -Verb RunAs -ArgumentList "-Command C:\SDL_Tools\nssm.e
 | `GET /` | `{equipment_id, equipment_name, protocol_version}` |
 | `GET /health` | `{status: "healthy"}` |
 | `GET /status` | `EquipmentStatus` envelope per STATUS_SPEC v1.2 (incl. `allowed_actions`, `details.claimed_by`, `activity`/`activity_since`) |
-| `GET /openapi.json` | Generated OpenAPI spec |
+| `GET /openapi.json` | Generated OpenAPI spec, including control error envelopes |
+| `GET /docs` | Interactive API reference |
+| `GET /docs/agent` | Agent integration guide: claims, dispatch, labware and refusal handling |
 
 ### Control
 
@@ -90,6 +92,7 @@ A run carries an optional `plate_format` and a list of samples, each addressed b
 
 The built-in `plate_format` check only knows the canonical `96-well` / `384-well` / `54-vial` formats. The autosampler on this instrument holds a **54-vial plate (6 rows × 9 cols)**, so a well like `G1` is valid for a 96-well plate but *off* the real plate — a needle-crash risk. Point `LABWARE_CONFIG_PATH` at a JSON file declaring the plate loaded in each drawer, and the sidecar validates every submission against that **actual geometry** (authoritative), refusing mismatches with **422 `plate_mismatch`**:
 
+- a configured plate taller than the known drawer clearance (unknown height/clearance remains permissive),
 - an off-plate `well` for the configured plate,
 - a declared `plate_format` that disagrees with the loaded plate type, or
 - a drawer with no configured labware.
@@ -108,6 +111,8 @@ setx LABWARE_CONFIG_PATH C:\SDL_Tools\labware_config.json   # then restart the s
 ```
 
 The drawer→plate assignment is an explicit human choice (safety-critical); the tool fills in the exact geometry. Leave `LABWARE_CONFIG_PATH` unset to fall back to the built-in `plate_format` check.
+
+The converter `tools/scml_to_opentrons.py --out-dir <directory>` exports OpenLab `.scml` container geometry as Opentrons schema-2 JSON. This is an offline tool, not a labware-loading API; target stores must support the Agilent footprint rather than impose the OT-2 slot envelope.
 
 ## Loopback verification
 

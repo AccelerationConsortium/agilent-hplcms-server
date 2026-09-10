@@ -1,4 +1,4 @@
-"""FastAPI app exposing STATUS_SPEC v1.0 endpoints for the Agilent UPLC-MS sidecar."""
+"""FastAPI app exposing STATUS_SPEC v1.2 endpoints for the Agilent UPLC-MS sidecar."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__
+from .agent_docs import agent_guide
 from .config import Settings, load_settings
 from .control import (
     ConsumableAcks,
@@ -85,7 +86,7 @@ def create_app(
         title="Agilent UPLC-MS Status Sidecar",
         version=__version__,
         description=(
-            "STATUS_SPEC v1.0 sidecar for the Agilent UPLC-MS instrument. "
+            "STATUS_SPEC v1.2 sidecar for the Agilent UPLC-MS instrument. "
             "/status is side-effect-free. /control/* endpoints drive Moses."
         ),
     )
@@ -115,6 +116,38 @@ def create_app(
     app.state.fault_acks = fault_acks_instance
 
     app.include_router(control_router)
+
+    @app.get("/docs/agent", tags=["documentation"], summary="Agent integration guide")
+    def documentation() -> dict:
+        return agent_guide()
+
+    # HTTPException serializes all declared control errors under `detail`.
+    # Describe the actual wire envelope, including custom labware refusals.
+    original_openapi = app.openapi
+
+    def documented_openapi() -> dict:
+        schema = original_openapi()
+        if schema.get("x-control-errors-wrapped"):
+            return schema
+        for path, operations in schema["paths"].items():
+            if not path.startswith("/control/"):
+                continue
+            for operation in operations.values():
+                if not isinstance(operation, dict):
+                    continue
+                for code, response in operation.get("responses", {}).items():
+                    if not code.isdigit() or int(code) < 400:
+                        continue
+                    media = response.get("content", {}).get("application/json")
+                    if media and code != "422":
+                        media["schema"] = {
+                            "type": "object", "required": ["detail"],
+                            "properties": {"detail": media["schema"]},
+                        }
+        schema["x-control-errors-wrapped"] = True
+        return schema
+
+    app.openapi = documented_openapi
 
     @app.get("/", response_model=ProbeResponse)
     def probe() -> ProbeResponse:

@@ -317,6 +317,7 @@ class PlateMismatchError(BaseModel):
     """Body for HTTP 422 when a submitted sample does not match the plate
     actually configured in its autosampler drawer (see control/labware.py):
 
+    - the configured plate exceeds known drawer clearance,
     - the drawer has no configured labware,
     - the declared ``plate_format`` disagrees with the loaded plate type, or
     - the ``well`` is off the configured plate's row/column geometry.
@@ -331,6 +332,18 @@ class PlateMismatchError(BaseModel):
     drawer: str
     declared: str | None = None
     configured: str | None = None
+
+
+class RequestValidationRejection(BaseModel):
+    """HTTP 422 envelope for FastAPI request validation."""
+
+    detail: list[dict[str, Any]]
+
+
+class LabwareRejection(BaseModel):
+    """HTTP 422 envelope for configured labware refusals."""
+
+    detail: PlateMismatchError
 
 
 class SubsystemFaultError(BaseModel):
