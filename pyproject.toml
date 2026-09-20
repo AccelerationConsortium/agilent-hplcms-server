@@ -33,6 +33,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agilent_hplcms_server"]
+# Ship the Markdown agent documentation that documentation.py serves via
+# importlib.resources, so /agent-docs works from an installed wheel too.
+artifacts = ["src/agilent_hplcms_server/docs/*.md"]
 
 [tool.uv.sources]
 sdl-lab-contract = { git = "https://github.com/AccelerationConsortium/sdl-lab-contract", tag = "v1.2.0" }

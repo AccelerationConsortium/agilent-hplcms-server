@@ -22,6 +22,7 @@ from .control import (
     router as control_router,
 )
 from .control.claims import ClaimHolder
+from .documentation import router as documentation_router
 from .models import EquipmentStatus, HealthResponse, PROTOCOL_VERSION, ProbeResponse
 from .probes import read_signals as _default_read_signals
 from .status_builder import (
@@ -116,6 +117,10 @@ def create_app(
     app.state.fault_acks = fault_acks_instance
 
     app.include_router(control_router)
+    # Lab-standard Markdown documentation surface (/agent-docs,
+    # /agent-docs/api-reference, /llms.txt). Additive: the JSON guide at
+    # /docs/agent below is unchanged.
+    app.include_router(documentation_router)
 
     @app.get("/docs/agent", tags=["documentation"], summary="Agent integration guide")
     def documentation() -> dict:
