@@ -48,6 +48,42 @@ class GradientConfig(BaseModel):
     equilibration_time: float = Field(default=0.0, ge=0, le=30.0)
 
 
+class StandbyConfig(BaseModel):
+    """Parameters of the low-flow park that runs after a batch completes.
+
+    Mirrors ``StandbyConfig`` in the Moses dispatch script
+    (``examples/agent_agilent.py``); ``run_batch`` has always accepted these as
+    its ``standby_config`` argument, but the sidecar never sent one, so every
+    park silently used the script's defaults. The defaults here are those same
+    values, so omitting this object reproduces the previous behaviour exactly.
+
+    This is what makes "an analytical run followed by a trailing low-flow park"
+    a *single* job: the park is a property of the run, not a second submission
+    that has to be sequenced by hand behind the first.
+    """
+
+    flow_rate: float = Field(
+        default=0.01, gt=0, le=2.0, description="Standby flow rate in mL/min"
+    )
+    run_time: float = Field(
+        default=1.0, gt=0, le=120.0, description="Duration of the standby flush in minutes"
+    )
+    fraction_b: float = Field(
+        default=0.50, ge=0.0, le=1.0, description="Fraction of solvent B during standby (0.0-1.0)"
+    )
+    sample_position: str = Field(
+        default="1",
+        min_length=1,
+        max_length=16,
+        description=(
+            "Vial used for the standby injection. Forwarded to Moses verbatim; "
+            "unlike a sample's position this is not required to be a D#X-Y drawer "
+            "address, and the script's default is the bare vial \"1\"."
+        ),
+    )
+    ms_mode: Literal["positive", "negative", "positive_negative"] = "positive_negative"
+
+
 class SampleConfig(BaseModel):
     sample_name: str = Field(
         min_length=1,
@@ -91,6 +127,14 @@ class RunRequest(BaseModel):
     output_dir: str = Field(description="Absolute path on the instrument PC for result files.")
     ms_mode: Literal["positive", "negative", "positive_negative"] = "positive_negative"
     standby_after: bool = True
+    standby_config: StandbyConfig | None = Field(
+        default=None,
+        description=(
+            "Parameters for the trailing low-flow park. None (default) parks on the "
+            "dispatch script's built-in defaults, which is what every run did before "
+            "this field existed. Ignored unless standby_after is true."
+        ),
+    )
     gradient: GradientConfig
     samples: list[SampleConfig] = Field(min_length=1, description="At least one sample required.")
     plate_format: str | None = Field(
@@ -132,6 +176,22 @@ class RunRequest(BaseModel):
             raise ValueError(
                 "script_name is not honored for dispatch='openlab' — the submit "
                 "script is device configuration (MOSES_OPENLAB_SUBMIT_SCRIPT)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _standby_config_needs_standby(self) -> "RunRequest":
+        """A park configuration with the park switched off is a contradiction.
+
+        Same reasoning as ``script_name`` under dispatch='openlab': refusing
+        beats silently ignoring a field the caller clearly meant to take effect
+        — a low-flow park that never ran is exactly the kind of thing nobody
+        notices until the column has sat dry.
+        """
+        if self.standby_config is not None and not self.standby_after:
+            raise ValueError(
+                "standby_config was provided but standby_after is false — the park "
+                "would never run. Set standby_after=true, or drop standby_config."
             )
         return self
 
