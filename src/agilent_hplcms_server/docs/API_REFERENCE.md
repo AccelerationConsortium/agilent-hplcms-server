@@ -90,6 +90,7 @@ the same order, and answer **202**.
 | `output_dir` | str | **required**; absolute path on the instrument PC |
 | `ms_mode` | `positive` \| `negative` \| `positive_negative` | default `positive_negative` |
 | `standby_after` | bool | default `true` |
+| `standby_config` | object \| null | default `null` — the trailing low-flow park runs on the dispatch script's own defaults. Supply to shape it: `{flow_rate (mL/min, 0 < f ≤ 2, default 0.01), run_time (min, 0 < t ≤ 120, default 1.0), fraction_b (0.0–1.0, default 0.5), sample_position (default `"1"`; a bare vial, **not** a `D[1-4][FB]-<well>` address), ms_mode (default `positive_negative`)}`. **Refused (422) together with `standby_after: false`** — the park would never run. Lets one job be "analytical run, then park" instead of two separately-queued jobs. |
 | `gradient` | object | `{name, solvent_a, solvent_b, run_time (min, 0 < t ≤ 120), flow_rate (mL/min, 0 < f ≤ 2), gradient_table: [[time_min, fraction_b]], equilibration_time (0–30 min, default 0)}` |
 | `samples` | list | at least one `{sample_name (alphanumeric/`_`/`-`, ≤64), sample_position (`D[1-4][FB]-<well>`, e.g. `D1B-A1`), injection_volume (µL, 0 < v ≤ 20)}` |
 | `plate_format` | str \| null | asserted against the drawer's configured labware. Canonical: `96-well`, `384-well`, `54-vial`. Null trusts the configured labware (and assumes `96-well` for the built-in check when none is configured). |

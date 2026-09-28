@@ -2322,3 +2322,83 @@ def test_withdrawing_the_ack_restores_the_refusal():
 
     # Withdrawing a second time has nothing left to withdraw.
     assert client.delete("/control/faults/multisampler/ack").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Trailing low-flow park (issue #6)
+#
+# `run_batch` in the Moses dispatch script has always taken a `standby_config`
+# argument; the sidecar never sent one, so every park used the script's own
+# defaults and a job needing a *different* park had to be submitted as a second,
+# separately-queued job. These pin the pass-through, including the property that
+# actually matters at the instrument: the composed job stays a valid
+# `run_batch(**job)` kwargs dict.
+# ---------------------------------------------------------------------------
+
+# Mirrors run_batch()'s signature in examples/agent_agilent.py. A key here that
+# run_batch does not accept is a TypeError at dispatch time, on the instrument.
+_RUN_BATCH_PARAMS = {
+    "instrument_config_path",
+    "gradient",
+    "samples",
+    "output_dir",
+    "ms_mode",
+    "standby_after",
+    "standby_config",
+    "logging_config_path",
+}
+
+
+def _compose(**overrides) -> dict:
+    from agilent_hplcms_server.control.models import RunRequest
+    from agilent_hplcms_server.control.router import _compose_moses_job
+
+    return _compose_moses_job(RunRequest(**{**VALID_RUN_BODY, **overrides}))
+
+
+def test_standby_config_omitted_is_previous_behaviour():
+    """No standby_config → an explicit None, which is run_batch's own default."""
+    job = _compose()
+    assert job["standby_config"] is None
+    assert job["standby_after"] is True
+
+
+def test_standby_config_forwarded_verbatim():
+    job = _compose(standby_config={"flow_rate": 0.05, "run_time": 5.0, "fraction_b": 0.2})
+    assert job["standby_config"] == {
+        "flow_rate": 0.05,
+        "run_time": 5.0,
+        "fraction_b": 0.2,
+        "sample_position": "1",   # script default, not a D#X-Y drawer address
+        "ms_mode": "positive_negative",
+    }
+
+
+@pytest.mark.parametrize("overrides", [{}, {"standby_config": {"flow_rate": 0.05}}])
+def test_composed_job_is_valid_run_batch_kwargs(overrides):
+    """The job is splatted as run_batch(**job); a stray key fails on hardware."""
+    assert set(_compose(**overrides)) <= _RUN_BATCH_PARAMS
+
+
+def test_standby_config_without_standby_after_is_refused():
+    """A park config with the park switched off would silently never run."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="standby_after"):
+        _compose(standby_after=False, standby_config={"flow_rate": 0.05})
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"flow_rate": 0},      # a park at zero flow is not a park
+        {"flow_rate": 99},     # above the pump's 2 mL/min ceiling
+        {"fraction_b": 1.5},   # not a fraction
+        {"run_time": 0},
+    ],
+)
+def test_standby_config_range_checks(bad):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        _compose(standby_config=bad)

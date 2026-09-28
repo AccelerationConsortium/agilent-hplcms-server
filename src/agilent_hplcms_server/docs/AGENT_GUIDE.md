@@ -155,7 +155,10 @@ everything through `GET /control/queue`.
 
 A request is one **sequence**: a shared method (`gradient`, `ms_mode`,
 `output_dir`, `instrument_config_path`, `standby_after`) plus a list of
-`samples`, at least one. Each sample is `{sample_name, sample_position,
+`samples`, at least one. The sequence may end in a low-flow park, and
+`standby_config` shapes it (flow rate, duration, %B, vial) — so "run these
+samples, then park the column" is one job, not a second one you have to
+sequence by hand behind the first. Each sample is `{sample_name, sample_position,
 injection_volume}`, and `sample_position` is the whole autosampler address —
 `D[1-4][F|B]-<well>`, e.g. `"D4B-A1"` — forwarded to the instrument verbatim.
 There are no separate tray/well fields to set. The sidecar parses the drawer and
