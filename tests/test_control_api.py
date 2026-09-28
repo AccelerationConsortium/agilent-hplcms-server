@@ -1953,6 +1953,21 @@ def test_subsystem_fault_refuses_submit_409():
     assert client.post("/control/queue", json=VALID_RUN_BODY).status_code == 409
 
 
+def test_subsystem_fault_refusal_says_who_may_acknowledge():
+    """The refusal is what a blocked caller reads, so it must not send them to
+    an endpoint they cannot use. Acknowledging is service-role only
+    (roster.can_ack_fault); on 2026-09-09 an operator and the agent acting for
+    them were both told to call it, and both would have been refused 403."""
+    signals = {**_load("signals_ready.json"), **_MODULE_FAULT_SIGNALS}
+    client = _authed_client(signals)
+
+    sentence = client.post("/control/run", json=VALID_RUN_BODY).json()["detail"]["detail"]
+
+    assert "POST /control/faults/{module}/ack" in sentence
+    assert "service role" in sentence
+    assert "403" in sentence
+
+
 def test_subsystem_fault_does_not_override_busy():
     """A fault mid-acquisition leaves the top-level `busy` (not `degraded`), but
     still gates enqueue verbs so nothing new launches into faulted hardware."""
