@@ -262,3 +262,15 @@ def test_activity_since_is_span_start_not_poll_time():
     first = client.get("/status").json()["activity_since"]
     second = client.get("/status").json()["activity_since"]
     assert first == second  # unchanged activity does not restart the span
+
+
+def test_leak_detected_is_not_advertised_without_a_producer():
+    """Issue #5 §3: `leak_detected` was plumbed daemon → sensor file → status,
+    but nothing on this setup can populate it (SolventSensingSupported=False;
+    the SignalBuffer client is unimplemented). A field that can never be true
+    tells a reader leaks are watched when they are not — withdrawn until a
+    producer exists."""
+    signals = {**_load("signals_ready.json"), "leak_detected": False}
+    client, _ = _client_with_signals(signals)
+    metrics = client.get("/status").json()["metrics"]
+    assert "leak_detected" not in metrics

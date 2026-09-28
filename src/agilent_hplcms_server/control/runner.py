@@ -147,6 +147,11 @@ class MosesRunner:
         #      job completion — process exit does that.
         self._service_mode: bool = False
         self._olss_run_no_job_streak: int = 0
+        # Inverse detector (issue #5 §2): when OLSS first showed no run while
+        # *this* job (by id) was active. Cleared by a run observation, job
+        # change, or completion; read by stale_active_run().
+        self._olss_idle_since: datetime | None = None
+        self._olss_idle_for: str | None = None
         # Single slot for an in-flight dispatch="openlab" submit subprocess.
         # Independent of _active_id: a handoff never occupies the FIFO slot.
         self._handoff_id: str | None = None
@@ -228,6 +233,7 @@ class MosesRunner:
         olss_state: str | None,
         olss_sw_status: str | None,
         olss_current_run: str | None = None,
+        now: datetime | None = None,
     ) -> None:
         """Update the servicing auto-detect fallback from the latest OLSS poll.
 
@@ -237,9 +243,15 @@ class MosesRunner:
         acquisition sequence is underway — NOT bare ``state=="Busy"``, so data
         analysis / reprocessing does not halt the queue. Job completion is driven
         by process exit in :meth:`poll`, never by OLSS.
+
+        The same observation feeds the inverse detector behind
+        :meth:`stale_active_run`: an active job while OLSS shows no run. A
+        failed OLSS probe (``olss_state`` None) is "not observed", never "idle".
         """
         current_run = (olss_current_run or "").strip().casefold()
         run_active = bool(current_run) and current_run != "no active run"
+        observed = olss_state is not None
+        now = now or datetime.now(timezone.utc)
         with self._lock:
             # Streak counts observations of "a real OLSS run while we hold no
             # active job" — the signature of a technician acquiring directly.
@@ -247,6 +259,36 @@ class MosesRunner:
                 self._olss_run_no_job_streak += 1
             else:
                 self._olss_run_no_job_streak = 0
+            if run_active or self._active_id is None:
+                self._olss_idle_since = None
+                self._olss_idle_for = None
+            elif observed and self._olss_idle_for != self._active_id:
+                self._olss_idle_since = now
+                self._olss_idle_for = self._active_id
+
+    def stale_active_run(
+        self, settings: Settings | None = None, now: datetime | None = None
+    ) -> bool:
+        """True iff the active job has shown no OpenLab acquisition for at
+        least ``stale_run_grace_s`` (issue #5 §2).
+
+        A warning, not a state change: completion is process-exit
+        authoritative (a hung Moses script keeps its job ``running``), so this
+        only tells an operator that the job which *looks* alive has not been
+        acquiring — ``POST /control/abort`` is the exit. Never raised without
+        an active job, on an unreadable OLSS, or for a job other than the one
+        the idle observation was made against.
+        """
+        settings = settings or load_settings()
+        now = now or datetime.now(timezone.utc)
+        with self._lock:
+            if (
+                self._active_id is None
+                or self._olss_idle_since is None
+                or self._olss_idle_for != self._active_id
+            ):
+                return False
+            return (now - self._olss_idle_since).total_seconds() >= settings.stale_run_grace_s
 
     def get_all_jobs(self) -> list[JobEntry]:
         """Snapshot of all tracked jobs sorted by queued_at (pending + active + history)."""

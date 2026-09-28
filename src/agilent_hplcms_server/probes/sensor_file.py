@@ -67,7 +67,6 @@ SENSOR_METRIC_KEYS: frozenset[str] = frozenset(
         "calibrant_ok",
         # Calibration
         "last_calibration_date",
-        "leak_detected",
     ]
 )
 

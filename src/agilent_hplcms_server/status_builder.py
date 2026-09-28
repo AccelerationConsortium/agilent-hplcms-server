@@ -513,6 +513,10 @@ def build_status(
         # servicing state above. The dashboard reads this to render its toggle,
         # and it is the source that refuses an enqueue outright.
         details["service_mode"] = service_mode
+        # Issue #5 §2: the active job looks alive but OpenLab has shown no
+        # acquisition for it — surfaced, never auto-finalised.
+        if runner.stale_active_run(settings):
+            details["stale_active_run"] = True
     if servicing:
         details["servicing"] = True
         if equipment_state == "busy":
@@ -756,8 +760,11 @@ def _build_metrics(signals: dict[str, Any]) -> dict[str, MetricValue]:
     _put("calibrant_ok",                  signals.get("calibrant_ok"))
 
     # --- Calibration & Comms (from sensor daemon JSON file) ---
+    # No `leak_detected` here (issue #5 §3): nothing on this setup produces it
+    # (SolventSensingSupported=False, SignalBuffer client unimplemented), and a
+    # field that can never be true reads as "leaks are watched". A leak the
+    # multisampler firmware trips surfaces as an LC module fault instead.
     _put("last_calibration_date",         signals.get("last_calibration_date"))
-    _put("leak_detected",                 signals.get("leak_detected"))
 
     return m
 

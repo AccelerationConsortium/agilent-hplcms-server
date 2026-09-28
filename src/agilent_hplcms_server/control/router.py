@@ -680,6 +680,7 @@ def get_queue(request: Request) -> QueueStatusResponse:
         accepting_jobs=accepting_jobs,
         dispatch_held_reason=dispatch_held_reason,
         instrument_state=signals.get("olss_instrument_state"),
+        stale_active_run=runner.stale_active_run(settings),
     )
 
 

@@ -285,6 +285,10 @@ class QueueStatusResponse(BaseModel):
     # run we did not queue; jobs are held and start when it ends), or None.
     dispatch_held_reason: Literal["service_mode", "servicing"] | None = None
     instrument_state: str | None = None
+    # The active job has shown no OpenLab acquisition for STALE_RUN_GRACE_S
+    # (issue #5 §2): a hung script keeps it "running" since completion is
+    # process-exit authoritative. A warning for the operator; abort is the exit.
+    stale_active_run: bool = False
 
 
 class CancelResponse(BaseModel):
