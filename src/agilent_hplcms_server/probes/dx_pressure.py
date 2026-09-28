@@ -35,7 +35,7 @@ import os
 import statistics
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from .dx_trace import read_trace
@@ -81,7 +81,9 @@ def _summarize(dx_path: Path) -> RunPressure | None:
     if trace is not None and trace.values:
         summary = RunPressure(
             run=dx_path.parent.name,
-            method=Path(trace.method).stem or "unknown",
+            # The trace stores the method as OpenLab wrote it: a Windows path,
+            # whatever host reads the trace.
+            method=PureWindowsPath(trace.method).stem or "unknown",
             max_bar=round(max(trace.values), 1),
             min_bar=round(min(trace.values), 1),
             mean_bar=round(statistics.mean(trace.values), 1),
