@@ -352,3 +352,12 @@ turns either into something a person actually sees, and is worth doing before Ph
   opaque strings.
 - **`read_module_states` slurps the whole `RCDriver.log`** (up to 10 MB) per poll.
   Pre-existing, and now the only remaining slurp in that module.
+
+## Runbook note: pull the driver log immediately
+
+`RCDriver.log` rotates at 10 MB — about 25 minutes on a busy day — and the
+sidecar keeps no copy. After any fault event, copy `LC Drivers\*RCDriver*.log`
+off the instrument PC before doing anything else; by the time the 2026-09-09
+incident was analysed its logs had rotated out and the sequence of faults
+could no longer be reconstructed (issue #5).
+

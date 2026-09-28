@@ -196,8 +196,11 @@ def _check_subsystem_fault(request: Request, signals: dict) -> None:
                     "LC module(s) reporting a hardware error: "
                     + ", ".join(faulted)
                     + ". Resolve the fault in OpenLab CDS / at the instrument, "
-                    "then resubmit — or acknowledge it via "
-                    "POST /control/faults/{module}/ack once the module is checked."
+                    "then resubmit. A module fixed while the instrument sits idle "
+                    "cannot report its own recovery: once it has been checked, an "
+                    "operator with the service role acknowledges it via "
+                    "POST /control/faults/{module}/ack. Any other caller is "
+                    "refused there (403), so ask a lab admin instead of retrying."
                 ),
                 faulted_modules=faulted,
             ).model_dump(mode="json"),
