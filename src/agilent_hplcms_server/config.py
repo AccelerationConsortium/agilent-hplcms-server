@@ -97,6 +97,13 @@ class Settings:
     # returns to Idle. Fails safe: a transient over-count only briefly halts the
     # queue and self-clears when OLSS goes Idle.
     servicing_debounce_polls: int = _env_int("SERVICING_DEBOUNCE_POLLS", 2)
+    # Stale-active-run detection (issue #5 §2), the inverse of the servicing
+    # detector: the sidecar holds an active job while OLSS has shown no
+    # acquisition for it for this long. A warning flag only — job completion
+    # stays process-exit authoritative. Long enough to cover a job's
+    # pre-acquisition phase (connect, method upload) and the gap before a
+    # trailing standby park; a hung script shows up once it elapses.
+    stale_run_grace_s: int = _env_int("STALE_RUN_GRACE_S", 300)
 
     # Lab user roster → claim role (identity only, NOT authentication; the
     # network ACL / dashboard login is the real access boundary). Comma-separated

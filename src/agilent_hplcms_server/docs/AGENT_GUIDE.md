@@ -203,6 +203,17 @@ queues behind whatever is active, and it is **not** an instrument shutdown —
 powering the UPLC-MS down is a deliberate manual procedure at the instrument.
 There is no `/control/shutdown` on this device.
 
+### A run that looks alive but is not acquiring
+
+Completion is process-exit authoritative, so a Moses script that hangs without
+exiting keeps its job `running` and `active_run_id` set — what pinned the
+instrument on 2026-09-09. `GET /control/queue` (and `/status`
+`details`) carry `stale_active_run: true` once the sidecar has held an active
+job while OpenLab has shown no acquisition for it for `STALE_RUN_GRACE_S`
+(default 300 s). It is a warning, not a state change: check the instrument,
+and `POST /control/abort` is the exit. An unreadable OLSS never counts as idle,
+and the flag never applies to a job other than the one it was observed on.
+
 ### Cancelling
 
 `DELETE /control/queue/{queue_id}` removes a *pending* job (404 if unknown or

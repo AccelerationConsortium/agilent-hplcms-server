@@ -54,7 +54,7 @@ run** (`run_pressure_max_bar`, `_min_bar`, `_mean_bar`, `_baseline_bar`,
 `degasser_active`); consumables (`solvent_{a1,a2,b1,b2}_volume_ml`,
 `_capacity_ml`, `_low`, `wash_solvent_volume_ml`, `waste_volume_ml`,
 `waste_capacity_ml`, `waste_near_capacity`, `calibrant_ok`); and
-`last_calibration_date`, `leak_detected`. There is **no run counter and no
+`last_calibration_date`. There is **no run counter and no
 `cycles_total`**.
 
 `details` (present-when-known): `instrument_label`, `openlab_log_dir`,
@@ -112,7 +112,7 @@ and parked until the instrument frees.
 | method + path | gate | returns | refusals |
 |---|---|---|---|
 | `POST /control/startup` | **none** | **200** `StartupResponse` `{status: ready\|requires_init, message, missing_processes}` | none — a read-only readiness check that never starts OpenLab and never refuses |
-| `GET /control/queue` | **none** | **200** `QueueStatusResponse` `{queue: [QueuedRun], active_run_id, pending_count, max_depth, instrument_online, accepting_jobs, dispatch_held_reason: service_mode\|servicing\|null, instrument_state}` | none |
+| `GET /control/queue` | **none** | **200** `QueueStatusResponse` `{queue: [QueuedRun], active_run_id, pending_count, max_depth, instrument_online, accepting_jobs, dispatch_held_reason: service_mode\|servicing\|null, instrument_state, stale_active_run}` | none |
 | `DELETE /control/queue/{queue_id}` | claim | **200** `{cancelled_id, message}` | 404 (unknown or already finished; plain string `detail`) · 409 (the job is running — use `POST /control/abort`; plain string `detail`) · 423 claim |
 | `POST /control/abort` | claim | **200** `AbortResponse` `{status: aborted\|not_running, message, run_id, queue_cleared}` — kills the active `moses` process **and** clears every pending job | 423 claim |
 | `POST /control/standby` | claim | **202** `StandbyResponse` `{run_id, status: accepted\|queued, message, queue_position?}` — enqueues a low-flow park job; **not** an instrument shutdown | 409 `requires_init` · 409 `instrument_servicing` (**either** source, unlike a run) · 409 `subsystem_fault` · 412 `queue_full` (+`Retry-After`) · 423 claim · 423 `workflow_active` |

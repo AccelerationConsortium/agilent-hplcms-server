@@ -304,7 +304,8 @@ The ack records OpenLab's raw estimate at that moment and **suppresses** that co
 | Key | Reason |
 |---|---|
 | `system_pressure_bar`, `flow_rate_ml_min`, `column_temperature_c` | *Live* values only. OpenLab SignalBuffer (port 9753) is a duplex publish/subscribe WCF service, not REST (GET returns 405). Post-run pressure **is** available — see [Post-run pressure QC](#post-run-pressure-qc). |
-| `calibrant_ok`, `last_calibration_date`, `leak_detected` | No accessible source on this setup |
+| `calibrant_ok`, `last_calibration_date` | No accessible source on this setup |
+| `leak_detected` | Withdrawn (issue #5): no live leak signal exists on this setup (`SolventSensingSupported=False`; the SignalBuffer client is unimplemented), so the key was a documented field that could never be true. A leak the multisampler firmware trips surfaces as an LC module fault (`Leak detected` in RCDriver.log → `lc_faults` / `last_error`). |
 
 ## Per-module LC components
 

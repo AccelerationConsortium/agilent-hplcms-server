@@ -2402,3 +2402,90 @@ def test_standby_config_range_checks(bad):
 
     with pytest.raises(ValidationError):
         _compose(standby_config=bad)
+
+
+# ---------------------------------------------------------------------------
+# Stale active run (issue #5 §2). notify_olss_state reconciled one way only:
+# "a real OLSS run while we hold no job" → servicing. The inverse — we hold an
+# active job while OLSS has shown no run for a long time — was never observed,
+# so a hung acquisition script pinned active_run_id on 2026-09-09 and the only
+# exit was a claim-gated abort. The flag is a warning: process exit stays
+# authoritative, nothing is auto-finalised.
+# ---------------------------------------------------------------------------
+
+def test_stale_active_run_needs_olss_idle_for_the_whole_grace_period():
+    from datetime import datetime, timedelta, timezone
+
+    runner = FakeRunner(busy=True)  # holds active job "test-run-1"
+    s = Settings(stale_run_grace_s=300)
+    t0 = datetime(2026, 9, 9, 23, 0, tzinfo=timezone.utc)
+
+    runner.notify_olss_state("Idle", "OK", None, now=t0)
+    assert runner.stale_active_run(s, now=t0) is False
+    assert runner.stale_active_run(s, now=t0 + timedelta(seconds=299)) is False
+    runner.notify_olss_state("Idle", "OK", None, now=t0 + timedelta(seconds=301))
+    assert runner.stale_active_run(s, now=t0 + timedelta(seconds=301)) is True
+
+    # OLSS showing an acquisition again clears it.
+    runner.notify_olss_state("Run", "OK", "Seq-1", now=t0 + timedelta(seconds=400))
+    assert runner.stale_active_run(s, now=t0 + timedelta(seconds=400)) is False
+
+
+def test_stale_active_run_is_never_raised_without_an_active_job():
+    from datetime import datetime, timedelta, timezone
+
+    runner = FakeRunner()
+    s = Settings(stale_run_grace_s=0)
+    t0 = datetime(2026, 9, 9, 23, 0, tzinfo=timezone.utc)
+    runner.notify_olss_state("Idle", "OK", None, now=t0)
+    assert runner.stale_active_run(s, now=t0 + timedelta(hours=1)) is False
+
+
+def test_stale_active_run_treats_an_unreadable_olss_as_not_observed():
+    """A failed OLSS probe is 'not observed', never 'idle' (agent guide,
+    'When the instrument state itself is unreadable')."""
+    from datetime import datetime, timedelta, timezone
+
+    runner = FakeRunner(busy=True)
+    s = Settings(stale_run_grace_s=1)
+    t0 = datetime(2026, 9, 9, 23, 0, tzinfo=timezone.utc)
+    runner.notify_olss_state(None, None, None, now=t0)
+    assert runner.stale_active_run(s, now=t0 + timedelta(minutes=10)) is False
+
+
+def test_stale_active_run_resets_when_a_new_job_becomes_active():
+    from datetime import datetime, timedelta, timezone
+
+    runner = FakeRunner(busy=True, run_id="old-run")
+    s = Settings(stale_run_grace_s=60)
+    t0 = datetime(2026, 9, 9, 23, 0, tzinfo=timezone.utc)
+    runner.notify_olss_state("Idle", "OK", None, now=t0)
+    assert runner.stale_active_run(s, now=t0 + timedelta(minutes=5)) is True
+
+    # The old job finishes and a new one starts before the next observation:
+    # the new job inherits no staleness.
+    with runner._lock:
+        runner._active_id = "new-run"
+    assert runner.stale_active_run(s, now=t0 + timedelta(minutes=5)) is False
+
+
+def test_queue_endpoint_reports_a_stale_active_run():
+    runner = FakeRunner(busy=True)
+    # OLSS observed idle with no current run while the runner holds an active
+    # job → with a zero grace period, stale on the first observation.
+    idle = {**_load("signals_ready.json"), "olss_instrument_state": "Idle", "olss_current_run": None}
+    client = _client(idle, runner=runner, settings=_settings(stale_run_grace_s=0))
+    body = client.get("/control/queue").json()
+    assert body["active_run_id"] == "test-run-1"
+    assert body["stale_active_run"] is True
+
+    fresh = _client(idle, runner=FakeRunner(), settings=_settings(stale_run_grace_s=0))
+    assert fresh.get("/control/queue").json()["stale_active_run"] is False
+
+
+def test_status_details_flag_a_stale_active_run():
+    runner = FakeRunner(busy=True)
+    idle = {**_load("signals_ready.json"), "olss_instrument_state": "Idle", "olss_current_run": None}
+    client = _client(idle, runner=runner, settings=_settings(stale_run_grace_s=0))
+    details = client.get("/status").json()["details"]
+    assert details["stale_active_run"] is True

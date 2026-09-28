@@ -127,7 +127,6 @@ METRIC_VALUE_TYPES: dict[str, str] = {
     "waste_capacity_ml": "float",
     "calibrant_ok": "bool",
     "last_calibration_date": "str",
-    "leak_detected": "bool",
 }
 
 # ---------------------------------------------------------------------------
