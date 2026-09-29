@@ -1214,18 +1214,26 @@ def _require_fault_ack_role(request: Request) -> str | None:
     return held.owner
 
 
-def _validate_role(role: str) -> str:
-    role = role.lower()
-    if role not in FAULT_ROLES:
+def _validate_module(module: str) -> str:
+    """Validate the *module* path segment (binary_pump, multisampler, ...).
+
+    Named for the module, not ``role``: everywhere else in this file ``role``
+    is the claim role (user | automation | service), and the two appear
+    together in these handlers. A caller reading the schema and passing their
+    claim role here gets a 404 in the middle of a fault, which is the worst
+    possible moment to lose a minute to a name.
+    """
+    module = module.lower()
+    if module not in FAULT_ROLES:
         raise HTTPException(
             status_code=404,
-            detail=f"Unknown LC module {role!r}; expected one of {list(FAULT_ROLES)}.",
+            detail=f"Unknown LC module {module!r}; expected one of {list(FAULT_ROLES)}.",
         )
-    return role
+    return module
 
 
 @router.post(
-    "/faults/{role}/ack",
+    "/faults/{module}/ack",
     response_model=FaultAckResponse,
     summary="Acknowledge an LC module hardware fault after checking the module",
     responses={
@@ -1234,7 +1242,7 @@ def _validate_role(role: str) -> str:
         423: {"model": ClaimRejection},
     },
 )
-def ack_fault(role: str, request: Request, note: str | None = None) -> FaultAckResponse:
+def ack_fault(module: str, request: Request, note: str | None = None) -> FaultAckResponse:
     """Record that an operator has physically checked a faulted LC module.
 
     Clears the fault evidence **that exists right now** — the module's logged
@@ -1248,17 +1256,17 @@ def ack_fault(role: str, request: Request, note: str | None = None) -> FaultAckR
     has not sent a READY since (``STAT?`` is only written at prerun), and
     claiming otherwise would invent a reply the module never made.
 
-    - HTTP 404 if ``role`` is not a known LC module.
+    - HTTP 404 if ``module`` is not a known LC module.
     - HTTP 403 ``role_forbidden`` if the claim owner is an automation account.
     - HTTP 423 if the ``X-Claim-Token`` is missing or stale.
     """
-    role = _validate_role(role)
+    module = _validate_module(module)
     _require_claim(request)
     owner = _require_fault_ack_role(request)
 
     fault_acks = _get_fault_acks(request)
     signals = _read_signals(request)
-    ack = fault_acks.record(role, signals, owner=owner, note=note)
+    ack = fault_acks.record(module, signals, owner=owner, note=note)
 
     # Re-derive from the store rather than trusting the ack blind: a fault newer
     # than the evidence just acknowledged leaves the module faulted, and the
@@ -1266,19 +1274,19 @@ def ack_fault(role: str, request: Request, note: str | None = None) -> FaultAckR
     from ..status_builder import errored_lc_modules
 
     faulted = errored_lc_modules(signals, fault_acks)
-    cleared = role not in faulted
+    cleared = module not in faulted
     if cleared:
         message = (
-            f"{role} fault acknowledged; the module no longer reports an error. "
+            f"{module} fault acknowledged; the module no longer reports an error. "
             "A newer fault from the driver will re-arm it."
         )
     else:
         message = (
-            f"{role} acknowledged, but it is still reporting a fault newer than "
+            f"{module} acknowledged, but it is still reporting a fault newer than "
             "the evidence acknowledged — the module has not recovered."
         )
     return FaultAckResponse(
-        module=role,
+        module=module,
         acked_at=ack["acked_at"],
         faults_through=ack["faults_through"],
         stat_through=ack["stat_through"],
@@ -1289,7 +1297,7 @@ def ack_fault(role: str, request: Request, note: str | None = None) -> FaultAckR
 
 
 @router.delete(
-    "/faults/{role}/ack",
+    "/faults/{module}/ack",
     response_model=FaultAckResponse,
     summary="Withdraw an LC module fault acknowledgment",
     responses={
@@ -1298,26 +1306,26 @@ def ack_fault(role: str, request: Request, note: str | None = None) -> FaultAckR
         423: {"model": ClaimRejection},
     },
 )
-def unack_fault(role: str, request: Request) -> FaultAckResponse:
+def unack_fault(module: str, request: Request) -> FaultAckResponse:
     """Withdraw an acknowledgment, restoring any fault it was suppressing.
 
     For an ack taken in error. The underlying evidence was never deleted — only
     filtered — so whatever is still inside ``LC_FAULT_WINDOW_S`` comes straight
     back.
 
-    - HTTP 404 if ``role`` is not a known LC module, or has no acknowledgment.
+    - HTTP 404 if ``module`` is not a known LC module, or has no acknowledgment.
     - HTTP 403 ``role_forbidden`` if the claim owner is an automation account.
     - HTTP 423 if the ``X-Claim-Token`` is missing or stale.
     """
-    role = _validate_role(role)
+    module = _validate_module(module)
     _require_claim(request)
     _require_fault_ack_role(request)
 
     fault_acks = _get_fault_acks(request)
-    if not fault_acks.clear(role):
+    if not fault_acks.clear(module):
         raise HTTPException(
             status_code=404,
-            detail=f"No fault acknowledgment recorded for {role!r}.",
+            detail=f"No fault acknowledgment recorded for {module!r}.",
         )
 
     from ..status_builder import errored_lc_modules
@@ -1325,12 +1333,12 @@ def unack_fault(role: str, request: Request) -> FaultAckResponse:
     signals = _read_signals(request)
     faulted = errored_lc_modules(signals, fault_acks)
     return FaultAckResponse(
-        module=role,
+        module=module,
         acked_at=datetime.now(timezone.utc),
-        fault_cleared=role not in faulted,
+        fault_cleared=module not in faulted,
         faulted_modules=faulted,
         message=(
-            f"{role} fault acknowledgment withdrawn; any fault still inside the "
+            f"{module} fault acknowledgment withdrawn; any fault still inside the "
             "detection window applies again."
         ),
     )
