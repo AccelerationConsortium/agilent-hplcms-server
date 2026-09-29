@@ -197,10 +197,10 @@ def _check_subsystem_fault(request: Request, signals: dict) -> None:
                     + ", ".join(faulted)
                     + ". Resolve the fault in OpenLab CDS / at the instrument, "
                     "then resubmit. A module fixed while the instrument sits idle "
-                    "cannot report its own recovery: once it has been checked, an "
-                    "operator with the service role acknowledges it via "
-                    "POST /control/faults/{module}/ack. Any other caller is "
-                    "refused there (403), so ask a lab admin instead of retrying."
+                    "cannot report its own recovery: once it has been physically "
+                    "checked, the operator holding the instrument acknowledges it "
+                    "via POST /control/faults/{module}/ack. An automation account "
+                    "is refused there (403)."
                 ),
                 faulted_modules=faulted,
             ).model_dump(mode="json"),
@@ -1202,12 +1202,13 @@ def _require_fault_ack_role(request: Request) -> str | None:
             status_code=403,
             detail=RoleForbiddenError(
                 detail=(
-                    "Acknowledging an LC module fault requires a service-role "
-                    "account."
+                    "Acknowledging an LC module fault says that a person has "
+                    "checked the module. It takes a user or service account; an "
+                    "automation account cannot make it."
                 ),
                 owner=held.owner if held else None,
                 role=held.role if held else None,
-                required_role="service",
+                required_role="user",
             ).model_dump(mode="json"),
         )
     return held.owner
@@ -1248,7 +1249,7 @@ def ack_fault(role: str, request: Request, note: str | None = None) -> FaultAckR
     claiming otherwise would invent a reply the module never made.
 
     - HTTP 404 if ``role`` is not a known LC module.
-    - HTTP 403 ``role_forbidden`` unless the claim owner is a service account.
+    - HTTP 403 ``role_forbidden`` if the claim owner is an automation account.
     - HTTP 423 if the ``X-Claim-Token`` is missing or stale.
     """
     role = _validate_role(role)
@@ -1305,7 +1306,7 @@ def unack_fault(role: str, request: Request) -> FaultAckResponse:
     back.
 
     - HTTP 404 if ``role`` is not a known LC module, or has no acknowledgment.
-    - HTTP 403 ``role_forbidden`` unless the claim owner is a service account.
+    - HTTP 403 ``role_forbidden`` if the claim owner is an automation account.
     - HTTP 423 if the ``X-Claim-Token`` is missing or stale.
     """
     role = _validate_role(role)

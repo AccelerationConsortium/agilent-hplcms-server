@@ -145,10 +145,12 @@ lc_fault_module_roles  list[str]
 ### Manual acknowledgment (`control/fault_acks.py`)
 
 `POST /control/faults/{module}/ack` records that an operator has physically
-checked a faulted module; `DELETE` withdraws it. Service-role gated — it asserts
-something about the hardware and releases the `subsystem_fault` interlock, which
-is the service toggle's kind of authority rather than the consumable
-acknowledgments' (refilling a bottle cannot crash a needle into a vial).
+checked a faulted module; `DELETE` withdraws it. It asserts something about the
+hardware and releases the `subsystem_fault` interlock, so it is for a person: a
+`user` or `service` account holding the claim. It was service-only at first; an
+operator who had fixed a module at the instrument then waited for an admin to
+clear it (issue #10). An `automation` account is refused: it can refill a
+bottle's counter, but it cannot look at a needle.
 
 Shaped after `control/consumables.py`, for the same reason that module exists: a
 warning the device cannot clear on its own, and can only *read* evidence about,
