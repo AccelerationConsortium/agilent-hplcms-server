@@ -59,8 +59,8 @@ Mutating endpoints (marked 🔒) require a valid `X-Claim-Token` header — acqu
 | 🔒 `POST /control/workflow/end` | Release the workflow lock (the claim is retained). Idempotent. |
 | 🔒 `POST /control/service/start` | Enable service mode — halt the queue and refuse submissions while a technician uses OpenLab CDS. Persistent until cleared. **Admin (service) account only** (else 403). |
 | 🔒 `POST /control/service/end` | Clear service mode and resume the queue. Idempotent. Admin-only. |
-| 🔒 `POST /control/faults/{module}/ack` | Acknowledge an LC module hardware fault after physically checking the module (`binary_pump` / `dad_detector` / `column_thermostat` / `multisampler`). Clears the fault evidence that exists *now*, so `/status` leaves `error` and `run.submit` is accepted again; a newer fault re-arms it. Optional `?note=`. 404 for an unknown module. **Admin (service) account only** (else 403). |
-| 🔒 `DELETE /control/faults/{module}/ack` | Withdraw an acknowledgment, restoring any fault still inside the detection window. 404 if none is recorded. Admin-only. |
+| 🔒 `POST /control/faults/{module}/ack` | Acknowledge an LC module hardware fault after physically checking the module (`binary_pump` / `dad_detector` / `column_thermostat` / `multisampler`). Clears the fault evidence that exists *now*, so `/status` leaves `error` and `run.submit` is accepted again; a newer fault re-arms it. Optional `?note=`. 404 for an unknown module. **A `user` or `service` account** (an `automation` account gets 403). |
+| 🔒 `DELETE /control/faults/{module}/ack` | Withdraw an acknowledgment, restoring any fault still inside the detection window. 404 if none is recorded. Same accounts as the acknowledgment. |
 | 🔒 `POST /control/consumables/waste/reset` | Acknowledge the waste bottle was physically emptied. Suppresses `waste_near_capacity` / `empty_waste_bottle` until OpenLab's (read-only, accumulating) estimate shows it is due again. Any claim holder. |
 | 🔒 `POST /control/consumables/solvent/{slot}/reset` | Acknowledge a solvent bottle (`a1`/`a2`/`b1`/`b2`) was refilled. Suppresses that slot's `solvent_<slot>_low` / `refill_solvent_<slot>` until the estimate depletes again. 404 for an unknown slot. |
 
@@ -215,11 +215,11 @@ Policy decisions, deliberate and reader-visible:
 
 Mutating `/control/*` calls require a valid `X-Claim-Token` (hard enforcement, `423` otherwise). A claim records its `owner`, and the device resolves the owner to a lab **role** from a configured roster (identity attribution, *not* authentication — the network ACL / dashboard login is the real access boundary). Capabilities by role:
 
-| group (env) | role | `run.submit` | `workflow.start/end` | `service.start/end` |
-|---|---|:--:|:--:|:--:|
-| `HPLCMS_USERS` | `user` | ✓ | | |
-| `HTE_USERS` | `automation` | ✓ | ✓ | |
-| `HPLCMS_ADMINS` | `service` | ✓ | | ✓ |
+| group (env) | role | `run.submit` | `workflow.start/end` | `service.start/end` | fault acknowledgment |
+|---|---|:--:|:--:|:--:|:--:|
+| `HPLCMS_USERS` | `user` | ✓ | | | ✓ |
+| `HTE_USERS` | `automation` | ✓ | ✓ | | |
+| `HPLCMS_ADMINS` | `service` | ✓ | | ✓ | ✓ |
 
 An unknown owner is refused `403 user_not_recognized`; an under-privileged owner calling a gated action gets `403 role_forbidden`. The roster is **always enforced**: when every list is empty the built-in defaults (`Hplcms-User` / `HTE-User` / `Service-Account`) apply, so a fresh install always has a service account and never bricks. A literal `"*"` in a list matches any owner — an explicit open mode for dev, distinct from an accidental empty config. `HPLCMS_ADMINS` is seeded with the single `Service-Account` the dashboard claims under to toggle service mode; broadening it later is just adding names.
 

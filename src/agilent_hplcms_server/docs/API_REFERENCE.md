@@ -157,15 +157,15 @@ Suppression lasts until OpenLab's raw estimate moves
 acknowledgment. `warning_suppressed: false` in the response means the estimate
 already shows the condition is due again.
 
-## LC module fault acknowledgments (`service` role)
+## LC module fault acknowledgments (`user` or `service` role)
 
 `{role}` is one of `binary_pump`, `dad_detector`, `column_thermostat`,
 `multisampler`.
 
 | method + path | gate | returns | refusals |
 |---|---|---|---|
-| `POST /control/faults/{role}/ack` | claim + `service` role | **200** `FaultAckResponse` `{module, acked_at, faults_through, stat_through, fault_cleared, faulted_modules, message}`. Optional query parameter `note`. | 404 unknown module (checked **before** the claim; plain string `detail`) · 403 `role_forbidden` · 423 claim |
-| `DELETE /control/faults/{role}/ack` | claim + `service` role | **200** `FaultAckResponse` — withdraws the acknowledgment; any fault still inside `LC_FAULT_WINDOW_S` applies again | 404 unknown module, or no acknowledgment recorded · 403 `role_forbidden` · 423 claim |
+| `POST /control/faults/{role}/ack` | claim + `user` or `service` role | **200** `FaultAckResponse` `{module, acked_at, faults_through, stat_through, fault_cleared, faulted_modules, message}`. Optional query parameter `note`. | 404 unknown module (checked **before** the claim; plain string `detail`) · 403 `role_forbidden` · 423 claim |
+| `DELETE /control/faults/{role}/ack` | claim + `user` or `service` role | **200** `FaultAckResponse` — withdraws the acknowledgment; any fault still inside `LC_FAULT_WINDOW_S` applies again | 404 unknown module, or no acknowledgment recorded · 403 `role_forbidden` · 423 claim |
 
 `fault_cleared: false` on a successful ack means a *newer* fault is already
 outstanding — the module has not recovered, and `run.submit` stays refused.

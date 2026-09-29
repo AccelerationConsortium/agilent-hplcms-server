@@ -1955,17 +1955,18 @@ def test_subsystem_fault_refuses_submit_409():
 
 def test_subsystem_fault_refusal_says_who_may_acknowledge():
     """The refusal is what a blocked caller reads, so it must not send them to
-    an endpoint they cannot use. Acknowledging is service-role only
-    (roster.can_ack_fault); on 2026-09-09 an operator and the agent acting for
-    them were both told to call it, and both would have been refused 403."""
+    an endpoint they cannot use. Acknowledging is for a person at the
+    instrument (roster.can_ack_fault): a user or service account holding the
+    claim, never an automation one."""
     signals = {**_load("signals_ready.json"), **_MODULE_FAULT_SIGNALS}
     client = _authed_client(signals)
 
     sentence = client.post("/control/run", json=VALID_RUN_BODY).json()["detail"]["detail"]
 
     assert "POST /control/faults/{module}/ack" in sentence
-    assert "service role" in sentence
-    assert "403" in sentence
+    assert "operator holding the instrument" in sentence
+    # The one caller that is still refused is told so.
+    assert "automation" in sentence and "403" in sentence
 
 
 def test_subsystem_fault_does_not_override_busy():
@@ -2270,14 +2271,40 @@ def test_fault_ack_requires_a_claim():
     assert client.post("/control/faults/multisampler/ack").status_code == 423
 
 
-def test_fault_ack_requires_the_service_role():
-    """An hte account may submit runs and refill bottles, but not vouch for
-    hardware: clearing this interlock is the service account's call."""
+def test_fault_ack_is_refused_to_an_automation_account():
+    """Acknowledging says "a person looked at the module". An automation
+    account may submit runs and refill bottles, but it cannot look."""
     client = _authed_client(_faulted_signals())  # default roster → automation
 
-    r = client.post("/control/faults/multisampler/ack")
-    assert r.status_code == 403
-    assert r.json()["detail"]["required_role"] == "service"
+    for verb in (client.post, client.delete):
+        r = verb("/control/faults/multisampler/ack")
+        assert r.status_code == 403
+        detail = r.json()["detail"]
+        assert detail["role"] == "automation"
+        assert detail["required_role"] == "user"
+        assert "automation" in detail["detail"]
+
+
+def test_the_operator_holding_the_instrument_may_acknowledge():
+    """Issue #10: the person at the instrument is the one who can see the
+    needle. They no longer wait for an admin to clear what they have fixed."""
+    client = _authed_client(
+        _faulted_signals(),
+        runner=FakeRunner(busy=False),
+        owner="Hplcms-User",
+        # Only the user list: the default roster would make every owner an
+        # automation account.
+        settings=_settings(hplcms_users="Hplcms-User", hte_users="", hplcms_admins=""),
+    )
+    assert client.post("/control/run", json=VALID_RUN_BODY).status_code == 409
+
+    r = client.post("/control/faults/multisampler/ack", params={"note": "needle checked"})
+
+    assert r.status_code == 200
+    assert r.json()["fault_cleared"] is True
+    assert "multisampler" in client.get("/status").json()["details"]["fault_acks"]
+    # And an acknowledgment taken in error can be withdrawn by the same person.
+    assert client.delete("/control/faults/multisampler/ack").status_code == 200
 
 
 def test_fault_ack_unknown_module_is_404():

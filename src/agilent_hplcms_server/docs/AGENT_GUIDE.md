@@ -121,9 +121,9 @@ boundary is the Tailscale ACL. Three roles, configured as comma-separated lists:
 
 | role | env list | may |
 |---|---|---|
-| `user` | `HPLCMS_USERS` | submit runs, cancel, abort, standby, acknowledge consumables |
-| `automation` | `HTE_USERS` | the above **plus** `workflow.start` / `workflow.end` |
-| `service` | `HPLCMS_ADMINS` | the above **plus** the service-mode toggle and LC fault acknowledgments |
+| `user` | `HPLCMS_USERS` | submit runs, cancel, abort, standby, acknowledge consumables and LC module faults |
+| `automation` | `HTE_USERS` | submit runs, cancel, abort, standby, acknowledge consumables, **plus** `workflow.start` / `workflow.end`. Not LC fault acknowledgments |
+| `service` | `HPLCMS_ADMINS` | everything a `user` may, **plus** the service-mode toggle |
 
 Higher privilege wins if an owner appears in several lists. When *every* list is
 empty the built-in defaults apply (`hplcms-user`, `hte-user`,
@@ -299,7 +299,8 @@ only observable recovery — the module's own `STAT?` going READY — is written
 at prerun. A module fixed while the instrument sits idle has no way to say so,
 and the fault would otherwise hold for the whole `LC_FAULT_WINDOW_S` (default
 one hour) with submissions refused behind it. `POST /control/faults/{role}/ack`
-is the exit: a `service`-role operator who has physically checked the module
+is the exit: the operator holding the instrument (a `user` or `service`
+account, never an `automation` one), having physically checked the module,
 clears the evidence that exists *right now*. Anything the driver logs afterwards
 re-arms the fault in full, so the acknowledgment needs no expiry and cannot mask
 the next failure. An acknowledged module is reported `not_ready`, not `ready` —
@@ -320,7 +321,8 @@ the raw estimate moves `CONSUMABLE_REARM_DELTA_ML` (default 200 mL) past the
 level at acknowledgment. Acknowledgments are persisted, so a service restart
 does not resurrect the warning, and an active suppression is visible as
 `details.waste_reset_at` / `details.solvent_<slot>_reset_at`. Any valid claim
-holder may do this — it is a routine operator action, unlike a fault ack.
+holder may do this, an automation account included — unlike a fault ack,
+which asserts that a person looked at the module.
 
 ## Preconditions and `allowed_actions` (STATUS_SPEC §6)
 
