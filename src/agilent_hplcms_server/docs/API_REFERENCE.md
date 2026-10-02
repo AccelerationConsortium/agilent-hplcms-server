@@ -66,7 +66,8 @@ run** (`run_pressure_max_bar`, `_min_bar`, `_mean_bar`, `_baseline_bar`,
 `waste_near_capacity`, `solvent_<slot>_low`, `waste_reset_at`,
 `solvent_<slot>_reset_at`, `claimed_by` (always present; `null` when
 unclaimed), `service_mode`, `servicing`, `workflow_active`,
-`subsystem_fault_modules`.
+`subsystem_fault_modules`, `stale_active_run` (only when `true`: the active
+job has shown no OpenLab acquisition for `STALE_RUN_GRACE_S`).
 
 ## Claim protocol (no `X-Claim-Token` gate — these establish it)
 
