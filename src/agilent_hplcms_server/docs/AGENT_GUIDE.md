@@ -298,7 +298,7 @@ The awkward part: Agilent's driver never logs a *fault-cleared* line, and the
 only observable recovery — the module's own `STAT?` going READY — is written
 at prerun. A module fixed while the instrument sits idle has no way to say so,
 and the fault would otherwise hold for the whole `LC_FAULT_WINDOW_S` (default
-one hour) with submissions refused behind it. `POST /control/faults/{role}/ack`
+one hour) with submissions refused behind it. `POST /control/faults/{module}/ack`
 is the exit: the operator holding the instrument (a `user` or `service`
 account, never an `automation` one), having physically checked the module,
 clears the evidence that exists *right now*. Anything the driver logs afterwards

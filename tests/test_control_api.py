@@ -2199,7 +2199,7 @@ def test_consumable_reset_requires_claim():
 
 
 # ---------------------------------------------------------------------------
-# LC module fault acknowledgments (POST/DELETE /control/faults/{role}/ack).
+# LC module fault acknowledgments (POST/DELETE /control/faults/{module}/ack).
 #
 # The exit the fault channel was missing. Agilent's driver never logs a
 # fault-cleared line and a module's STAT? — the one recovery signal the probe can
@@ -2531,3 +2531,25 @@ def test_status_details_flag_a_stale_active_run():
     client = _client(idle, runner=runner, settings=_settings(stale_run_grace_s=0))
     details = client.get("/status").json()["details"]
     assert details["stale_active_run"] is True
+
+
+def test_fault_ack_path_parameter_is_named_module():
+    """The path segment is the MODULE, and the schema must say so.
+
+    `role` in this API otherwise means the claim role (user | automation |
+    service), and both appear in these handlers. When the parameter was called
+    `role`, the served schema invited a caller mid-fault to pass their claim
+    role and take a 404 — while README and the 409 refusal both already said
+    `{module}`. Pin the name so it cannot drift back.
+    """
+    schema = _client(_load("signals_ready.json")).get("/openapi.json").json()
+    assert "/control/faults/{module}/ack" in schema["paths"]
+    assert "/control/faults/{role}/ack" not in schema["paths"]
+
+    for method in ("post", "delete"):
+        names = [
+            p["name"]
+            for p in schema["paths"]["/control/faults/{module}/ack"][method]["parameters"]
+            if p["in"] == "path"
+        ]
+        assert names == ["module"], f"{method}: {names}"
