@@ -1,0 +1,161 @@
+{
+  "status": "DRAFT: unmeasured features are estimates",
+  "units": "mm",
+  "revision": 21,
+  "opening_mm": [
+    80.2,
+    40.15
+  ],
+  "rear_slot_outlines_only": false,
+  "rear_slots_cut": 4,
+  "rear_slot_shoulder_height_center_height_center_width_depth_mm": [
+    17.0,
+    20.0,
+    4.2,
+    6.8
+  ],
+  "rear_slot_removed_volume_mm3": 5178.05398939169,
+  "base_end_slots": {
+    "width_x_mm": 10.0,
+    "length_y_mm": 3.0,
+    "rear_edge_offset_mm": 3.0,
+    "ear_side_body_edge_offset_mm": 4.25,
+    "derived_x_range_mm": [
+      4.25,
+      14.25
+    ],
+    "derived_y_range_mm": [
+      91.4,
+      94.4
+    ],
+    "status": "Confirmed as end slots, not A/C. Both modeled as through openings; opposite slot mirrored provisionally.",
+    "x_ranges_mm": [
+      [
+        4.25,
+        14.25
+      ],
+      [
+        117.55,
+        127.55
+      ]
+    ],
+    "opposite_slot_symmetry_assumed": true
+  },
+  "total_removed_volume_mm3": 6715.673438410925,
+  "magnet_pocket": {
+    "diameter_mm": 10.0,
+    "pocket_depth_mm": 3.0,
+    "opening_face": "underside",
+    "location_intent": "Aligned with B: centered across body, measured6 mm from rear outer face.",
+    "center_x_mm": 65.9,
+    "center_x_status": "Centered across body at B",
+    "center_rear_offset_mm": 6.0,
+    "status": "Modeled blind pocket with local supporting boss",
+    "center_y_mm": 91.4,
+    "support_boss_diameter_mm": 12.0,
+    "retained_floor_mm": 1.5,
+    "support_boss_design_note": "Local boss added where pocket extends forward of rear ledge; nominal radial wall1 mm, floor1.5 mm. No fit clearance added."
+  },
+  "magnet_floor_verified": true,
+  "magnet_boss_added_volume_mm3": 66.33196372490784,
+  "rear_slot_mouth_widths_mm": [
+    12.2,
+    11.3,
+    11.3,
+    12.2
+  ],
+  "rear_slot_inner_bottom_widths_mm": [
+    8.3,
+    7.3,
+    7.3,
+    8.3
+  ],
+  "rear_slot_inward_taper_verified": true,
+  "rear_slot_outer_lip_thickness_mm": 2.0,
+  "rear_slot_inner_height_mm": 20.0,
+  "rear_slot_lip_and_inner_clearance_verified": true,
+  "rear_tab_bevel_angle_in_plan_to_x_deg": 60.0,
+  "rear_tab_bevel_direction": "left-right; no vertical bevel",
+  "rear_tab_bevel_lateral_run_each_side_mm": 1.154700538379252,
+  "rear_tab_central_gap_outer_inner_mm": [
+    4.2,
+    6.509401076758504
+  ],
+  "rear_tab_bevel_faces_verified": 8,
+  "rear_slot_void_shoulders_and_inner_floor_verified": true,
+  "rear_slot_x_ranges_mm": [
+    [
+      16.6,
+      28.8
+    ],
+    [
+      47.0,
+      58.3
+    ],
+    [
+      73.5,
+      84.8
+    ],
+    [
+      103.0,
+      115.2
+    ]
+  ],
+  "body_width_excluding_wing_mm": 131.8,
+  "left_wing_extension_root_length_thickness_mm": [
+    5.0,
+    25.35,
+    2.0
+  ],
+  "left_wing_z_range_mm": [
+    22.85,
+    48.2
+  ],
+  "left_wing_lower_edge_aligned_to_ramp": false,
+  "left_slope_angle_deg_verified": 45.0,
+  "left_slope_visible_endpoint_y_z_mm": [
+    93.10000000000001,
+    33.60000000000001
+  ],
+  "left_wing_y_range_mm": [
+    93.10000000000001,
+    95.10000000000001
+  ],
+  "left_wing_forward_shift_mm": 2.3,
+  "left_wing_return_thickness_mm": 2.0,
+  "left_wing_top_below_rear_top_mm": 0.0,
+  "side_wall_thickness_mm": 2.0,
+  "front_wall_thickness_mm": 2.0,
+  "side_ramp_start_from_front_mm": 65.0,
+  "right_flat_length_mm": 10.0,
+  "right_flat_height_mm": 19.6,
+  "right_flat_start_from_front_mm": 80.0,
+  "right_vertical_rise_mm": 10.0,
+  "right_step_top_height_mm": 29.6,
+  "measured_right_rear_height_mm": 34.3,
+  "right_ramp_endpoint_y_mm": 93.10000000000001,
+  "right_return_front_offset_from_rear_mm": 4.299999999999997,
+  "right_return_wall_thickness_mm": 2.0,
+  "rear_ledge_height_mm": 21.7,
+  "rear_ledge_depth_mm": 7.0,
+  "assumed_side_ramp_end_from_front_mm": 95.4,
+  "rear_wall_thickness_mm": 2.0,
+  "front_rim_total_height_mm": 5.5,
+  "left_side_max_total_height_mm": 35.900000000000006,
+  "opening_to_rear_inner_face_mm": 30.750000000000007,
+  "margins_left_right_front_rear_mm": [
+    25.8,
+    25.80000000000001,
+    24.5,
+    32.75000000000001
+  ],
+  "bounding_box": [
+    136.8,
+    97.4,
+    48.2
+  ],
+  "valid_solid": true,
+  "solid_count": 1,
+  "step_roundtrip_valid": true,
+  "volume_mm3": 42805.02396939237
+}

@@ -1,0 +1,37 @@
+{
+  "status": "DRAFT: unmeasured features are estimates",
+  "units": "mm",
+  "revision": 6,
+  "opening_mm": [
+    80.2,
+    40.15
+  ],
+  "side_wall_thickness_mm": 2.0,
+  "front_wall_thickness_mm": 2.0,
+  "side_ramp_start_from_front_mm": 65.0,
+  "right_flat_length_mm": 10.0,
+  "right_flat_height_mm": 19.6,
+  "right_flat_start_from_front_mm": 78.4,
+  "assumed_side_ramp_end_from_front_mm": 88.4,
+  "rear_wall_thickness_mm": 9.0,
+  "front_rim_total_height_mm": 5.5,
+  "side_max_total_height_mm": 21.75,
+  "opening_to_rear_inner_face_mm": 23.750000000000007,
+  "margins_left_right_front_rear_mm": [
+    25.8,
+    26.0,
+    24.5,
+    32.75000000000001
+  ],
+  "bounding_box": [
+    132.0,
+    97.4,
+    48.2
+  ],
+  "valid_solid": true,
+  "solid_count": 1,
+  "step_roundtrip_valid": true,
+  "volume_mm3": 73229.49544407848,
+  "geometry_matches_latest_user_description": false,
+  "pending_correction": "Rear wall is a plate plus lower step, not uniform 9 mm; right notch has 10 mm vertical rise followed by resumed ramp. Rebuild pending section dimensions."
+}

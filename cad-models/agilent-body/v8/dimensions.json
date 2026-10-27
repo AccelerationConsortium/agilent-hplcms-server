@@ -1,0 +1,59 @@
+{
+  "units": "mm",
+  "measured": {
+    "width": 132.0,
+    "depth": 97.4,
+    "height": 48.2,
+    "base_thickness": 1.5,
+    "opening_width": 80.2,
+    "opening_depth": 40.15,
+    "opening_left": 25.8,
+    "opening_front": 24.5,
+    "opening_right": 26.0,
+    "opening_rear": 32.75,
+    "rear_wall_thickness": 2.0,
+    "rim_height": 5.5,
+    "side_wall_thickness": 2.0,
+    "front_wall_thickness": 2.0,
+    "side_ramp_start_from_front": 65.0,
+    "right_flat_length": 10.0,
+    "right_flat_height": 19.6,
+    "rear_overall_depth": 9.0,
+    "rear_ledge_height": 21.7,
+    "right_flat_start": 80.0,
+    "right_vertical_rise": 10.0,
+    "left_side_rear_height": 21.75,
+    "left_wing_extension": 5.0,
+    "left_wing_root_length": 25.35,
+    "left_wing_thickness": 2.0
+  },
+  "estimated": {
+    "opening_radius": 2.0,
+    "right_rear_height": 34.676,
+    "left_wing_top_offset": 0.0
+  },
+  "revision": 8,
+  "shape_notes": {
+    "left_side": "Direct ramp from Y=65,Z=5.5 to rear plate inner face at Z=21.75; earlier 21.75 measurement currently assigned to left side only.",
+    "right_side": "Ramp to Y=80,Z=19.6; flat to Y=90; vertical rise 10 to Z=29.6; final upward ramp joins rear plate.",
+    "right_final_ramp": "Endpoint height is estimated by continuing initial right-ramp slope; requires measurement.",
+    "right_horizontal_length": "Earlier 10 mm interpreted as horizontal length; subsequent 10 mm confirmed as vertical rise.",
+    "rear_ledge": "Plate 2 mm plus ledge 7 mm equals overall 9 mm; ledge height 21.70 measured. Assumed inward-facing, solid, spanning between sidewalls (X=2 to130). Ledge end treatment unmeasured.",
+    "export_status": "v8 draft includes measured left wing dimensions with provisional attachment placement. Other existing provisional geometry retained."
+  },
+  "features": {
+    "left_wing": {
+      "description": "User identifies outward-projecting white wing at left rear corner; visible in two new photos.",
+      "reference_images": [
+        "/tmp/codex-remote-attachments/01a13177-226a-7171-a509-681a47bb181a/D227E3C1-DBD6-4EA7-9BF8-B4ACB7DAF986/1-Photo-1.jpg",
+        "/tmp/codex-remote-attachments/01a13177-226a-7171-a509-681a47bb181a/D227E3C1-DBD6-4EA7-9BF8-B4ACB7DAF986/2-Photo-2.jpg"
+      ],
+      "outward_extension_mm": 5.0,
+      "length_along_root_mm": 25.35,
+      "thickness_mm": 2.0,
+      "placement": "Provisional: coplanar with rear plate (XZ plane), rear faces flush; root along Z, top flush with rear-plate top. Top offset is editable.",
+      "width_interpretation": "Confirmed: 132 mm body excludes wing; overall width 137 mm.",
+      "status": "Included in v8; placement to verify."
+    }
+  }
+}

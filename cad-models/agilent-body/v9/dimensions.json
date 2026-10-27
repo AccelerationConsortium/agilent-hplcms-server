@@ -1,0 +1,84 @@
+{
+  "units": "mm",
+  "measured": {
+    "width": 132.0,
+    "depth": 97.4,
+    "height": 48.2,
+    "base_thickness": 1.5,
+    "opening_width": 80.2,
+    "opening_depth": 40.15,
+    "opening_left": 25.8,
+    "opening_front": 24.5,
+    "opening_right": 26.0,
+    "opening_rear": 32.75,
+    "rear_wall_thickness": 2.0,
+    "rim_height": 5.5,
+    "side_wall_thickness": 2.0,
+    "front_wall_thickness": 2.0,
+    "side_ramp_start_from_front": 65.0,
+    "right_flat_length": 10.0,
+    "right_flat_height": 19.6,
+    "rear_overall_depth": 9.0,
+    "rear_ledge_height": 21.7,
+    "right_flat_start": 80.0,
+    "right_vertical_rise": 10.0,
+    "left_side_rear_height": 21.75,
+    "left_wing_extension": 5.0,
+    "left_wing_root_length": 25.35,
+    "left_wing_thickness": 2.0
+  },
+  "estimated": {
+    "opening_radius": 2.0,
+    "right_rear_height": 34.676
+  },
+  "revision": 9,
+  "shape_notes": {
+    "left_side": "Direct ramp from Y=65,Z=5.5 to rear plate inner face at Z=21.75; earlier 21.75 measurement currently assigned to left side only.",
+    "right_side": "Ramp to Y=80,Z=19.6; flat to Y=90; vertical rise 10 to Z=29.6; final upward ramp joins rear plate.",
+    "right_final_ramp": "Endpoint height is estimated by continuing initial right-ramp slope; requires measurement.",
+    "right_horizontal_length": "Earlier 10 mm interpreted as horizontal length; subsequent 10 mm confirmed as vertical rise.",
+    "rear_ledge": "Plate 2 mm plus ledge 7 mm equals overall 9 mm; ledge height 21.70 measured. Assumed inward-facing, solid, spanning between sidewalls (X=2 to130). Ledge end treatment unmeasured.",
+    "export_status": "v9 aligns lower edge of left wing to left ramp upper endpoint; other provisional features retained."
+  },
+  "features": {
+    "left_wing": {
+      "description": "User identifies outward-projecting white wing at left rear corner; visible in two new photos.",
+      "reference_images": [
+        "/tmp/codex-remote-attachments/01a13177-226a-7171-a509-681a47bb181a/D227E3C1-DBD6-4EA7-9BF8-B4ACB7DAF986/1-Photo-1.jpg",
+        "/tmp/codex-remote-attachments/01a13177-226a-7171-a509-681a47bb181a/D227E3C1-DBD6-4EA7-9BF8-B4ACB7DAF986/2-Photo-2.jpg"
+      ],
+      "outward_extension_mm": 5.0,
+      "length_along_root_mm": 25.35,
+      "thickness_mm": 2.0,
+      "placement": "User alignment interpreted as wing lower inner edge meeting left ramp upper endpoint. Wing bottom Z equals measured left ramp height 21.75; top Z=47.10 from measured root length25.35. Rear plate coplanarity retained.",
+      "width_interpretation": "Confirmed: 132 mm body excludes wing; overall width 137 mm.",
+      "status": "Included in v9 with alignment constraint; interpretation of inner edge explicit."
+    }
+  },
+  "constraints": {
+    "left_wing_bottom_aligned_to_left_ramp_top": true
+  },
+  "pending_features": {
+    "rear_and_underside": {
+      "status": "Photo evidence recorded; geometry not yet added.",
+      "observed": [
+        "Four large rear-edge recesses/openings",
+        "Underside rectangular apertures",
+        "Local corner cutouts and circular molded marks"
+      ],
+      "measurement_status": "Widths, positions, heights and recess depths unmeasured; circular marks not assumed to be holes.",
+      "reference_images": [
+        "reference-rear.jpg",
+        "reference-bottom.jpg"
+      ]
+    },
+    "rear_slot_1": {
+      "width": 12.0,
+      "height": 17.0,
+      "left_offset": 16.6,
+      "depth": null,
+      "bottom_z_assumed": 0.0,
+      "status": "Measured outline only, not cut into v9; depth and repeat pattern pending."
+    }
+  }
+}

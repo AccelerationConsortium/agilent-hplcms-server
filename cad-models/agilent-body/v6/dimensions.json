@@ -1,0 +1,46 @@
+{
+  "units": "mm",
+  "measured": {
+    "width": 132.0,
+    "depth": 97.4,
+    "height": 48.2,
+    "base_thickness": 1.5,
+    "opening_width": 80.2,
+    "opening_depth": 40.15,
+    "opening_left": 25.8,
+    "opening_front": 24.5,
+    "opening_right": 26.0,
+    "opening_rear": 32.75,
+    "rear_wall_thickness": 9.0,
+    "rim_height": 5.5,
+    "side_rear_height": 21.75,
+    "side_wall_thickness": 2.0,
+    "front_wall_thickness": 2.0,
+    "side_ramp_start_from_front": 65.0,
+    "right_flat_length": 10.0,
+    "right_flat_height": 19.6
+  },
+  "estimated": {
+    "opening_radius": 2.0
+  },
+  "revision": 6,
+  "shape_notes": {
+    "left_side": "User confirmed: ramp connects directly to rear wall.",
+    "right_side": "Confirmed sequence: rising ramp -> horizontal notch at height 19.60 -> vertical rise 10.00 -> rising ramp resumes. Horizontal start measured at 80 mm from front.",
+    "right_cut_status": "Vertical rise confirmed 10 mm. Existing v6 remains superseded. Original 10 mm horizontal interpretation retained pending verification; with it, step is at Y=90, Z=29.60. Need reconcile rear inner face Y=88.40 and earlier side maximum 21.75 before solid rebuild.",
+    "export_status": "Existing v6 STEP/STL/preview have superseded rear-wall section and right-notch topology; await measurements before regeneration.",
+    "rear_wall": "User correction interpreted as plate plus lower ledge/step within 9 mm combined depth; not a uniform 9 mm thick plate. Existing rear_wall_thickness field belongs to superseded v6 geometry, not confirmed material thickness."
+  },
+  "pending_correction": {
+    "measured_right_notch_start_from_front_mm": 80.0,
+    "interpreted_horizontal_length_mm": 10.0,
+    "derived_end_from_front_mm": 90.0,
+    "vertical_rise_mm": 10.0,
+    "conflict": "Previous uniform 9 mm rear wall interpretation is superseded: user describes white plate plus a lower step. Await plate material thickness, step height, and placement to resolve notch clearance.",
+    "derived_step_top_height_mm": 29.6,
+    "rear_overall_depth_mm": 9.0,
+    "rear_plate_material_thickness_mm": null,
+    "rear_low_step_top_height_mm": null,
+    "rear_low_step_side": null
+  }
+}

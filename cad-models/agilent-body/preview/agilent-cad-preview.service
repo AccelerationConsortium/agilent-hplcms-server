@@ -1,0 +1,13 @@
+[Unit]
+Description=Agilent CAD Tailscale preview
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/sdl2/caoyang/agilent-hplcms-server/cad-models/agilent-body/preview
+ExecStart=/usr/bin/python3 /home/sdl2/caoyang/agilent-hplcms-server/cad-models/agilent-body/preview/serve.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

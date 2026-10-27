@@ -1,0 +1,28 @@
+{
+  "status": "DRAFT: unmeasured features are estimates",
+  "units": "mm",
+  "revision": 3,
+  "opening_mm": [
+    80.2,
+    40.15
+  ],
+  "rear_wall_thickness_mm": 9.0,
+  "front_rim_total_height_mm": 5.5,
+  "side_max_total_height_mm": 21.75,
+  "opening_to_rear_inner_face_mm": 23.750000000000007,
+  "margins_left_right_front_rear_mm": [
+    25.8,
+    26.0,
+    24.5,
+    32.75000000000001
+  ],
+  "bounding_box": [
+    132.0,
+    97.4,
+    48.2
+  ],
+  "valid_solid": true,
+  "solid_count": 1,
+  "step_roundtrip_valid": true,
+  "volume_mm3": 72384.08044407847
+}

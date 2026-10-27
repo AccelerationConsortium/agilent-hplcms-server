@@ -1,0 +1,24 @@
+{
+  "units": "mm",
+  "measured": {
+    "width": 132.0,
+    "depth": 97.4,
+    "height": 48.2,
+    "base_thickness": 1.5,
+    "opening_width": 80.2,
+    "opening_depth": 40.15,
+    "opening_left": 25.8,
+    "opening_front": 24.5,
+    "opening_right": 26.0,
+    "opening_rear": 32.75,
+    "rear_wall_thickness": 9.0,
+    "rim_height": 5.5,
+    "side_rear_height": 21.75
+  },
+  "estimated": {
+    "wall_thickness": 1.5,
+    "opening_radius": 2.0,
+    "side_ramp_depth": 25.0
+  },
+  "revision": 3
+}

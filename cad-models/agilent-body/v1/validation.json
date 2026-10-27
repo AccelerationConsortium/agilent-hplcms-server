@@ -1,0 +1,13 @@
+{
+  "status": "DRAFT: unmeasured features are estimates",
+  "units": "mm",
+  "bounding_box": [
+    132.5,
+    98.0,
+    48.2
+  ],
+  "valid_solid": true,
+  "solid_count": 1,
+  "step_roundtrip_valid": true,
+  "volume_mm3": 25720.100444078467
+}

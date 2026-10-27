@@ -1,0 +1,234 @@
+{
+  "units": "mm",
+  "measured": {
+    "width": 131.8,
+    "depth": 97.4,
+    "height": 48.2,
+    "base_thickness": 1.5,
+    "opening_width": 80.2,
+    "opening_depth": 40.15,
+    "opening_left": 25.8,
+    "opening_front": 24.5,
+    "opening_rear": 32.75,
+    "rear_wall_thickness": 2.0,
+    "rim_height": 5.5,
+    "side_wall_thickness": 2.0,
+    "front_wall_thickness": 2.0,
+    "side_ramp_start_from_front": 65.0,
+    "right_flat_length": 10.0,
+    "right_flat_height": 19.6,
+    "rear_overall_depth": 9.0,
+    "rear_ledge_height": 21.7,
+    "right_flat_start": 80.0,
+    "right_vertical_rise": 10.0,
+    "left_side_rear_height": 21.75,
+    "left_wing_extension": 5.0,
+    "left_wing_root_length": 25.35,
+    "left_wing_thickness": 2.0,
+    "rear_slot_widths": [
+      12.2,
+      11.3,
+      11.3,
+      12.2
+    ],
+    "rear_slot_gaps": [
+      18.2,
+      15.2,
+      18.2
+    ],
+    "rear_first_slot_left_offset": 16.6,
+    "rear_slot_shoulder_height": 17.0,
+    "rear_slot_center_height": 20.0,
+    "rear_slot_center_width": 4.2,
+    "rear_slot_depth": 6.8,
+    "rear_slot_bottom_widths": [
+      8.3,
+      7.3,
+      7.3,
+      8.3
+    ],
+    "rear_slot_outer_lip_thickness": 2.0,
+    "rear_slot_inner_height": 20.0,
+    "left_slope_angle_deg": 45.0,
+    "left_wing_forward_shift": 2.3
+  },
+  "estimated": {
+    "opening_radius": 2.0,
+    "right_rear_height": 34.676
+  },
+  "revision": 18,
+  "shape_notes": {
+    "left_side": "45 degree rise from Y65 Z5.5. At forward-shifted wing return Y93.1 the ramp reaches Z33.6; projected height at rear inner face Y95.4 is35.9. Prior21.75 side-top measurement superseded by user angle/start correction.",
+    "right_side": "Ramp to Y=80,Z=19.6; flat to Y=90; vertical rise 10 to Z=29.6; final upward ramp joins rear plate.",
+    "right_final_ramp": "Endpoint height is estimated by continuing initial right-ramp slope; requires measurement.",
+    "right_horizontal_length": "Earlier 10 mm interpreted as horizontal length; subsequent 10 mm confirmed as vertical rise.",
+    "rear_ledge": "Plate 2 mm plus ledge 7 mm equals overall 9 mm; ledge height 21.70 measured. Assumed inward-facing, solid, spanning between sidewalls (X=2 to129.8). Ledge end treatment unmeasured.",
+    "export_status": "v18: left slope45deg with start65; wing translated2.30 toward front, preserving its Z21.75..47.10 span. Local2mm-thick return joins wing to rear panel, inferred from photo.",
+    "opening_right_margin": "Derived 25.80 from revised body131.80 minus opening80.20 minus left25.80; supersedes prior measured right26.00 for dimensional closure.",
+    "rear_slots": "Inward tapered pockets rise from underside to20 mm internally. Only outermost2 mm in depth retain shoulder height17 and centered4.20 mm opening to20. Pocket depth6.80, symmetric taper, sharp corners.",
+    "rear_tab_bevel": "Corrected direction: bevel the two center-facing vertical tab edges left/right in XY. Central gap4.20 at outer face widens inward over2 mm to6.5094. Left/right bevels60deg to X direction; Z17/20 heights unchanged. Supersedes v14 vertical bevel."
+  },
+  "features": {
+    "left_wing": {
+      "description": "User identifies outward-projecting white wing at left rear corner; visible in two new photos.",
+      "reference_images": [
+        "/tmp/codex-remote-attachments/01a13177-226a-7171-a509-681a47bb181a/D227E3C1-DBD6-4EA7-9BF8-B4ACB7DAF986/1-Photo-1.jpg",
+        "/tmp/codex-remote-attachments/01a13177-226a-7171-a509-681a47bb181a/D227E3C1-DBD6-4EA7-9BF8-B4ACB7DAF986/2-Photo-2.jpg"
+      ],
+      "outward_extension_mm": 5.0,
+      "length_along_root_mm": 25.35,
+      "thickness_mm": 2.0,
+      "placement": "Y93.1..95.1, Z21.75..47.10. Moved2.30 toward front with vertical span preserved. Inferred2mm return inside body X0..2 extends to rear panel.",
+      "width_interpretation": "Confirmed body width excludes wing; revised body 131.80, overall 136.80 mm.",
+      "status": "v18 shifted forward and joined with provisional return; obsolete ramp-top alignment removed."
+    },
+    "rear_slots": [
+      {
+        "index": 1,
+        "width": 12.2,
+        "left_offset": 16.6,
+        "right_edge": 28.8,
+        "height": 17.0,
+        "depth": 6.8,
+        "bottom_z_assumed": 0.0,
+        "center_height": 20.0,
+        "center_width": 4.2,
+        "bottom_width": 8.3,
+        "taper_direction": "narrows inward along recess depth",
+        "symmetric_taper_assumed": true,
+        "outer_lip_thickness": 2.0,
+        "inner_height": 20.0
+      },
+      {
+        "index": 2,
+        "width": 11.3,
+        "left_offset": 47.0,
+        "right_edge": 58.3,
+        "height": 17.0,
+        "depth": 6.8,
+        "bottom_z_assumed": 0.0,
+        "center_height": 20.0,
+        "center_width": 4.2,
+        "bottom_width": 7.3,
+        "taper_direction": "narrows inward along recess depth",
+        "symmetric_taper_assumed": true,
+        "outer_lip_thickness": 2.0,
+        "inner_height": 20.0
+      },
+      {
+        "index": 3,
+        "width": 11.3,
+        "left_offset": 73.5,
+        "right_edge": 84.8,
+        "height": 17.0,
+        "depth": 6.8,
+        "bottom_z_assumed": 0.0,
+        "center_height": 20.0,
+        "center_width": 4.2,
+        "bottom_width": 7.3,
+        "taper_direction": "narrows inward along recess depth",
+        "symmetric_taper_assumed": true,
+        "outer_lip_thickness": 2.0,
+        "inner_height": 20.0
+      },
+      {
+        "index": 4,
+        "width": 12.2,
+        "left_offset": 103.0,
+        "right_edge": 115.2,
+        "height": 17.0,
+        "depth": 6.8,
+        "bottom_z_assumed": 0.0,
+        "center_height": 20.0,
+        "center_width": 4.2,
+        "bottom_width": 8.3,
+        "taper_direction": "narrows inward along recess depth",
+        "symmetric_taper_assumed": true,
+        "outer_lip_thickness": 2.0,
+        "inner_height": 20.0
+      }
+    ],
+    "base_end_slots": {
+      "width_x_mm": 10.0,
+      "length_y_mm": 3.0,
+      "rear_edge_offset_mm": 3.0,
+      "ear_side_body_edge_offset_mm": 4.25,
+      "derived_x_range_mm": [
+        4.25,
+        14.25
+      ],
+      "derived_y_range_mm": [
+        91.4,
+        94.4
+      ],
+      "status": "Confirmed as end slots, not A/C. Both modeled as through openings; opposite slot mirrored provisionally.",
+      "x_ranges_mm": [
+        [
+          4.25,
+          14.25
+        ],
+        [
+          117.55,
+          127.55
+        ]
+      ],
+      "opposite_slot_symmetry_assumed": true
+    },
+    "magnet_replacing_B": {
+      "diameter_mm": 10.0,
+      "pocket_depth_mm": 3.0,
+      "opening_face": "underside",
+      "location_intent": "Aligned with B: centered across body, measured6 mm from rear outer face.",
+      "center_x_mm": 65.9,
+      "center_x_status": "Centered across body at B",
+      "center_rear_offset_mm": 6.0,
+      "status": "Modeled blind pocket with local supporting boss",
+      "center_y_mm": 91.4,
+      "support_boss_diameter_mm": 12.0,
+      "retained_floor_mm": 1.5,
+      "support_boss_design_note": "Local boss added where pocket extends forward of rear ledge; nominal radial wall1 mm, floor1.5 mm. No fit clearance added."
+    }
+  },
+  "constraints": {
+    "left_wing_bottom_aligned_to_left_ramp_top": false,
+    "rear_slot_corners_are_sharp": true
+  },
+  "pending_features": {
+    "rear_and_underside": {
+      "status": "Four inward-tapered stepped slots modeled in v12; other underside details pending.",
+      "observed": [
+        "Four large rear-edge recesses/openings",
+        "Underside rectangular apertures",
+        "Local corner cutouts and circular molded marks"
+      ],
+      "measurement_status": "Rear slots: outer heights17, central width4.20/height20, recess depth6.80 applied to all four. Underside apertures remain unmeasured.",
+      "reference_images": [
+        "reference-rear.jpg",
+        "reference-bottom.jpg"
+      ]
+    },
+    "three_base_rectangles": {
+      "priority": "User identifies these as important next features",
+      "reference_image": "reference-base-three.jpg",
+      "labels": {
+        "A": "Upper large opening with metal tab in photo",
+        "B": "User requests replacement by round magnet pocket diameter10 mm, depth3 mm.",
+        "C": "Lower large opening with metal tab in photo"
+      },
+      "measurement_status": "A/C deferred by user; end slots prioritized. B to be replaced by round magnet pocket."
+    }
+  },
+  "derived": {
+    "opening_right": 25.8,
+    "rear_last_slot_right_margin": 16.6,
+    "left_slope_rear_height": 35.9
+  },
+  "design": {
+    "rear_tab_inner_bevel_angle_deg": 60.0,
+    "rear_tab_inner_bevel_reference": "in XY plan, angle to left-right X axis; previously square side edge was90deg",
+    "rear_tab_bevel_depth_mm": 2.0,
+    "rear_tab_bevel_direction": "Left/right widening into cavity; constant through tab height Z17..20, no vertical bevel.",
+    "left_wing_bottom_z": 21.75,
+    "left_wing_return_thickness": 2.0
+  }
+}
