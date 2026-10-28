@@ -2,7 +2,7 @@
 
 Base: the deployed service's `http://<host>:8010`. All timestamps UTC ISO-8601.
 Exact request/response schemas: `/openapi.json`. Tags: `control`,
-`documentation`.
+`documentation`, `stats`.
 
 Every mutating `/control/*` route takes a required `X-Claim-Token` header
 ("claim" in the *gate* column). The exceptions are called out: `POST
@@ -18,6 +18,7 @@ generated OpenAPI document reflects — except request validation, which is
 | `GET /` | `ProbeResponse` — `{equipment_id: "agilent_uplc_ms", equipment_name: "Agilent UPLC-MS", protocol_version: "1.2"}` |
 | `GET /health` | `{"status": "healthy"}` — service liveness only, says nothing about the instrument |
 | `GET /status` | the full `EquipmentStatus` envelope (below) |
+| `GET /stats/usage` | per-user instrument hours, all time (below). `?refresh=1` rescans instead of reusing the report built in the last 60 s. 503 `results_root_missing` if the results root is not on disk. |
 | `GET /docs/agent` | the JSON agent guide: `title`, `protocol_version`, `reference`, `execution_policy`, `workflow`, `sample_addressing`, `dispatch`, `refusals`, `cancellation`, `capabilities`. Static; no hardware access. |
 | `GET /agent-docs` | this service's agent guide (`text/markdown`) |
 | `GET /agent-docs/api-reference` | this document (`text/markdown`) |
@@ -68,6 +69,21 @@ run** (`run_pressure_max_bar`, `_min_bar`, `_mean_bar`, `_baseline_bar`,
 unclaimed), `service_mode`, `servicing`, `workflow_active`,
 `subsystem_fault_modules`, `stale_active_run` (only when `true`: the active
 job has shown no OpenLab acquisition for `STALE_RUN_GRACE_S`).
+
+### `GET /stats/usage`
+
+`{generated_at, results_root, users, grand_total_hours, note}`, built from the
+OpenLab results tree on disk (`CDS_RESULTS_DIR`), never from the instrument.
+Each `users[]` entry is `{user, kind, injections, result_sets, total_run_hours,
+first_run, last_run, measured_injections, estimated_injections}`, sorted by
+hours. `user` is the top-level results folder; `kind` is `human`, `agent` (the
+`agent` folder plus runs the sidecar exported to the results root) or `system`
+(`Blanks`, `Shutdown`, `SmokeTest`, `standby`, `Installation Checkout`). One
+`.dx` raw-data archive is one injection, counted once however many folders it
+was copied into. A duration is *measured* from the archive's `RunDateTime` to
+its close, or *estimated* as the gap to the next injection, capped at the method
+run time or 2 h. `note` gives the counts behind those choices. Per-injection
+detail is in the CSV from `agilent-hplcms-server-usage-stats --csv <path>`.
 
 ## Claim protocol (no `X-Claim-Token` gate — these establish it)
 
@@ -186,6 +202,7 @@ outstanding — the module has not recovered, and `run.submit` stays refused.
 | `role_forbidden` | 403 | `detail`, `owner`, `role`, `required_role` |
 | `workflow_active` | 423 | `detail`, `claimed_by`, `retry_after_s` |
 | — (claim rejection) | 409 / 423 / 401 | `detail`, `claimed_by`, `retry_after_s` |
+| `results_root_missing` | 503 | `detail`, `results_root` (`GET /stats/usage` only) |
 
 409 and 412 refusals never populate `last_error` (§6.3).
 

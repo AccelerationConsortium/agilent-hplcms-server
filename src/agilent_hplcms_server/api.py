@@ -8,7 +8,7 @@ from typing import Callable
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__
@@ -30,6 +30,13 @@ from .status_builder import (
     EQUIPMENT_KIND,
     EQUIPMENT_NAME,
     build_status,
+)
+from .usage_stats import (
+    ResultsRootMissing,
+    ResultsRootMissingError,
+    UsageStatsResponse,
+    cached_scan,
+    to_response,
 )
 
 
@@ -126,7 +133,7 @@ def create_app(
     def documentation() -> dict:
         return agent_guide()
 
-    # HTTPException serializes all declared control errors under `detail`.
+    # HTTPException serializes all declared control/stats errors under `detail`.
     # Describe the actual wire envelope, including custom labware refusals.
     original_openapi = app.openapi
 
@@ -135,7 +142,7 @@ def create_app(
         if schema.get("x-control-errors-wrapped"):
             return schema
         for path, operations in schema["paths"].items():
-            if not path.startswith("/control/"):
+            if not path.startswith(("/control/", "/stats/")):
                 continue
             for operation in operations.values():
                 if not isinstance(operation, dict):
@@ -177,6 +184,31 @@ def create_app(
             consumables=consumables_instance,
             fault_acks=fault_acks_instance,
         )
+
+    @app.get(
+        "/stats/usage",
+        response_model=UsageStatsResponse,
+        tags=["stats"],
+        summary="Per-user instrument usage hours, all time",
+        responses={503: {"model": ResultsRootMissingError}},
+    )
+    def usage_stats(refresh: bool = False) -> UsageStatsResponse:
+        """Instrument time per user, reconstructed from the OpenLab results tree.
+
+        Read-only and claim-free. The report is reused for a minute; pass
+        ``?refresh=1`` to rescan now. HTTP 503 ``results_root_missing`` if the
+        results root is not on disk.
+        """
+        try:
+            report = cached_scan(settings.cds_results_dir, refresh=refresh)
+        except ResultsRootMissing as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=ResultsRootMissingError(
+                    detail=str(exc), results_root=settings.cds_results_dir,
+                ).model_dump(mode="json"),
+            ) from exc
+        return to_response(report)
 
     return app
 

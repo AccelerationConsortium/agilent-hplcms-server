@@ -26,6 +26,7 @@ dev = [
 
 [project.scripts]
 agilent-hplcms-server-serve = "agilent_hplcms_server.api:main"
+agilent-hplcms-server-usage-stats = "agilent_hplcms_server.usage_stats:main"
 
 [build-system]
 requires = ["hatchling"]

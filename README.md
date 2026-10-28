@@ -35,6 +35,7 @@ Start-Process powershell -Verb RunAs -ArgumentList "-Command C:\SDL_Tools\nssm.e
 | `GET /` | `{equipment_id, equipment_name, protocol_version}` |
 | `GET /health` | `{status: "healthy"}` |
 | `GET /status` | `EquipmentStatus` envelope per STATUS_SPEC v1.2 (incl. `allowed_actions`, `details.claimed_by`, `activity`/`activity_since`) |
+| `GET /stats/usage` | Per-user instrument hours, all time, from the OpenLab results tree: `{generated_at, results_root, users: [{user, kind, injections, result_sets, total_run_hours, first_run, last_run, measured_injections, estimated_injections}], grand_total_hours, note}`. No claim needed. Reuses a report for 60 s; `?refresh=1` rescans. 503 `results_root_missing` if the results root is absent. See *Usage statistics* below. |
 | `GET /openapi.json` | Generated OpenAPI spec, including control error envelopes |
 | `GET /docs` | Interactive API reference |
 | `GET /docs/agent` | Agent integration guide: claims, dispatch, labware and refusal handling |
@@ -224,6 +225,20 @@ Mutating `/control/*` calls require a valid `X-Claim-Token` (hard enforcement, `
 An unknown owner is refused `403 user_not_recognized`; an under-privileged owner calling a gated action gets `403 role_forbidden`. The roster is **always enforced**: when every list is empty the built-in defaults (`Hplcms-User` / `HTE-User` / `Service-Account`) apply, so a fresh install always has a service account and never bricks. A literal `"*"` in a list matches any owner — an explicit open mode for dev, distinct from an accidental empty config. `HPLCMS_ADMINS` is seeded with the single `Service-Account` the dashboard claims under to toggle service mode; broadening it later is just adding names.
 
 **Central roster (optional).** Set `ROSTER_URL` to the central auth service's owner→role projection (ac-organic-lab `GET /equipment/{key}/roster`) and the sidecar polls it every `ROSTER_REFRESH_INTERVAL_S` (default 60 s) — the central roster is then **authoritative** for owner→role resolution, so per-user roles are managed centrally instead of via the `*_USERS` env lists. The static env roster above becomes the fallback used **only until the first successful pull** (the device never bricks if the auth service is unreachable at startup); once a roster is pulled, a later refresh failure keeps the last-good copy. A successfully-pulled *empty* roster is authoritative (nobody is allowed). Leave `ROSTER_URL` unset to run fully standalone on the env lists. The pull is stdlib-only (`urllib`) and Tailnet-only by deployment; set `ROSTER_API_KEY` only if the central service ever gates the device-plane endpoint.
+
+## Usage statistics
+
+`GET /stats/usage` and the `agilent-hplcms-server-usage-stats` command read the OpenLab results tree (`CDS_RESULTS_DIR`) and total instrument time per top-level results folder. They are read-only and never touch the instrument.
+
+```powershell
+# Table to the console, per-injection CSV to a file
+C:\SDL_Tools\uv.exe run agilent-hplcms-server-usage-stats --csv C:\SDL_Tools\usage_stats.csv
+```
+
+- **One injection = one `.dx`** raw-data archive. A `.sirslt` without one (a CDF/CSV export or an acquisition that wrote no data) and a ChemStation `.D` folder (an export) are not counted, so the same run is never billed twice. A `.dx` copied into several folders has the same `RunDateTime` in every copy and is counted once.
+- **Times come from inside the archive.** Folder creation times on this PC are migration dates, not run dates. Start is `injection.acmd`'s `RunDateTime`; the *measured* end is the newest member timestamp in the `.dx` ZIP, which is when acquisition closed it. Without a usable end, the duration is *estimated* as the gap to the next injection on the instrument, capped at the method run time (`.amx` `MethodRuntimeInSeconds` plus pump post time, from the copy beside the data or `Methods\`) or 2 h.
+- **Owners.** The top-level folder is the user. `agent` covers the `agent` folder and runs whose `.sirslt` the sidecar left at the results root; such a run counts for the agent even when its `.dx` was filed under a person's folder. `Blanks`, `Shutdown`, `SmokeTest`, `standby` and `Installation Checkout` are reported as `system`. `RunOperator` cannot identify people, because it is `SYSTEM (SYSTEM)` on every run.
+- A cold scan of the real tree takes about 5 s and a warm one about 2 s, since parsed archives are cached. That is why the endpoint reuses its report for 60 s.
 
 ## What the server never does
 
